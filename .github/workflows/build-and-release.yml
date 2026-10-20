@@ -1,0 +1,45 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Test release tooling
+        run: |
+          python -m unittest discover -s .github/scripts -p 'test_*.py'
+          if ($LASTEXITCODE) { throw 'Release helper tests failed' }
+          node --test .github/scripts/resolve-release-build.test.cjs
+          if ($LASTEXITCODE) { throw 'Release resolver tests failed' }
+      - name: Build and test Release
+        run: ./scripts/build.ps1 -Configuration Release
+      - name: Package Windows x64
+        run: ./scripts/package.ps1
+      - name: Verify release package
+        run: python .github/scripts/release.py verify artifacts/release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fastpdf-windows-x64
+          path: |
+            artifacts/release/FastPDF-x64.zip
+            artifacts/release/SHA256SUMS.txt
+          if-no-files-found: error

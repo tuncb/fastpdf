@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Validate tag and find main build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    outputs:
+      run-id: ${{ steps.build.outputs.run-id }}
+      build-required: ${{ steps.build.outputs.build-required }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Validate version and main ancestry
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python .github/scripts/release.py validate-tag "$RELEASE_TAG"
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo 'Release tags must point to a commit on main.' >&2
+            exit 1
+          }
+      - name: Find or wait for the exact commit's main build
+        id: build
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { resolveReleaseBuild } = require('./.github/scripts/resolve-release-build.cjs');
+            await resolveReleaseBuild({ github, context, core });
+
+  build:
+    name: Build tag without reusable package
+    needs: resolve
+    if: needs.resolve.outputs.build-required == 'true'
+    uses: ./.github/workflows/build-and-release.yml
+
+  release:
+    name: Publish Windows x64 release
+    needs: [resolve, build]
+    if: >-
+      !cancelled() && needs.resolve.result == 'success' &&
+      (needs.build.result == 'success' ||
+       (needs.build.result == 'skipped' && needs.resolve.outputs.run-id != ''))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.resolve.outputs.run-id || github.run_id }}
+          name: fastpdf-windows-x64
+          path: release-assets
+      - name: Verify release package and extract notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python .github/scripts/release.py validate-tag "$RELEASE_TAG"
+          python .github/scripts/release.py verify release-assets
+          python .github/scripts/release.py notes "$RELEASE_TAG" > release-notes.md
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --verify-tag --title "$RELEASE_TAG" --notes-file release-notes.md
+          fi

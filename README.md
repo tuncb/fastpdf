@@ -32,6 +32,12 @@ To make a portable ZIP after a successful build:
 .\scripts\package.ps1
 ```
 
+Packaging requires Python 3.10 or newer. Download Windows x64 builds from
+[GitHub Releases](https://github.com/tuncb/fastpdf/releases). Each release includes
+`FastPDF-x64.zip` and `SHA256SUMS.txt`. Extract the ZIP and run `fastpdf.exe`.
+See [CHANGELOG.md](CHANGELOG.md) for release notes and [AGENTS.md](AGENTS.md) for
+the versioning and tag-based release process.
+
 ## Reader controls
 
 - Open: Ctrl+O or drag a PDF into the window.
