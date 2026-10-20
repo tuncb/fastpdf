@@ -1,0 +1,5 @@
+/build*/
+/artifacts/
+*.user
+*.suo
+__pycache__/

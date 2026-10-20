@@ -1,0 +1,210 @@
+[
+  {
+    "name": "L-lossless",
+    "width": 37,
+    "height": 29,
+    "components": 1,
+    "tolerance": 0,
+    "sha256": "dbd5a8bf30cfe6cba33cd7bdb1d29426b68f096e46ea781f931f760a8e4e414e",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 19,
+        "height": 15,
+        "file": "L-lossless-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "L-lossy",
+    "width": 37,
+    "height": 29,
+    "components": 1,
+    "tolerance": 1,
+    "sha256": "3ea97ea95e89f9ee2c5e6ac482c65ae1958be42eb3d62bec48b314e7755c81eb",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 19,
+        "height": 15,
+        "file": "L-lossy-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "RGB-lossless",
+    "width": 37,
+    "height": 29,
+    "components": 3,
+    "tolerance": 0,
+    "sha256": "3e50b5d35b71a7327b7870e22c375986793c9e0eb9f4768a6cc0a75a307c3e3c",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 19,
+        "height": 15,
+        "file": "RGB-lossless-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "RGB-lossy",
+    "width": 37,
+    "height": 29,
+    "components": 3,
+    "tolerance": 1,
+    "sha256": "1541f037c2fecb93fb89cf28f554a0064a4ee01cd0fb335f9e1db0b2d440f135",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 19,
+        "height": 15,
+        "file": "RGB-lossy-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "RGBA-lossless",
+    "width": 37,
+    "height": 29,
+    "components": 4,
+    "tolerance": 0,
+    "sha256": "6c18df6f260d29dff9ab9dd7c4c49ab4da647ce88193f26813a8f283c0ee1b23",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 19,
+        "height": 15,
+        "file": "RGBA-lossless-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "RGBA-lossy",
+    "width": 37,
+    "height": 29,
+    "components": 4,
+    "tolerance": 1,
+    "sha256": "1baadd4e9d44f4c6a76efcf29cc151a3143ad3d1c4243956d3a58378e5a73000",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 19,
+        "height": 15,
+        "file": "RGBA-lossy-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "tiled-LRCP",
+    "width": 65,
+    "height": 73,
+    "components": 3,
+    "tolerance": 0,
+    "sha256": "8c1153e730d28911d27c1bc32948868897d9e814bac040029a891eec040b6d60",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 33,
+        "height": 37,
+        "file": "tiled-LRCP-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "tiled-RLCP",
+    "width": 65,
+    "height": 73,
+    "components": 3,
+    "tolerance": 0,
+    "sha256": "053aaaf02e6ce11015ad9604ea5cdd3e5c06c112e853712d783a0a22d24cffdc",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 33,
+        "height": 37,
+        "file": "tiled-RLCP-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "tiled-RPCL",
+    "width": 65,
+    "height": 73,
+    "components": 3,
+    "tolerance": 0,
+    "sha256": "9d93b9947e219688508b1ff2cbb54aeacd7febbeb2e5e794cf274b90fc6ac11b",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 33,
+        "height": 37,
+        "file": "tiled-RPCL-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "tiled-PCRL",
+    "width": 65,
+    "height": 73,
+    "components": 3,
+    "tolerance": 0,
+    "sha256": "386535eb4c086876b94f1798e36956171683ceace86aed5bb0fb99bd8e9e1958",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 33,
+        "height": 37,
+        "file": "tiled-PCRL-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "tiled-CPRL",
+    "width": 65,
+    "height": 73,
+    "components": 3,
+    "tolerance": 0,
+    "sha256": "dd9eff23a3422507674286d45c87c21351a3c9ce85407afad8a3181c5b18d9c1",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 33,
+        "height": 37,
+        "file": "tiled-CPRL-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "gray-16bit",
+    "width": 37,
+    "height": 29,
+    "components": 1,
+    "tolerance": 0,
+    "sha256": "69f338dbd3b68053ab4881ba6836a8fd2680f7fd1de87a04b8ef767b8ed2a4bd",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 19,
+        "height": 15,
+        "file": "gray-16bit-r1.raw"
+      }
+    ]
+  },
+  {
+    "name": "gray-signed",
+    "width": 37,
+    "height": 29,
+    "components": 1,
+    "tolerance": 0,
+    "sha256": "c8240819f3de9f7ea795fcfb05fda8aa34e5b8523a6921a50e816c892bb6cedf",
+    "reductions": [
+      {
+        "level": 1,
+        "width": 19,
+        "height": 15,
+        "file": "gray-signed-r1.raw"
+      }
+    ]
+  }
+]
