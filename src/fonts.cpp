@@ -344,9 +344,15 @@ uint32_t glyph_unicode(std::string_view name) {
     return 0;
 }
 static std::string name_for(uint32_t unicode) {
-    for (auto& n : standard_names())
-        if (glyph_unicode(n) == unicode && unicode)
-            return n;
+    static const auto names = [] {
+        std::unordered_map<uint32_t, std::string_view> result;
+        for (auto& name : standard_names())
+            if (auto code = glyph_unicode(name))
+                result.try_emplace(code, name);
+        return result;
+    }();
+    if (auto found = names.find(unicode); found != names.end())
+        return std::string(found->second);
     if (unicode >= 33 && unicode <= 126)
         return std::string(1, char(unicode));
     return {};
@@ -579,8 +585,9 @@ static Bytes type1_decrypt(View data, uint16_t seed, int discard) {
     }
     return out;
 }
-static void type1_program(Font& f, const Value& file) {
-    View raw = f.program;
+static std::shared_ptr<Type1Program> type1_program(View raw, const Value& file) {
+    auto owned = std::make_shared<Type1Program>();
+    auto& f = *owned;
     Bytes flattened;
     if (raw.size() > 6 && raw[0] == 128) {
         size_t pos = 0;
@@ -691,7 +698,7 @@ static void type1_program(Font& f, const Value& file) {
                 operands.erase(operands.begin());
         }
     }
-    if (get(f.dictionary, "Encoding").kind == Kind::null) {
+    {
         Parser enc{raw.first(ee), 0, 0, false};
         std::vector<Value> stack;
         while (enc.pos < enc.data.size()) {
@@ -704,7 +711,6 @@ static void type1_program(Font& f, const Value& file) {
                     int n = integer(code, -1);
                     if (n >= 0 && n < 256 && name.kind == Kind::name) {
                         f.glyph_names[n] = name.text;
-                        f.encoding[n] = glyph_unicode(name.text);
                     }
                     stack.clear();
                 } else {
@@ -718,8 +724,7 @@ static void type1_program(Font& f, const Value& file) {
         }
     }
     require(!f.type1_chars.empty(), "No Type 1 character programs");
-    f.type1 = true;
-    f.embedded = true;
+    return owned;
 }
 struct T1State {
     Point position;
@@ -729,7 +734,7 @@ struct T1State {
     bool flex = false;
     std::vector<Point> flex_points;
 };
-static void type1_run(Font& font, View data, T1State& s, int depth) {
+static void type1_run(const Type1Program& font, View data, T1State& s, int depth) {
     require(depth < 32, "Type 1 subroutine depth limit");
     auto& a = s.stack;
     auto move = [&](double x, double y) {
@@ -896,11 +901,14 @@ static void type1_run(Font& font, View data, T1State& s, int depth) {
     }
 }
 std::vector<Segment> type1_outline(Font& font, std::string_view name) {
-    auto it = font.type1_chars.find(std::string(name));
-    if (it == font.type1_chars.end())
+    if (!font.type1_program)
+        return {};
+    auto& program = *font.type1_program;
+    auto it = program.type1_chars.find(std::string(name));
+    if (it == program.type1_chars.end())
         return {};
     T1State s;
-    type1_run(font, it->second, s, 0);
+    type1_run(program, it->second, s, 0);
     return s.path;
 }
 static IDWriteFontFace* system_face(Renderer& r, const Font& f) {
@@ -1122,10 +1130,29 @@ Font& load_font(Renderer& r, Document& d, const Value& input) {
         if (program->has_stream) {
             IDWriteFontFile* file = nullptr;
             try {
-                f.program = decode_stream(d, *program).bytes;
-                if (type1)
-                    type1_program(f, *program);
-                else {
+                if (type1) {
+                    auto cached = r.type1_programs.find(program);
+                    if (cached != r.type1_programs.end())
+                        f.type1_program = cached->second;
+                    else {
+                        auto bytes = decode_stream(d, *program).bytes;
+                        f.type1_program = type1_program(bytes, *program);
+                        r.type1_programs.emplace(program, f.type1_program);
+                    }
+                    // Font dictionaries can share one program but have different
+                    // encodings and widths. Only the decoded program is shared.
+                    if (encoding.kind == Kind::null)
+                        for (size_t i = 0; i < f.glyph_names.size(); ++i) {
+                            auto& name = f.type1_program->glyph_names[i];
+                            if (!name.empty()) {
+                                f.glyph_names[i] = name;
+                                f.encoding[i] = glyph_unicode(name);
+                            }
+                        }
+                    f.type1 = true;
+                    f.embedded = true;
+                } else {
+                    f.program = decode_stream(d, *program).bytes;
                     if (cff)
                         cff_metadata(f);
                     hr(r.loader->CreateInMemoryFontFileReference(r.write, f.program.data(),

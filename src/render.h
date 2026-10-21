@@ -34,6 +34,11 @@ struct CMap {
     std::unordered_map<uint32_t, uint32_t> cid;
     bool identity = false, vertical = false;
 };
+struct Type1Program {
+    std::unordered_map<std::string, Bytes> type1_chars;
+    std::vector<Bytes> type1_subrs;
+    std::array<std::string, 256> glyph_names;
+};
 struct Font {
     Value dictionary, descendant;
     IDWriteFontFace* face = nullptr;
@@ -48,8 +53,7 @@ struct Font {
     std::unordered_map<uint32_t, uint16_t> cff_cids;
     std::unordered_map<std::string, uint16_t> cff_names;
     std::unordered_map<uint16_t, uint32_t> glyph_to_unicode;
-    std::unordered_map<std::string, Bytes> type1_chars;
-    std::vector<Bytes> type1_subrs;
+    std::shared_ptr<Type1Program> type1_program;
     Bytes cid_to_gid;
     double default_width = 0, default_vertical = -1000, default_vorigin = 880;
     Matrix matrix{0.001, 0, 0, 0.001, 0, 0};
@@ -140,6 +144,7 @@ struct Renderer {
     IDWriteInMemoryFontFileLoader* loader = nullptr;
     IWICImagingFactory* wic = nullptr;
     std::unordered_map<const Value*, std::unique_ptr<Font>> fonts;
+    std::unordered_map<const Value*, std::shared_ptr<Type1Program>> type1_programs;
     std::unordered_map<const Value*, CachedImage> images;
     std::unordered_map<std::string, std::shared_ptr<CMap>> character_maps;
     size_t image_bytes = 0;

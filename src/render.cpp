@@ -30,6 +30,7 @@ void clear_resources(Renderer& r) {
     for (auto& pair : r.fonts)
         release(pair.second->face);
     r.fonts.clear();
+    r.type1_programs.clear();
     r.images.clear();
     r.character_maps.clear();
     r.image_bytes = 0;
@@ -45,6 +46,7 @@ void close_renderer(Renderer& r) {
     for (auto& pair : r.fonts)
         release(pair.second->face);
     r.fonts.clear();
+    r.type1_programs.clear();
     r.images.clear();
     r.character_maps.clear();
     if (r.loader && r.write)

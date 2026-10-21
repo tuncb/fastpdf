@@ -9,6 +9,44 @@ static pdf::Value object(std::string_view text) {
     pdf::Parser parser{pdf::view(text)};
     return pdf::parse(parser);
 }
+static void shared_type1_programs(pdf::Renderer& renderer) {
+    pdf::clear_resources(renderer);
+    pdf::Document doc;
+    std::string header = "%!PS-AdobeFont-1.0\n/Encoding 256 array dup 65 /A put def\ncurrentfile eexec\n";
+    std::string plain = "abcd/lenIV -1 def /Subrs 0 array def /CharStrings 1 dict /A 5 RD ";
+    plain.append("\x8b\xf8\xec\x0d\x0e", 5); // 0 600 hsbw endchar
+    plain += " ND end closefile";
+    pdf::Bytes bytes(header.begin(), header.end());
+    uint16_t seed = 55665;
+    for (uint8_t value : plain) {
+        uint8_t encrypted = value ^ uint8_t(seed >> 8);
+        bytes.push_back(encrypted);
+        seed = uint16_t((unsigned(encrypted) + seed) * 52845 + 22719);
+    }
+    auto program = std::make_unique<pdf::Value>(object("<< >>"));
+    program->has_stream = true;
+    program->stream = bytes;
+    doc.objects[77] = std::move(program);
+    doc.xref.resize(78);
+    doc.xref[77].type = 1;
+    auto native = object("<< /Subtype /Type1 /BaseFont /Test /FirstChar 65 /Widths [600] "
+                         "/FontDescriptor << /FontFile 77 0 R >> >>");
+    auto remapped = object("<< /Subtype /Type1 /BaseFont /Test /FirstChar 66 /Widths [900] "
+                           "/Encoding << /Differences [66 /A] >> "
+                           "/FontDescriptor << /FontFile 77 0 R >> >>");
+    // Load the explicit encoding first. It must not suppress the native encoding
+    // when another dictionary later uses the same font program.
+    auto& a = pdf::load_font(renderer, doc, remapped);
+    auto& b = pdf::load_font(renderer, doc, native);
+    test(a.type1 && b.type1 && a.type1_program == b.type1_program && renderer.type1_programs.size() == 1,
+         "Font dictionaries share the decoded Type 1 program");
+    auto ga = pdf::decode_text(a, "B"), gb = pdf::decode_text(b, "A");
+    test(ga.size() == 1 && gb.size() == 1 && ga[0].text == L"A" && gb[0].text == L"A" &&
+             ga[0].advance == 900 && gb[0].advance == 600,
+         "Shared font programs preserve separate encodings and widths");
+    pdf::clear_resources(renderer);
+    test(renderer.type1_programs.empty(), "Document changes clear shared Type 1 programs");
+}
 static void raw_images(pdf::Renderer& renderer, pdf::Document& doc) {
     pdf::clear_resources(renderer);
     renderer.image_cache_limit = 128 * 1024 * 1024;
@@ -173,6 +211,7 @@ int wmain(int argc, wchar_t** argv) {
             }
 
         raw_images(renderer, doc);
+        shared_type1_programs(renderer);
         std::atomic<unsigned> completed = 0, active = 0;
         bool failed = false;
         try {
