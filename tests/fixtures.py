@@ -502,6 +502,24 @@ def generate(directory):
     objects = base(b"q 100 0 0 100 20 20 cm /Im Do Q", b"/XObject << /Im 6 0 R >>")
     objects += [stream(raw, image_attrs+b" /SMask 7 0 R"), stream(b"\x80"*4,b"/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8")]
     add("image_smask", pdf(objects), pixel=(40, 120, (255, 127, 127)), tolerance=3)
+    for name, image_mask, mask_data, expected in [
+        ("soft", b"/SMask 7 0 R /Mask [255 255 0 0 0 0]", b"\x80", (0, 0, 191)),
+        ("explicit", b"/Mask 7 0 R", b"\0", (0, 0, 128)),
+        ("color", b"/Mask [0 0 0 0 255 255]", b"\0", (0, 0, 128)),
+        ("state", b"", b"\0", (0, 0, 255)),
+    ]:
+        content = (b"0 0 1 rg 0 0 300 220 re f q /G gs q 100 0 0 100 20 20 cm /Im Do Q "
+                   b"0 1 0 rg 160 20 100 100 re f Q")
+        objects = base(content, b"/XObject << /Im 6 0 R >> /ExtGState << /G << /ca .5 /BM /Multiply "
+                       b"/SMask << /S /Alpha /G 8 0 R >> >> >>")
+        objects.append(stream(b"\xff\0\0", b"/Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                              b"/BitsPerComponent 8 /ColorSpace /DeviceRGB " + image_mask))
+        attributes = (b"/ImageMask true /BitsPerComponent 1" if name == "explicit" else
+                      b"/BitsPerComponent 8 /ColorSpace /DeviceGray")
+        objects.append(stream(mask_data, b"/Type /XObject /Subtype /Image /Width 1 /Height 1 " + attributes))
+        objects.append(stream(b"", b"/Type /XObject /Subtype /Form /BBox [0 0 300 220] "
+                              b"/Group << /S /Transparency /I true >> /Resources << >>"))
+        add(f"image_mask_priority_{name}", pdf(objects), pixels=[(50, 150, expected), (200, 150, (0, 0, 255))], tolerance=2)
     for name, ext, expected in [("alpha", b"/ca 0.5", (255,128,128)), ("multiply",b"/BM /Multiply",(0,0,0))]:
         content = (b"0 0 1 rg 20 20 100 100 re f " if name=="multiply" else b"") + b"/GS gs 1 0 0 rg 20 20 100 100 re f"
         objects = base(content,b"/ExtGState << /GS 6 0 R >>") + [b"<< "+ext+b" >>"]

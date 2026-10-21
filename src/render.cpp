@@ -509,8 +509,9 @@ static void composite(Context& c, Surface& layer, std::string_view mode, float o
 }
 static void paint(Context& c, const Value& resources, const std::function<void(Context&)>& draw,
                   bool force = false, float opacity = 1, Rect bounds = {-1e30, -1e30, 1e30, 1e30},
-                  bool has_backdrop = false) {
-    if (!force && (c.g.blend == "Normal" || c.g.blend == "Compatible") && c.g.softmask.kind == Kind::null) {
+                  bool has_backdrop = false, bool image_mask = false) {
+    bool use_mask = !image_mask && c.g.softmask.kind != Kind::null;
+    if (!force && (c.g.blend == "Normal" || c.g.blend == "Compatible") && !use_mask) {
         draw(c);
         return;
     }
@@ -561,7 +562,7 @@ static void paint(Context& c, const Value& resources, const std::function<void(C
         drawing = false;
         hr(result, "Render transparency layer");
         Bytes mask;
-        if (c.g.softmask.kind != Kind::null) {
+        if (use_mask) {
             sub.g = c.g;
             mask = soft_mask(sub, resources);
         }
@@ -753,6 +754,12 @@ static void draw_image(Context& c, const Value& image, const Value& resources,
     ProfileTimer resample_timer(c.renderer->profiling ? &c.renderer->profile.image_resample_ms : nullptr);
     decoded = image_level(*c.document, decoded, width, height);
     resample_timer.stop();
+    // An image's own mask replaces the graphics-state soft mask. Blend mode
+    // and constant opacity still apply (PDF 32000-1, 11.6.4.3 and Table 89).
+    auto& d = *c.document;
+    auto& mask = entry(d, image, "Mask");
+    bool image_mask = !decoded->stencil && (entry(d, image, "SMask").has_stream ||
+                      mask.has_stream || mask.kind == Kind::array || integer(get(image, "SMaskInData")) != 0);
     paint(
         c, resources,
         [&](Context& target) {
@@ -803,7 +810,7 @@ static void draw_image(Context& c, const Value& image, const Value& resources,
                                                           : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
             release(bitmap);
         },
-        false, 1, transformed_box(c.g.ctm, {0, 0, 1, 1}));
+        false, 1, transformed_box(c.g.ctm, {0, 0, 1, 1}), false, image_mask);
 }
 static Rect transformed_box(Matrix m, Rect r) {
     Point p[] = {transform(m, {r.x0, r.y0}), transform(m, {r.x1, r.y0}), transform(m, {r.x1, r.y1}),

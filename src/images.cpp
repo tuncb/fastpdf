@@ -399,7 +399,8 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
     auto out = std::make_shared<Image>();
     out->stencil = stencil;
     auto& decode = entry(d, image, "Decode");
-    auto& mask = entry(d, image, "Mask");
+    const Value no_mask;
+    const auto& mask = entry(d, image, "SMask").has_stream ? no_mask : entry(d, image, "Mask");
     ProfileTimer convert_timer(r.profiling ? &r.profile.image_convert_ms : nullptr);
     if (!decoded.image_filter.empty()) {
         convert_timer.stop();
@@ -434,7 +435,23 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
             const ColorSpace* direct = &space;
             while (direct->name == "ICCBased" && direct->alternate)
                 direct = direct->alternate.get();
-            if (alpha < 0 && ((direct->name == "DeviceRGB" && channels == 3) ||
+            if (alpha < 0 && channels == 1) {
+                // A single component has only 256 possible decoded values.
+                // Convert each tint or palette index once, not once per pixel.
+                std::array<uint32_t, 256> palette{};
+                for (unsigned i = 0; i < palette.size(); ++i) {
+                    double value = indexed ? double(i) : i / 255.0;
+                    auto converted = color(d, space, std::span(&value, 1));
+                    palette[i] = uint32_t(unit(converted.b) * 255 + 0.5f) |
+                                 (uint32_t(unit(converted.g) * 255 + 0.5f) << 8) |
+                                 (uint32_t(unit(converted.r) * 255 + 0.5f) << 16) | 0xff000000u;
+                }
+                for (size_t i = 0; i < raw.samples.size(); ++i) {
+                    if ((i & 65535) == 0)
+                        check_cancel(d);
+                    std::memcpy(out->pixels.data() + i * 4, &palette[raw.samples[i]], 4);
+                }
+            } else if (alpha < 0 && ((direct->name == "DeviceRGB" && channels == 3) ||
                               (direct->name == "DeviceGray" && channels == 1))) {
                 for (unsigned y = 0; y < raw.height; ++y) {
                     if ((y & 127) == 0)
