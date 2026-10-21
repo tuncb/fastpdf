@@ -9,6 +9,8 @@
 #include <fstream>
 #include <iostream>
 #include <functional>
+#include <system_error>
+#include <thread>
 
 using namespace deployment;
 static int assertions = 0;
@@ -16,6 +18,13 @@ static void test(bool value, const char* message) {
     ++assertions;
     if (!value)
         throw std::runtime_error(message);
+}
+static void test_windows(bool value, const char* message) {
+    const DWORD error = value ? ERROR_SUCCESS : GetLastError();
+    ++assertions;
+    if (!value)
+        throw std::runtime_error(std::string(message) + " (Windows error " + std::to_string(error) +
+                                 ": " + std::system_category().message(int(error)) + ")");
 }
 static void rejects(const std::function<void()>& action, const char* message) {
     bool rejected = false;
@@ -178,27 +187,95 @@ static std::wstring environment(const wchar_t* name) {
 static void future_version(const fs::path& candidate, Version version) {
     DWORD ignored = 0;
     DWORD size = GetFileVersionInfoSizeW(candidate.c_str(), &ignored);
+    test_windows(size != 0, "Read future version fixture size");
     std::vector<uint8_t> info(size);
-    test(size && GetFileVersionInfoW(candidate.c_str(), 0, size, info.data()), "Read future version fixture");
+    test_windows(GetFileVersionInfoW(candidate.c_str(), 0, size, info.data()) != 0,
+                 "Read future version fixture");
     VS_FIXEDFILEINFO* fixed = nullptr;
     UINT length = 0;
-    test(VerQueryValueW(info.data(), L"\\", reinterpret_cast<void**>(&fixed), &length) != 0,
-         "Read fixed version fixture");
+    test_windows(VerQueryValueW(info.data(), L"\\", reinterpret_cast<void**>(&fixed), &length) != 0,
+                 "Read fixed version fixture");
     fixed->dwFileVersionMS = MAKELONG(WORD(version.minor), WORD(version.major));
     fixed->dwFileVersionLS = MAKELONG(0, WORD(version.patch));
     fixed->dwProductVersionMS = fixed->dwFileVersionMS;
     fixed->dwProductVersionLS = fixed->dwFileVersionLS;
-    HANDLE resources = BeginUpdateResourceW(candidate.c_str(), FALSE);
-    test(resources != nullptr, "Open resource fixture for editing");
-    test(UpdateResourceW(resources, RT_VERSION, MAKEINTRESOURCEW(1), 1033, info.data(), DWORD(info.size())) !=
-             0,
-         "Write future native version");
     const auto metadata = std::string("{\"version\":\"") + version_string(version) +
                           "\",\"platform\":\"windows-x64\",\"commit\":\"" + std::string(40, 'a') + "\"}";
-    test(UpdateResourceW(resources, RT_RCDATA, MAKEINTRESOURCEW(201), 1033,
-                         const_cast<char*>(metadata.data()), DWORD(metadata.size())) != 0,
-         "Write future build metadata");
-    test(EndUpdateResourceW(resources, FALSE) != 0, "Finish future executable fixture");
+    // A newly inspected executable can be briefly locked. Retry the entire resource
+    // transaction with a fresh handle and the same data, for at most five seconds.
+    const auto deadline = GetTickCount64() + 5000;
+    for (;;) {
+        const char* operation = "Open resource fixture for editing";
+        HANDLE resources = BeginUpdateResourceW(candidate.c_str(), FALSE);
+        DWORD error = ERROR_SUCCESS;
+        if (!resources) {
+            error = GetLastError();
+        } else {
+            operation = "Write future native version";
+            if (!UpdateResourceW(resources, RT_VERSION, MAKEINTRESOURCEW(1), 1033, info.data(),
+                                 DWORD(info.size()))) {
+                error = GetLastError();
+            } else {
+                operation = "Write future build metadata";
+                if (!UpdateResourceW(resources, RT_RCDATA, MAKEINTRESOURCEW(201), 1033,
+                                     const_cast<char*>(metadata.data()), DWORD(metadata.size())))
+                    error = GetLastError();
+            }
+            if (error != ERROR_SUCCESS) {
+                EndUpdateResourceW(resources, TRUE);
+            } else {
+                operation = "Finish future executable fixture";
+                if (EndUpdateResourceW(resources, FALSE))
+                    return;
+                error = GetLastError();
+            }
+        }
+        // The resource writer can report an existing file lock as ERROR_OPEN_FAILED.
+        if ((error != ERROR_ACCESS_DENIED && error != ERROR_OPEN_FAILED &&
+             error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) ||
+            GetTickCount64() >= deadline) {
+            SetLastError(error);
+            test_windows(false, operation);
+        }
+        Sleep(100);
+    }
+}
+static void future_version_tests(const fs::path& reader, const fs::path& scratch) {
+    const auto candidate = scratch / "future-version-retry.exe";
+    fs::copy_file(reader, candidate);
+    Version future = parse_version(FASTPDF_VERSION);
+    ++future.minor;
+    HANDLE locked = CreateFileW(candidate.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                OPEN_EXISTING, 0, nullptr);
+    test_windows(locked != INVALID_HANDLE_VALUE, "Lock future version fixture");
+    {
+        std::jthread release_lock([locked] {
+            Sleep(300);
+            CloseHandle(locked);
+        });
+        future_version(candidate, future);
+    }
+    verify_executable(candidate, hash_file(candidate), version_string(future));
+    fs::remove(candidate);
+
+    const auto blocked = scratch / "future-version-blocked.exe";
+    fs::copy_file(reader, blocked);
+    locked = CreateFileW(blocked.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    test_windows(locked != INVALID_HANDLE_VALUE, "Keep future version fixture locked");
+    std::string failure;
+    const auto started = GetTickCount64();
+    try {
+        future_version(blocked, future);
+    } catch (const std::exception& error) {
+        failure = error.what();
+    }
+    CloseHandle(locked);
+    test(GetTickCount64() - started >= 5000 && GetTickCount64() - started < 10000,
+         "Persistent resource lock exhausts the bounded retry");
+    test(failure.find("Windows error ") != std::string::npos,
+         "Resource failure reports the Windows error");
+    verify_executable(blocked, hash_file(blocked), FASTPDF_VERSION);
+    fs::remove(blocked);
 }
 int wmain(int argc, wchar_t** argv) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -238,6 +315,7 @@ int wmain(int argc, wchar_t** argv) {
         const fs::path scratch = fs::absolute(argv[2]);
         fs::create_directories(scratch);
         installation_dialog_tests();
+        future_version_tests(reader, scratch);
         test(parse_version("v1.20.3") > parse_version("1.9.99"), "Numeric version ordering");
         test(parse_version("0.2.0") == Version{0, 2, 0}, "Parse current version");
         for (auto text : {"", "1.2", "1.2.3.4", "01.2.3", "1.2.3-beta", "-1.2.3", "65536.0.0", "v.2.3"})
