@@ -4,6 +4,7 @@ Notable changes by release tag, newest first.
 
 ## v0.3.0
 
+- Blue lightning F app icon for the window, taskbar, executable, and Start menu shortcut.
 - Compact dark toolbar with editable page and zoom fields, clearer control states, and improved sidebar navigation.
 - Dark menu bar and drop-down menus with readable shortcuts, selection highlights, and disabled commands.
 - Compact dark About dialog with the app version, GitHub link, and a button for third-party notices.

@@ -42,6 +42,10 @@ The local release files are written to `artifacts/release/`.
 See [CHANGELOG.md](CHANGELOG.md) for release notes and [AGENTS.md](AGENTS.md) for
 the versioning and tag-based release process.
 
+The app icon source is `src/assets/fastpdf.png`. To regenerate the checked-in Windows icon,
+install Pillow and run `python scripts/generate-icon.py`. Normal builds use the existing ICO
+and do not need Pillow.
+
 ## Installation and manual updates
 
 The downloaded `fastpdf.exe` works portably. On the empty welcome screen, choose

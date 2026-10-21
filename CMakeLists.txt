@@ -31,7 +31,7 @@ add_custom_target(build_metadata
   VERBATIM)
 add_dependencies(fastpdf build_metadata)
 set_source_files_properties(src/app.rc PROPERTIES
-  OBJECT_DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/release-manifest.json")
+  OBJECT_DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/release-manifest.json;${CMAKE_CURRENT_SOURCE_DIR}/src/assets/fastpdf.ico")
 target_include_directories(fastpdf PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/docs")
 target_link_libraries(fastpdf PRIVATE deployment comctl32 comdlg32 shell32 dwmapi msimg32)
 add_executable(pdfprobe src/cli.cpp)
