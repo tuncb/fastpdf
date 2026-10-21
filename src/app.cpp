@@ -19,6 +19,7 @@ using namespace pdf;
 constexpr UINT worker_message = WM_APP + 1;
 constexpr int id_sidebar = 200, id_search = 201, id_toolbar = 202, id_page = 203, id_zoom = 204;
 constexpr int page_slot = 100, zoom_slot = 101, toolbar_height = 36;
+constexpr const wchar_t* menu_titles[] = {L"&File", L"&View", L"&Help"};
 enum class Job { open, render, search, export_png, print };
 enum class Fit { page, width, custom };
 struct PageInfo {
@@ -102,6 +103,10 @@ struct ToolbarTool {
     ToolbarIcon icon;
     const wchar_t* name;
 };
+struct MenuItem {
+    std::wstring title, shortcut;
+    bool bar = false, separator = false;
+};
 constexpr ToolbarTool toolbar_tools[] = {
     {cmd_open, ToolbarIcon::open, L"Open PDF (Ctrl+O)"},
     {cmd_print, ToolbarIcon::print, L"Print (Ctrl+P)"},
@@ -123,6 +128,7 @@ struct App {
     HINSTANCE instance = nullptr;
     HFONT font = nullptr, title_font = nullptr, small_font = nullptr, selected_font = nullptr;
     HBRUSH edit_background = nullptr, chrome_background = nullptr;
+    std::deque<MenuItem> menu_items;
     ui::Painter painter;
     HWND input_hover = nullptr;
     int sidebar_hover = -1;
@@ -450,6 +456,39 @@ static void request_render(App& a, bool reset_scroll = false) {
     sync_toolbar(a);
     InvalidateRect(a.window, nullptr, FALSE);
 }
+static void style_menu(App& a, HMENU menu, bool bar) {
+    MENUINFO info{sizeof(info)};
+    info.fMask = MIM_BACKGROUND;
+    info.hbrBack = bar ? a.chrome_background : a.edit_background;
+    SetMenuInfo(menu, &info);
+    for (int index = 0; index < GetMenuItemCount(menu); ++index) {
+        MENUITEMINFOW item{sizeof(item)};
+        item.fMask = MIIM_FTYPE | MIIM_DATA | MIIM_SUBMENU | MIIM_STRING;
+        if (!GetMenuItemInfoW(menu, UINT(index), TRUE, &item))
+            continue;
+        if (!(item.fType & MFT_OWNERDRAW)) {
+            std::wstring title(size_t(item.cch) + 1, L'\0');
+            item.dwTypeData = title.data();
+            ++item.cch;
+            GetMenuItemInfoW(menu, UINT(index), TRUE, &item);
+            title.resize(item.cch);
+            std::wstring shortcut;
+            if (auto tab = title.find(L'\t'); tab != std::wstring::npos) {
+                shortcut = title.substr(tab + 1);
+                title.resize(tab);
+            }
+            a.menu_items.push_back({std::move(title), std::move(shortcut), bar,
+                                    (item.fType & MFT_SEPARATOR) != 0});
+            item.dwItemData = reinterpret_cast<ULONG_PTR>(&a.menu_items.back());
+        }
+        // Keep the native strings and submenus for accessibility and menu navigation.
+        item.fMask = MIIM_FTYPE | MIIM_DATA;
+        item.fType |= MFT_OWNERDRAW;
+        SetMenuItemInfoW(menu, UINT(index), TRUE, &item);
+        if (item.hSubMenu)
+            style_menu(a, item.hSubMenu, false);
+    }
+}
 static void fonts(App& a) {
     for (auto f : {a.font, a.title_font, a.small_font, a.selected_font})
         if (f)
@@ -473,6 +512,8 @@ static void fonts(App& a) {
         SendMessageW(control, WM_SETFONT, WPARAM(a.font), TRUE);
     for (auto control : {a.toolbar, a.page_edit, a.zoom_edit})
         SendMessageW(control, WM_SETFONT, WPARAM(a.small_font), TRUE);
+    style_menu(a, GetMenu(a.window), true);
+    DrawMenuBar(a.window);
 }
 static void layout(App& a) {
     auto r = client(a);
@@ -1651,6 +1692,23 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         }
         case WM_ERASEBKGND:
             return 1;
+        case WM_NCPAINT:
+        case WM_NCACTIVATE: {
+            LRESULT result = DefWindowProcW(window, message, wp, lp);
+            if (a.chrome_background && GetMenu(window) && !IsIconic(window)) {
+                // Windows draws a light one-pixel menu divider outside the client area.
+                RECT client_rect{}, window_rect{};
+                GetClientRect(window, &client_rect);
+                MapWindowPoints(window, nullptr, reinterpret_cast<POINT*>(&client_rect), 2);
+                GetWindowRect(window, &window_rect);
+                OffsetRect(&client_rect, -window_rect.left, -window_rect.top);
+                RECT divider{client_rect.left, client_rect.top - 1, client_rect.right, client_rect.top};
+                HDC dc = GetWindowDC(window);
+                fill_rect(dc, divider, ui::border);
+                ReleaseDC(window, dc);
+            }
+            return result;
+        }
         case WM_NOTIFY: {
             auto header = reinterpret_cast<NMHDR*>(lp);
             if (header->hwndFrom == a.toolbar && header->code == NM_CUSTOMDRAW) {
@@ -1716,8 +1774,89 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             SetBkColor(HDC(wp), ui::surface);
             SetTextColor(HDC(wp), IsWindowEnabled(HWND(lp)) ? ui::text : ui::disabled);
             return LRESULT(a.edit_background);
+        case WM_MEASUREITEM: {
+            auto item = reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
+            if (item->CtlType != ODT_MENU || !item->itemData)
+                break;
+            const auto& data = *reinterpret_cast<const MenuItem*>(item->itemData);
+            if (data.separator) {
+                item->itemWidth = 0;
+                item->itemHeight = UINT(px(a, 9));
+                return TRUE;
+            }
+            HDC dc = GetDC(window);
+            auto old = SelectObject(dc, a.font);
+            RECT bounds{}, shortcut{};
+            DrawTextW(dc, data.title.c_str(), -1, &bounds,
+                      DT_SINGLELINE | DT_CALCRECT);
+            DrawTextW(dc, data.shortcut.c_str(), -1, &shortcut,
+                      DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
+            SelectObject(dc, old);
+            ReleaseDC(window, dc);
+            item->itemWidth = UINT(bounds.right + shortcut.right + px(a, data.bar ? 16 : 64));
+            item->itemHeight = UINT(data.bar
+                ? std::max(bounds.bottom + px(a, 6), LONG(GetSystemMetricsForDpi(SM_CYMENU, a.dpi)))
+                : std::max(bounds.bottom + px(a, 12), LONG(px(a, 30))));
+            return TRUE;
+        }
+        case WM_MENUCHAR: {
+            HMENU menu = HMENU(lp);
+            for (int index = 0; index < GetMenuItemCount(menu); ++index) {
+                MENUITEMINFOW item{sizeof(item)};
+                item.fMask = MIIM_FTYPE | MIIM_DATA | MIIM_STATE;
+                if (!GetMenuItemInfoW(menu, UINT(index), TRUE, &item) ||
+                    !(item.fType & MFT_OWNERDRAW) || !item.dwItemData ||
+                    (item.fState & (MFS_DISABLED | MFS_GRAYED)))
+                    continue;
+                const auto& title = reinterpret_cast<const MenuItem*>(item.dwItemData)->title;
+                for (size_t i = 0; i + 1 < title.size(); ++i) {
+                    if (title[i] != L'&')
+                        continue;
+                    if (title[++i] == L'&')
+                        continue;
+                    if (std::towupper(wchar_t(LOWORD(wp))) == std::towupper(title[i]))
+                        return MAKELRESULT(index, MNC_EXECUTE);
+                }
+            }
+            break;
+        }
         case WM_DRAWITEM: {
             auto item = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
+            if (item->CtlType == ODT_MENU && item->itemData) {
+                const auto& data = *reinterpret_cast<const MenuItem*>(item->itemData);
+                int saved = SaveDC(item->hDC);
+                bool disabled = (item->itemState & (ODS_DISABLED | ODS_GRAYED)) != 0;
+                COLORREF background = data.bar ? ui::chrome : ui::surface;
+                if (!disabled && !data.separator) {
+                    if (item->itemState & ODS_SELECTED)
+                        background = ui::selected;
+                    else if (item->itemState & ODS_HOTLIGHT)
+                        background = ui::hover;
+                }
+                fill_rect(item->hDC, item->rcItem, background);
+                RECT bounds = item->rcItem;
+                if (data.separator) {
+                    bounds.left += px(a, 12);
+                    bounds.right -= px(a, 12);
+                    bounds.top = (bounds.top + bounds.bottom) / 2;
+                    bounds.bottom = bounds.top + 1;
+                    fill_rect(item->hDC, bounds, ui::border);
+                    RestoreDC(item->hDC, saved);
+                    return TRUE;
+                }
+                UINT flags = (data.bar ? DT_CENTER : DT_LEFT) | DT_SINGLELINE | DT_VCENTER;
+                if (item->itemState & ODS_NOACCEL)
+                    flags |= DT_HIDEPREFIX;
+                if (!data.bar) {
+                    bounds.left += px(a, 16);
+                    bounds.right -= px(a, 16);
+                    label(item->hDC, bounds, data.shortcut, disabled ? ui::disabled : ui::muted,
+                          a.font, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                }
+                label(item->hDC, bounds, data.title, disabled ? ui::disabled : ui::text, a.font, flags);
+                RestoreDC(item->hDC, saved);
+                return TRUE;
+            }
             if (item->CtlID == cmd_install || item->CtlID == cmd_portable) {
                 const bool focused = (item->itemState & ODS_FOCUS) != 0;
                 const COLORREF fill = (item->itemState & ODS_SELECTED) ? ui::selected : ui::surface;
@@ -2074,9 +2213,9 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
     AppendMenuW(help, MF_STRING, cmd_install, L"&Installation…");
     AppendMenuW(help, MF_STRING, cmd_updates, L"Check for &updates…");
     AppendMenuW(help, MF_STRING, cmd_cancel_update, L"&Cancel update");
-    AppendMenuW(menu, MF_POPUP, UINT_PTR(file), L"&File");
-    AppendMenuW(menu, MF_POPUP, UINT_PTR(view), L"&View");
-    AppendMenuW(menu, MF_POPUP, UINT_PTR(help), L"&Help");
+    AppendMenuW(menu, MF_POPUP, UINT_PTR(file), menu_titles[0]);
+    AppendMenuW(menu, MF_POPUP, UINT_PTR(view), menu_titles[1]);
+    AppendMenuW(menu, MF_POPUP, UINT_PTR(help), menu_titles[2]);
     HWND window = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"FastPDF",
                                   WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL | WS_CLIPCHILDREN,
                                   CW_USEDEFAULT, CW_USEDEFAULT, 1280, 900, nullptr, menu, instance, &app);

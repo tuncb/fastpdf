@@ -5,6 +5,7 @@ Notable changes by release tag, newest first.
 ## v0.3.0
 
 - Compact dark toolbar with editable page and zoom fields, clearer control states, and improved sidebar navigation.
+- Dark menu bar and drop-down menus with readable shortcuts, selection highlights, and disabled commands.
 - Install FastPDF for your Windows account from the welcome screen or Help → Installation, with an optional Start menu shortcut and uninstall support in Windows Installed Apps.
 - Check for updates manually from Help. Downloads are verified before installation, with options to restart now or install when the reader closes. No automatic checks, startup app, or tray icon are added.
 - Reopen the current PDF at the same page, zoom mode, and rotation after an update. Passwords are not saved; protected documents may ask again.
