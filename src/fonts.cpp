@@ -983,6 +983,7 @@ static void reverse_font_cmap(Font& font) {
     release(face);
 }
 Font& load_font(Renderer& r, Document& d, const Value& input) {
+    ProfileTimer timer(r.profiling ? &r.profile.font_load_ms : nullptr);
     const auto& dictionary = resolve(d, input);
     auto found = r.fonts.find(&dictionary);
     if (found != r.fonts.end())

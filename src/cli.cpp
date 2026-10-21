@@ -28,7 +28,9 @@ static std::string json(std::string_view s) {
     return out + '\"';
 }
 static void write_profile(std::ostream& out, const pdf::RenderProfile& p) {
-    out << ",\"profile\":{\"content_ms\":" << p.content_ms << ",\"image_load_ms\":" << p.image_load_ms
+    out << ",\"profile\":{\"surface_ms\":" << p.surface_ms << ",\"content_ms\":" << p.content_ms
+        << ",\"interpret_ms\":" << p.interpret_ms << ",\"font_load_ms\":" << p.font_load_ms
+        << ",\"image_load_ms\":" << p.image_load_ms
         << ",\"image_stream_ms\":" << p.image_stream_ms << ",\"image_codec_ms\":" << p.image_codec_ms
         << ",\"image_convert_ms\":" << p.image_convert_ms << ",\"image_mask_ms\":" << p.image_mask_ms
         << ",\"image_resample_ms\":" << p.image_resample_ms << ",\"image_upload_ms\":" << p.image_upload_ms

@@ -105,7 +105,8 @@ struct ImageProfile {
     unsigned decoded_width = 0, decoded_height = 0, reduction = 0;
 };
 struct RenderProfile {
-    double content_ms = 0, image_load_ms = 0, image_stream_ms = 0, image_codec_ms = 0, image_convert_ms = 0,
+    double surface_ms = 0, content_ms = 0, interpret_ms = 0, font_load_ms = 0,
+           image_load_ms = 0, image_stream_ms = 0, image_codec_ms = 0, image_convert_ms = 0,
            image_mask_ms = 0, image_resample_ms = 0, image_upload_ms = 0, composite_ms = 0, finish_ms = 0,
            readback_ms = 0;
     size_t image_hits = 0, image_misses = 0;

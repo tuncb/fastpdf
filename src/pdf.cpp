@@ -718,7 +718,7 @@ static void outlines(Document& d, Value item, int depth, std::unordered_set<uint
         auto dest = get(node, "Dest");
         if (dest.kind == Kind::null)
             dest = get(entry(d, node, "A"), "D");
-        d.outline.push_back({pdf_text(get(node, "Title").text), destination_page(d, dest), depth});
+        d.outline.push_back({pdf_text(entry(d, node, "Title").text), destination_page(d, dest), depth});
         outlines(d, get(node, "First"), depth + 1, visited);
         item = get(node, "Next");
     }

@@ -2128,7 +2128,9 @@ RenderedPage render_page(Renderer& r, Document& d, size_t page_index, double sca
     out.width = unsigned(std::ceil(w));
     out.height = unsigned(std::ceil(h));
     out.page_matrix = m;
+    ProfileTimer surface_timer(r.profiling ? &r.profile.surface_ms : nullptr);
     auto target = surface(r, text_only ? 1 : out.width, text_only ? 1 : out.height);
+    surface_timer.stop();
     Context c;
     c.renderer = &r;
     c.document = &d;
@@ -2142,12 +2144,14 @@ RenderedPage render_page(Renderer& r, Document& d, size_t page_index, double sca
         ProfileTimer content_timer(r.profiling ? &r.profile.content_ms : nullptr);
         auto content = page_content(d, page);
         content_timer.stop();
+        ProfileTimer interpret_timer(r.profiling ? &r.profile.interpret_ms : nullptr);
         interpret(c, content, resolve(d, page.resources), 0);
         pop_clips(c, 0);
         c.g = {};
         c.g.ctm = m;
         annotations(c, page, resolve(d, page.resources), m);
         pop_clips(c, 0);
+        interpret_timer.stop();
         ProfileTimer finish_timer(r.profiling ? &r.profile.finish_ms : nullptr);
         hr(target->target->EndDraw(), "Render PDF page");
         finish_timer.stop();

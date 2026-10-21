@@ -141,6 +141,34 @@ def check_bookmarks(window, toolbar, page):
     selection(-1)  # The first bookmark starts on page 2.
 
 
+def check_bookmark_titles(executable, output):
+    # The same titles must appear whether they are stored in the outline item
+    # or in a separate PDF string object (as in the Mothes thesis).
+    document = output / "bookmark-titles.pdf"
+    titles = [b"(Introduction)",
+              b"<" + (b"\xfe\xff" + "Spline theory \u03a9".encode("utf-16-be")).hex().encode() + b">",
+              b"(Summary)"]
+    captures = []
+    for indirect in (False, True):
+        objects = base(extra_catalog=b"/Outlines 6 0 R")
+        objects.extend([
+            b"<< /Type /Outlines /First 7 0 R /Last 9 0 R /Count 3 >>",
+            b"<< /Parent 6 0 R /Next 9 0 R /First 8 0 R /Last 8 0 R /Count 1 /Dest [3 0 R /Fit] /Title "
+            + (b"10 0 R" if indirect else titles[0]) + b" >>",
+            b"<< /Parent 7 0 R /Dest [3 0 R /Fit] /Title "
+            + (b"11 0 R" if indirect else titles[1]) + b" >>",
+            b"<< /Parent 6 0 R /Prev 7 0 R /Dest [3 0 R /Fit] /Title "
+            + (b"12 0 R" if indirect else titles[2]) + b" >>",
+            *titles,
+        ])
+        document.write_bytes(pdf(objects))
+        capture = output / f"bookmark-titles-{'indirect' if indirect else 'direct'}.png"
+        subprocess.run([str(executable), str(document), "--screenshot", str(capture)],
+                       check=True, timeout=20)
+        captures.append(capture.read_bytes())
+    assert captures[0] == captures[1], "Indirect bookmark titles differ from direct titles"
+
+
 def run(executable, output):
     output.mkdir(parents=True, exist_ok=True)
     objects = base()
@@ -276,7 +304,8 @@ def run(executable, output):
                 process.wait()
                 raise AssertionError("Reader did not close")
         assert process.returncode == 0
-    print("Toolbar: empty/loaded states, bookmarks, navigation, input validation, zoom, toggles, and resizing passed")
+    check_bookmark_titles(executable, output)
+    print("Toolbar: empty/loaded states, bookmark titles, navigation, input validation, zoom, toggles, and resizing passed")
 
 
 if __name__ == "__main__":

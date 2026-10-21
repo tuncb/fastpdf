@@ -39,7 +39,7 @@ This implementation uses a software Direct2D surface for predictable offscreen r
 
 ## Measuring rendering
 
-`pdfprobe --timings` emits each render separately. The first render populates image/font resources; later renders reuse them. It does not use the GUI's rendered-page cache. `--benchmark 1` explicitly renders once. `--profile` adds stage timings, source image metadata and decoded dimensions. `--image-workers 1` selects serial decoding; `--full-resolution` disables codec downscaling.
+`pdfprobe --timings` emits each render separately. The first render populates image/font resources; later renders reuse them. It does not use the GUI's rendered-page cache. `--benchmark 1` explicitly renders once. `--profile` adds stage timings, source image metadata and decoded dimensions. The `surface_ms` field measures page surface creation. The `interpret_ms` field measures content interpretation and annotations, including the font work in `font_load_ms`. `--image-workers 1` selects serial decoding; `--full-resolution` disables codec downscaling.
 
 Profile fields are not additive: `image_load_ms` includes nested masks, codec time includes image preparation, and JPEG 2000 block/wavelet/output fields sum task time across parallel tiles. Compare page `ms` for wall latency and use stage fields to locate work.
 
