@@ -6,9 +6,10 @@ programs copied from the article collection.
 - `symbol-subset.ttf` contains two rectangular glyphs. Its Windows symbol cmap
   maps codes `F001` and `F041` to different rectangles. This tests a collision
   between a PDF character code and a glyph-name Unicode value.
-- `mac-subset-0.ttf`, `mac-subset-4.ttf`, and `mac-subset-6.ttf` use the same
-  rectangles with Macintosh cmap formats 0, 4, and 6. PDF code 1 must select
-  the left rectangle, even when its ToUnicode value is A (code 65).
+- `mac-subset-0.ttf`, `mac-subset-4.ttf`, and `mac-subset-6.ttf` contain a tall
+  rectangle and a short rectangle. Macintosh cmap formats 0, 4, and 6 map PDF
+  code 1 to the tall rectangle and code 65 to the short rectangle. ToUnicode
+  maps code 1 to A (Unicode 65); it must not change the glyph that is drawn.
 - `thin-stem.cff` contains simple test outlines. It tests the native encoding and
   the display weight of a small CFF glyph.
 - `cmyk-panels.jpg` contains four constant CMYK panels. It tests JPEG sample
