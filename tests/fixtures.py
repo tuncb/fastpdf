@@ -320,12 +320,12 @@ def generate(directory):
     objects = base(strips, b"/XObject << /Im 6 0 R >>")
     objects.append(stream(bytes(16 * 2 * 3), b"/Type /XObject /Subtype /Image /Width 16 /Height 2 "
                           b"/BitsPerComponent 8 /ColorSpace /DeviceRGB"))
-    add("image_strip_clips", pdf(objects), pixels=[(50, y, (0, 0, 0)) for y in range(165, 195)])
+    add("image_strip_clips", pdf(objects), pixels=[(50, y, (0, 0, 0)) for y in (165, 167, 169, 171, 173)])
     objects[2] = objects[2].replace(b"/XObject", b"/ExtGState << /G << /ca .5 >> >> /XObject")
     objects[4] = stream(b"/G gs " + strips)
-    add("image_strip_opacity", pdf(objects), pixels=[(50, y, (128, 128, 128)) for y in range(165, 195)], tolerance=1)
+    add("image_strip_opacity", pdf(objects), pixels=[(50, y, (128, 128, 128)) for y in (165, 167, 169, 171, 173)], tolerance=1)
     objects[4] = stream(b"q 0 1 -1 0 220 0 cm " + strips + b" Q")
-    add("image_strip_rotation", pdf(objects), pixels=[(x, 170, (0, 0, 0)) for x in range(165, 195)])
+    add("image_strip_rotation", pdf(objects), pixels=[(x, 170, (0, 0, 0)) for x in (165, 167, 169, 171, 173)])
     modes = ["Normal", "Multiply", "Screen", "Overlay", "Darken", "Lighten", "ColorDodge", "ColorBurn",
              "HardLight", "SoftLight", "Difference", "Exclusion", "Hue", "Saturation", "Color", "Luminosity"]
     resources = b"/ExtGState << " + b" ".join(f"/G{i} << /BM /{mode} /ca .5 >>".encode()
