@@ -55,8 +55,11 @@ to the document. Installation is also available from **Help → Installation…*
 
 Installation copies the reader to `%LOCALAPPDATA%\Programs\FastPDF`, optionally
 creates a Start menu shortcut, and registers FastPDF in Windows **Installed Apps**.
-It needs no administrator privileges and does not change the default PDF application.
-The Installation dialog lets you change the shortcut option or uninstall. You can
+It needs no administrator privileges and makes FastPDF available in **Open with**.
+Select **Use FastPDF as the default PDF reader** to open Windows Default apps after
+installation and confirm FastPDF for `.pdf` files. This option starts unchecked;
+your existing default is kept until you confirm a change in Windows Settings.
+The Installation dialog also lets you change the shortcut option or uninstall. You can
 also uninstall through Windows Settings or `fastpdf.exe --uninstall`. Uninstall
 removes FastPDF's files and registration and leaves your PDFs alone.
 

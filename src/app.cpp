@@ -1,6 +1,7 @@
 #include "render.h"
 #include "resource.h"
 #include "deployment.h"
+#include "installation_dialog.h"
 #include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -825,32 +826,24 @@ static void installation_dialog(App& a) {
     if (a.update_job.valid() || !a.pending_update.directory.empty())
         throw std::runtime_error("Finish or cancel the current update before changing the installation.");
     const bool present = deployment::installation_present();
-    std::wstring content = L"Install folder:\n" + deployment::install_directory().wstring();
-    BOOL shortcut = present ? deployment::shortcut_present() : TRUE;
-    std::vector<TASKDIALOG_BUTTON> buttons;
-    if (a.installed)
-        buttons = {{100, L"Apply"}, {101, L"Uninstall FastPDF"}};
-    else if (present)
-        buttons = {{102, L"Open installed FastPDF"}, {101, L"Uninstall FastPDF"}};
-    else {
-        buttons = {{100, L"Install FastPDF"}};
-        content += L"\n\nInstall for your Windows account, or cancel to keep using the portable reader.";
-    }
-    const int result =
-        task_dialog(a, a.installed ? L"FastPDF installation" : L"Install FastPDF", content, buttons,
-                    (!present || a.installed) ? L"Create a Start menu shortcut" : nullptr,
-                    (!present || a.installed) ? &shortcut : nullptr);
-    if (result == 100) {
-        deployment::install(shortcut != FALSE);
+    ui::InstallationOptions options{deployment::install_directory().wstring(), a.installed, present,
+                                    !present || deployment::shortcut_present(),
+                                    present && deployment::default_pdf_reader()};
+    const auto result = ui::show_installation_dialog(a.instance, a.window, options);
+    if (result == ui::InstallationAction::apply) {
+        deployment::install(options.shortcut);
         if (!a.installed) {
             deployment::open_installed(current_session(a));
             PostMessageW(a.window, WM_CLOSE, 0, 0);
-        } else
+        }
+        if (options.default_pdf && !deployment::default_pdf_reader())
+            deployment::open_pdf_defaults(a.window);
+        else if (a.installed)
             MessageBoxW(a.window, L"Installation options saved.", L"FastPDF", MB_OK | MB_ICONINFORMATION);
-    } else if (result == 102) {
+    } else if (result == ui::InstallationAction::open) {
         deployment::open_installed(current_session(a));
         PostMessageW(a.window, WM_CLOSE, 0, 0);
-    } else if (result == 101) {
+    } else if (result == ui::InstallationAction::uninstall) {
         if (MessageBoxW(a.window, L"Uninstall FastPDF for your Windows account? Your PDF files will be kept.",
                         L"Uninstall FastPDF", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
             deployment::start_uninstall();
