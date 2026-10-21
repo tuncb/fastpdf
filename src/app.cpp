@@ -6,6 +6,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <dwmapi.h>
+#include <uxtheme.h>
 #include <shellapi.h>
 #include <condition_variable>
 #include <deque>
@@ -1662,6 +1663,14 @@ static void create_toolbar(App& a) {
         SetWindowSubclass(control, input_frame_proc, 2, DWORD_PTR(&a));
     // The toolbar's native tooltip window also describes its two text fields.
     HWND tips = HWND(SendMessageW(a.toolbar, TB_GETTOOLTIPS, 0, 0));
+    require(tips != nullptr, "Cannot create toolbar hints");
+    // Use the application colors instead of the system tooltip theme.
+    SetWindowTheme(tips, L"", L"");
+    SendMessageW(tips, TTM_SETTIPBKCOLOR, ui::surface, 0);
+    SendMessageW(tips, TTM_SETTIPTEXTCOLOR, ui::text, 0);
+    SendMessageW(tips, TTM_SETDELAYTIME, TTDT_INITIAL, 400);
+    SendMessageW(tips, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
+    SendMessageW(tips, TTM_SETDELAYTIME, TTDT_AUTOPOP, 10000);
     for (auto [window, name] : {std::pair{a.page_edit, L"Page number — Enter to go, Esc to cancel"},
                                 {a.zoom_edit, L"Zoom percentage (5–800%) — Enter to apply"}}) {
         TOOLINFOW tool{sizeof(tool)};
@@ -1754,6 +1763,15 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         }
         case WM_NOTIFY: {
             auto header = reinterpret_cast<NMHDR*>(lp);
+            if (header->hwndFrom == a.toolbar && header->code == TBN_GETINFOTIPW) {
+                auto tip = reinterpret_cast<NMTBGETINFOTIPW*>(lp);
+                for (const auto& tool : toolbar_tools)
+                    if (tool.command == tip->iItem) {
+                        lstrcpynW(tip->pszText, tool.name, tip->cchTextMax);
+                        break;
+                    }
+                return 0;
+            }
             if (header->hwndFrom == a.toolbar && header->code == NM_CUSTOMDRAW) {
                 auto draw = reinterpret_cast<NMCUSTOMDRAW*>(lp);
                 if (draw->dwDrawStage == CDDS_PREPAINT) {
