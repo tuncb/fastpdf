@@ -64,8 +64,9 @@ def run(executable,root):
             if "size" in case: assert (info["width"],info["height"])==tuple(case["size"]),info
             if case.get("repaired"): assert info["repaired"],info
             else: assert not info["repaired"],info
-            if "pixel" in case:
-                x,y,expected=case["pixel"]
+            pixels=list(case.get("pixels",[]))
+            if "pixel" in case: pixels.append(case["pixel"])
+            for x,y,expected in pixels:
                 actual=png_pixel(output,x,y)
                 assert all(abs(a-b)<=case.get("tolerance",1) for a,b in zip(actual,expected)),f"pixel {x},{y}: {actual} != {expected}; {info}"
             if not case.get("repaired"): assert not info["warnings"],info
