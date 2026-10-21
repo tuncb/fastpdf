@@ -1167,6 +1167,7 @@ static void paint_sidebar_item(App& a, HDC dc, RECT rect, int index, bool select
     if (a.bookmarks && size_t(index) < a.outline.size()) {
         const auto& outline = a.outline[size_t(index)];
         text = outline.title;
+        std::replace(text.begin(), text.end(), L'\t', L' ');
         rect.left += px(a, std::min(outline.depth, 5) * 12);
     } else
         text = L"Page " + std::to_wstring(index + 1);
