@@ -425,6 +425,20 @@ def generate(directory):
     objects[3]=b"<< /Type /Font /Subtype /Type3 /Name /F1 /FontBBox [0 0 600 700] /FontMatrix [.001 0 0 .001 0 0] /FirstChar 65 /LastChar 65 /Widths [600] /Encoding << /Differences [65 /A] >> /CharProcs << /A 6 0 R >> /Resources << >> >>"
     objects += [stream(b"600 0 d0 0 0 500 700 re f")]
     add("type3",pdf(objects),text="AAA",pixel=(50,150,(0,0,0)))
+    # Type 3 widths use FontMatrix, including across separate text operations.
+    objects=base(b"BT /F1 40 Tf 20 160 Td (AAA) Tj 0 -60 Td (A) Tj (A) Tj (A) Tj "
+                 b"0 -60 Td 3 Tc 5 Tw 80 Tz [(A) -100 ( ) 100 (A)] TJ (A) Tj ET")
+    widths=b"25 " + b"0 " * 32 + b"50"
+    objects[3]=(b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 40 60] "
+                b"/FontMatrix [.01204 0 0 .01204 0 0] /FirstChar 32 /LastChar 65 "
+                b"/Widths [" + widths + b"] /Encoding << /Differences [32 /space 65 /A] >> "
+                b"/CharProcs << /A 6 0 R /space 7 0 R >> /Resources << >> >>")
+    objects += [stream(b"50 0 d0 0 0 40 60 re f"),stream(b"25 0 d0")]
+    add("type3_font_matrix",pdf(objects),text="AAA",pixels=[
+        (30,45,(0,0,0)),(41,45,(255,255,255)),(50,45,(0,0,0)),(75,45,(0,0,0)),
+        (30,105,(0,0,0)),(41,105,(255,255,255)),(50,105,(0,0,0)),(75,105,(0,0,0)),
+        (25,170,(0,0,0)),(41,170,(255,255,255)),(62,170,(0,0,0)),
+        (76,170,(255,255,255)),(84,170,(0,0,0))])
     objects=base(extra_page=b"/Annots [6 0 R]")
     objects += [b"<< /Type /Annot /Subtype /Square /Rect [140 20 200 100] /AP << /N 7 0 R >> >>",stream(b"0 1 0 rg 0 0 10 10 re f",b"/Type /XObject /Subtype /Form /BBox [0 0 10 10]")]
     add("annotation",pdf(objects),pixel=(160,150,(0,255,0)))

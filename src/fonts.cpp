@@ -1255,6 +1255,10 @@ std::vector<Glyph> decode_text(Font& f, std::string_view text) {
             if (SUCCEEDED(f.face->GetDesignGlyphMetrics(&g.index, 1, &metric)) && fm.designUnitsPerEm)
                 g.advance = double(metric.advanceWidth) * 1000 / fm.designUnitsPerEm;
         }
+        // Type 3 widths use glyph space. Convert the horizontal component to
+        // the 1000-unit text-space metrics used by the renderer.
+        if (f.type3)
+            g.advance *= f.matrix.a * 1000;
         g.vx = g.advance / 2;
         g.vy = f.default_vorigin;
         g.vadvance = f.default_vertical;
