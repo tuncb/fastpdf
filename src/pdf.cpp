@@ -348,6 +348,8 @@ void close(Document& doc) {
     doc.xref.clear();
     doc.pages.clear();
     doc.outline.clear();
+    doc.named_destinations.clear();
+    doc.destinations_loaded = false;
     doc.trailer = {};
     doc.catalog = {};
     doc.security = {};
@@ -671,21 +673,31 @@ static void pages(Document& d, const Value& ref, Value resources, Rect media, Re
     if (ref.kind == Kind::ref)
         path.erase(ref.object);
 }
-static const Value& named_dest(Document& d, const Value& tree, std::string_view name, int depth = 0) {
+static void index_destinations(Document& d, const Value& tree, std::unordered_set<const Value*>& visited,
+                                int depth = 0) {
     if (depth > 64)
-        return nil;
+        return;
+    check_cancel(d);
     auto& node = resolve(d, tree);
+    if (!visited.insert(&node).second)
+        return;
     auto& names = entry(d, node, "Names");
-    for (size_t i = 0; i + 1 < names.array.size(); i += 2)
-        if (names.array[i].text == name)
-            return names.array[i + 1];
-    auto& kids = entry(d, node, "Kids");
-    for (auto& child : kids.array) {
-        auto& found = named_dest(d, child, name, depth + 1);
-        if (found.kind != Kind::null)
-            return found;
+    for (size_t i = 0; i + 1 < names.array.size(); i += 2) {
+        require(d.named_destinations.size() < max_nodes, "Named destination limit exceeded");
+        d.named_destinations.try_emplace(names.array[i].text, &names.array[i + 1]);
     }
-    return nil;
+    auto& kids = entry(d, node, "Kids");
+    for (auto& child : kids.array)
+        index_destinations(d, child, visited, depth + 1);
+}
+static const Value& named_dest(Document& d, const std::string& name) {
+    if (!d.destinations_loaded) {
+        std::unordered_set<const Value*> visited;
+        index_destinations(d, get(entry(d, d.catalog, "Names"), "Dests"), visited);
+        d.destinations_loaded = true;
+    }
+    auto found = d.named_destinations.find(name);
+    return found == d.named_destinations.end() ? nil : *found->second;
 }
 int destination_page(Document& d, const Value& value) {
     const Value* dest = &resolve(d, value);
@@ -694,7 +706,7 @@ int destination_page(Document& d, const Value& value) {
         auto& old = get(legacy, dest->text);
         dest = old.kind != Kind::null
                    ? &resolve(d, old)
-                   : &resolve(d, named_dest(d, get(entry(d, d.catalog, "Names"), "Dests"), dest->text));
+                   : &resolve(d, named_dest(d, dest->text));
     }
     if (dest->kind == Kind::dict)
         dest = &entry(d, *dest, "D");

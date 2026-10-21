@@ -61,6 +61,25 @@ static void png_predictors() {
                  "Mixed PNG filters preserve rows across vector and scalar boundaries");
         }
 }
+static void named_destinations() {
+    pdf::Document doc;
+    doc.pages.resize(3);
+    for (unsigned i = 0; i < 3; ++i)
+        doc.pages[i].reference = pdf::reference(10 + i);
+    // Name trees may have multiple branches and duplicate names in damaged
+    // files. Keep the first match and the legacy dictionary's precedence.
+    doc.catalog = object("<< /Dests << /legacy [10 0 R /Fit] >> /Names << /Dests << /Kids ["
+                         "<< /Names [(last) [12 0 R /Fit] (shared) [11 0 R /Fit]] >>"
+                         "<< /Names [(legacy) [12 0 R /Fit] (shared) [12 0 R /Fit]"
+                         "(first) << /D [10 0 R /Fit] >>] >>] >> >> >>");
+    test(pdf::destination_page(doc, object("(last)")) == 2, "Indexed named destination");
+    test(pdf::destination_page(doc, object("/legacy")) == 0, "Legacy destination takes precedence");
+    test(pdf::destination_page(doc, object("(shared)")) == 1, "First duplicate destination wins");
+    test(pdf::destination_page(doc, object("(first)")) == 0, "Destination dictionary");
+    test(pdf::destination_page(doc, object("(missing)")) == -1, "Missing named destination");
+    pdf::close(doc);
+    test(doc.named_destinations.empty() && !doc.destinations_loaded, "Close clears destination pointers");
+}
 int main() {
     using namespace pdf;
     try {
@@ -122,6 +141,7 @@ int main() {
         test(predictor({1, 10, 10, 10, 2, 1, 2, 3}, params) == Bytes({10, 20, 30, 11, 22, 33}),
              "PNG Sub and Up predictors");
         png_predictors();
+        named_destinations();
         auto tiff = object("<< /Predictor 2 /Columns 3 /Colors 1 /BitsPerComponent 16 >>");
         test(predictor({0, 255, 0, 1, 0, 1}, tiff) == Bytes({0, 255, 1, 0, 1, 1}), "16-bit TIFF prediction");
         test(rc4(view("Plaintext"), view("Key")) == ascii_hex(view("BBF316E8D940AF0AD3")),

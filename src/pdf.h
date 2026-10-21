@@ -87,6 +87,8 @@ struct Document {
     size_t function_cache_bytes = 0;
     std::vector<Page> pages;
     std::vector<Outline> outline;
+    std::unordered_map<std::string, const Value*> named_destinations;
+    bool destinations_loaded = false;
     Security security;
     std::vector<std::string> warnings;
     std::wstring path;
