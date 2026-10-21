@@ -1,0 +1,226 @@
+[
+  {
+    "width": 1,
+    "height": 1,
+    "typical": false,
+    "custom": false,
+    "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+  },
+  {
+    "width": 1,
+    "height": 1,
+    "typical": false,
+    "custom": true,
+    "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+  },
+  {
+    "width": 1,
+    "height": 1,
+    "typical": true,
+    "custom": false,
+    "sha256": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"
+  },
+  {
+    "width": 1,
+    "height": 1,
+    "typical": true,
+    "custom": true,
+    "sha256": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"
+  },
+  {
+    "width": 1,
+    "height": 19,
+    "typical": false,
+    "custom": false,
+    "sha256": "5c754b3b453a10bcf38d58d6c09176fc8201361fbb5329c49e130cabc379a391"
+  },
+  {
+    "width": 1,
+    "height": 19,
+    "typical": false,
+    "custom": true,
+    "sha256": "5c754b3b453a10bcf38d58d6c09176fc8201361fbb5329c49e130cabc379a391"
+  },
+  {
+    "width": 1,
+    "height": 19,
+    "typical": true,
+    "custom": false,
+    "sha256": "5a90d3af1d598586fcc5c808f80f3734884b843d15434cfd5b3150bca6ff1c0d"
+  },
+  {
+    "width": 1,
+    "height": 19,
+    "typical": true,
+    "custom": true,
+    "sha256": "5a90d3af1d598586fcc5c808f80f3734884b843d15434cfd5b3150bca6ff1c0d"
+  },
+  {
+    "width": 2,
+    "height": 19,
+    "typical": false,
+    "custom": false,
+    "sha256": "3d7fece81b11db28acd56daa4884d708d1af53cf9a6c8295f1c48c0292f915f6"
+  },
+  {
+    "width": 2,
+    "height": 19,
+    "typical": false,
+    "custom": true,
+    "sha256": "3d7fece81b11db28acd56daa4884d708d1af53cf9a6c8295f1c48c0292f915f6"
+  },
+  {
+    "width": 2,
+    "height": 19,
+    "typical": true,
+    "custom": false,
+    "sha256": "75507991cd8896819ec125724dd7e51232f784d9bc4c110122867eb27a92fd5f"
+  },
+  {
+    "width": 2,
+    "height": 19,
+    "typical": true,
+    "custom": true,
+    "sha256": "75507991cd8896819ec125724dd7e51232f784d9bc4c110122867eb27a92fd5f"
+  },
+  {
+    "width": 3,
+    "height": 19,
+    "typical": false,
+    "custom": false,
+    "sha256": "3ac117da8562b34660267f4098254817066aba3d3f537e7c1bc17eb59b1b0b4f"
+  },
+  {
+    "width": 3,
+    "height": 19,
+    "typical": false,
+    "custom": true,
+    "sha256": "3ac117da8562b34660267f4098254817066aba3d3f537e7c1bc17eb59b1b0b4f"
+  },
+  {
+    "width": 3,
+    "height": 19,
+    "typical": true,
+    "custom": false,
+    "sha256": "1b5cd1bbf84f4e1bb6409cc4128fc0ef68f3a9485bff88e76e3efcd07a02c688"
+  },
+  {
+    "width": 3,
+    "height": 19,
+    "typical": true,
+    "custom": true,
+    "sha256": "1b5cd1bbf84f4e1bb6409cc4128fc0ef68f3a9485bff88e76e3efcd07a02c688"
+  },
+  {
+    "width": 4,
+    "height": 19,
+    "typical": false,
+    "custom": false,
+    "sha256": "51df33a261a53953e0e827c0cdf289eec482f5368c3abab7edba3875ec14faae"
+  },
+  {
+    "width": 4,
+    "height": 19,
+    "typical": false,
+    "custom": true,
+    "sha256": "51df33a261a53953e0e827c0cdf289eec482f5368c3abab7edba3875ec14faae"
+  },
+  {
+    "width": 4,
+    "height": 19,
+    "typical": true,
+    "custom": false,
+    "sha256": "ff40e0efb04f981d8ac1b8bf936665c69a90de3fa578e9731358f67128136e86"
+  },
+  {
+    "width": 4,
+    "height": 19,
+    "typical": true,
+    "custom": true,
+    "sha256": "ff40e0efb04f981d8ac1b8bf936665c69a90de3fa578e9731358f67128136e86"
+  },
+  {
+    "width": 5,
+    "height": 19,
+    "typical": false,
+    "custom": false,
+    "sha256": "49f85be7e085b02cf07c1c44a57aa964bf3d21ab0de402a83d2cdb2d00f1d359"
+  },
+  {
+    "width": 5,
+    "height": 19,
+    "typical": false,
+    "custom": true,
+    "sha256": "3ecc8e07f8387aec37d090179454d000a36d3fa71e83ccae487b3c29d04a0c06"
+  },
+  {
+    "width": 5,
+    "height": 19,
+    "typical": true,
+    "custom": false,
+    "sha256": "c6c8045d5f9f3f74ef55e61e5b5ae9c7d2269597eea404c0f284dd21fc576e51"
+  },
+  {
+    "width": 5,
+    "height": 19,
+    "typical": true,
+    "custom": true,
+    "sha256": "f55aabfc84df9c6ce8a6cf23f28ad0ef938681d62159b134aec6803ddf5ba89c"
+  },
+  {
+    "width": 17,
+    "height": 23,
+    "typical": false,
+    "custom": false,
+    "sha256": "238b4002582a8160ec4cebfb0d8a6d0d72a02d9f9208c010401e517dcacabca9"
+  },
+  {
+    "width": 17,
+    "height": 23,
+    "typical": false,
+    "custom": true,
+    "sha256": "101870f71d78d31dc503d68731f873da36abc0f24a57a3b399d0195d4c60aafb"
+  },
+  {
+    "width": 17,
+    "height": 23,
+    "typical": true,
+    "custom": false,
+    "sha256": "42d8acfc9fc8454fba2381044771a2d16f2c82be553eb7d02bd7912e9a4347c3"
+  },
+  {
+    "width": 17,
+    "height": 23,
+    "typical": true,
+    "custom": true,
+    "sha256": "550c1c31df208e563b4923e46e1a326617d73be20abb465db1b0fba9b87b9097"
+  },
+  {
+    "width": 65,
+    "height": 67,
+    "typical": false,
+    "custom": false,
+    "sha256": "92cf56134167c2572be42919d7788c501482146863ca10acc1e54b3e5ce17c3c"
+  },
+  {
+    "width": 65,
+    "height": 67,
+    "typical": false,
+    "custom": true,
+    "sha256": "2ecf1976db61c66a104e75f611aa293675ca6148064f7d56485044365707ff51"
+  },
+  {
+    "width": 65,
+    "height": 67,
+    "typical": true,
+    "custom": false,
+    "sha256": "69ae56fb7cb4d26256e1f81cf667b8760e820c4c60bb6f692555b940b46239ac"
+  },
+  {
+    "width": 65,
+    "height": 67,
+    "typical": true,
+    "custom": true,
+    "sha256": "1436f32f0ec109e53e3a8b2255f110ee71827d22834c3123969896b3a19ddb88"
+  }
+]

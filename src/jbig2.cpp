@@ -254,6 +254,9 @@ static BitmapPtr generic(Decoder& d, Arithmetic& a, int width, int height, unsig
                          const std::vector<Offset>& at, bool typical, const Bitmap* skip = nullptr) {
     auto out = bitmap(d, width, height);
     auto offsets = generic_template(kind, at);
+    bool standard = kind == 0 && !skip && at[0].x == 3 && at[0].y == -1 &&
+                    at[1].x == -3 && at[1].y == -1 && at[2].x == 2 && at[2].y == -2 &&
+                    at[3].x == -2 && at[3].y == -2;
     constexpr unsigned typical_context[] = {0x9b25, 0x795, 0xe5, 0x195};
     unsigned ltp = 0;
     for (int y = 0; y < height; ++y) {
@@ -265,6 +268,27 @@ static BitmapPtr generic(Decoder& d, Arithmetic& a, int width, int height, unsig
             if (y)
                 std::copy_n(out->pixels.begin() + size_t(y - 1) * width, width,
                             out->pixels.begin() + size_t(y) * width);
+            continue;
+        }
+        if (standard) {
+            // The standard template has three contiguous rows. Shift their
+            // contexts instead of reading all sixteen neighbours for each bit.
+            auto* row = out->pixels.data() + size_t(y) * width;
+            const auto* above = y ? row - width : nullptr;
+            const auto* above2 = y > 1 ? row - size_t(width) * 2 : nullptr;
+            unsigned row1 = 0, row2 = 0, current = 0;
+            for (int x = 0; x < 4; ++x)
+                row1 = (row1 << 1) | (above && x < width ? above[x] : 0);
+            for (int x = 0; x < 3; ++x)
+                row2 = (row2 << 1) | (above2 && x < width ? above2[x] : 0);
+            for (int x = 0; x < width; ++x) {
+                unsigned context = (row2 << 11) | (row1 << 4) | current;
+                unsigned value = mq_bit(a.mq, a.generic[context]);
+                row[x] = uint8_t(value);
+                current = ((current << 1) | value) & 15;
+                row1 = ((row1 << 1) | (above && x + 4 < width ? above[x + 4] : 0)) & 127;
+                row2 = ((row2 << 1) | (above2 && x + 3 < width ? above2[x + 3] : 0)) & 31;
+            }
             continue;
         }
         for (int x = 0; x < width; ++x) {

@@ -1,9 +1,11 @@
 """Check the owned codec against precomputed, independently decoded pixel fixtures."""
 from pathlib import Path
 import json
+import hashlib
 import struct
 import subprocess
 import sys
+from jbig2_fixtures import generic_stream
 
 executable=Path(sys.argv[1]).resolve()
 output=Path(sys.argv[2]).resolve()
@@ -44,3 +46,16 @@ for name,data in variants.items():
     result=subprocess.run([str(executable),str(source),str(output/'invalid.raw')],capture_output=True,text=True,timeout=10)
     assert result.returncode==1,(name,result.returncode,result.stderr)
 print(f"{len(variants)} malformed JPEG 2000 rejection checks passed")
+
+cases = json.loads((root / 'jbig2-generic.json').read_text())
+for case in cases:
+    source = output / 'generic.jb2'
+    target = output / 'generic.raw'
+    source.write_bytes(generic_stream(case['width'], case['height'], case['typical'], case['custom']))
+    result = subprocess.run([str(executable), '--jbig2', str(source), str(target),
+                             str(case['width']), str(case['height'])], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, (case, result.stderr)
+    actual = target.read_bytes()
+    assert len(actual) == case['width'] * case['height'], case
+    assert hashlib.sha256(actual).hexdigest() == case['sha256'], case
+print(f"{len(cases)} JBIG2 arithmetic pixel regressions passed")
