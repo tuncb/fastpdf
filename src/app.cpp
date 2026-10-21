@@ -1,5 +1,6 @@
 #include "render.h"
 #include "resource.h"
+#include "deployment.h"
 #include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -10,6 +11,8 @@
 #include <mutex>
 #include <thread>
 #include <cwctype>
+#include <future>
+#include <optional>
 
 using namespace pdf;
 constexpr UINT worker_message = WM_APP + 1;
@@ -85,7 +88,17 @@ enum Command {
     cmd_print,
     cmd_info,
     cmd_goto,
-    cmd_licenses
+    cmd_licenses,
+    cmd_install,
+    cmd_updates,
+    cmd_cancel_update,
+    cmd_portable
+};
+struct UpdateResult {
+    deployment::Release release;
+    deployment::Download download;
+    std::wstring error;
+    bool downloading = false;
 };
 struct App {
     HWND window = nullptr, sidebar = nullptr, search = nullptr;
@@ -111,6 +124,12 @@ struct App {
     std::wstring smoke_output;
     bool smoke = false;
     int exit_code = 0;
+    bool installed = false, portable_choice = false, update_on_exit = false;
+    std::optional<deployment::Session> restore;
+    std::atomic<bool> update_cancel = false;
+    std::future<UpdateResult> update_job;
+    deployment::Download pending_update;
+    std::wstring update_status;
 };
 static std::wstring lower(std::wstring s) {
     for (auto& c : s)
@@ -434,6 +453,9 @@ static void update_sidebar(App& a) {
     InvalidateRect(a.sidebar, nullptr, TRUE);
 }
 static void load_file(App& a, const std::wstring& path, const std::wstring& password = {}) {
+    if (a.restore && (a.restore->document.empty() ||
+                      std::filesystem::absolute(path) != std::filesystem::absolute(a.restore->document)))
+        a.restore.reset();
     a.path = path;
     a.password = password;
     ++a.document;
@@ -604,8 +626,163 @@ static void copy(App& a) {
     InvalidateRect(a.window, nullptr, FALSE);
 }
 
+static deployment::Session current_session(const App& a) {
+    return {a.path.empty() ? L"" : std::filesystem::absolute(a.path).wstring(), a.page, a.rotation,
+            int(a.fit), a.zoom};
+}
+static int task_dialog(App& a, const wchar_t* title, const std::wstring& content,
+                       const std::vector<TASKDIALOG_BUTTON>& buttons, const wchar_t* checkbox = nullptr,
+                       BOOL* checked = nullptr) {
+    TASKDIALOGCONFIG dialog{sizeof(dialog)};
+    dialog.hwndParent = a.window;
+    dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_SIZE_TO_CONTENT | TDF_POSITION_RELATIVE_TO_WINDOW;
+    if (checked && *checked)
+        dialog.dwFlags |= TDF_VERIFICATION_FLAG_CHECKED;
+    dialog.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    dialog.pszWindowTitle = L"FastPDF";
+    dialog.pszMainInstruction = title;
+    dialog.pszContent = content.c_str();
+    dialog.pszVerificationText = checkbox;
+    dialog.cButtons = UINT(buttons.size());
+    dialog.pButtons = buttons.data();
+    dialog.nDefaultButton = IDCANCEL;
+    int pressed = IDCANCEL;
+    if (FAILED(TaskDialogIndirect(&dialog, &pressed, nullptr, checked)))
+        throw std::runtime_error("Cannot open the FastPDF dialog");
+    return pressed;
+}
+static void installation_dialog(App& a) {
+    if (a.update_job.valid() || !a.pending_update.directory.empty())
+        throw std::runtime_error("Finish or cancel the current update before changing the installation.");
+    const bool present = deployment::installation_present();
+    std::wstring content = L"Install folder:\n" + deployment::install_directory().wstring();
+    BOOL shortcut = present ? deployment::shortcut_present() : TRUE;
+    std::vector<TASKDIALOG_BUTTON> buttons;
+    if (a.installed)
+        buttons = {{100, L"Apply"}, {101, L"Uninstall FastPDF"}};
+    else if (present)
+        buttons = {{102, L"Open installed FastPDF"}, {101, L"Uninstall FastPDF"}};
+    else {
+        buttons = {{100, L"Install FastPDF"}};
+        content += L"\n\nInstall for your Windows account, or cancel to keep using the portable reader.";
+    }
+    const int result =
+        task_dialog(a, a.installed ? L"FastPDF installation" : L"Install FastPDF", content, buttons,
+                    (!present || a.installed) ? L"Create a Start menu shortcut" : nullptr,
+                    (!present || a.installed) ? &shortcut : nullptr);
+    if (result == 100) {
+        deployment::install(shortcut != FALSE);
+        if (!a.installed) {
+            deployment::open_installed(current_session(a));
+            PostMessageW(a.window, WM_CLOSE, 0, 0);
+        } else
+            MessageBoxW(a.window, L"Installation options saved.", L"FastPDF", MB_OK | MB_ICONINFORMATION);
+    } else if (result == 102) {
+        deployment::open_installed(current_session(a));
+        PostMessageW(a.window, WM_CLOSE, 0, 0);
+    } else if (result == 101) {
+        if (MessageBoxW(a.window, L"Uninstall FastPDF for your Windows account? Your PDF files will be kept.",
+                        L"Uninstall FastPDF", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+            deployment::start_uninstall();
+            PostMessageW(a.window, WM_CLOSE, 0, 0);
+        }
+    }
+}
+static void ready_update(App& a) {
+    const int result = task_dialog(
+        a, L"Your update is ready",
+        L"FastPDF " + utf8(a.pending_update.version) +
+            L" has been downloaded and verified.\n\nClose other FastPDF windows before installing. "
+            L"Restarting will reopen this document at the same page. Protected PDFs may ask for their "
+            L"password again.",
+        {{100, L"Restart now"}, {101, L"Install when I close FastPDF"}, {102, L"Later"}});
+    if (result == 100) {
+        if (a.busy)
+            throw std::runtime_error("Wait for the current render, print, or export to finish, then choose "
+                                     "Check for updates again.");
+        deployment::start_update(a.pending_update, current_session(a), true);
+        a.pending_update = {};
+        a.update_on_exit = false;
+        PostMessageW(a.window, WM_CLOSE, 0, 0);
+    } else if (result == 101) {
+        deployment::require_no_other_instances();
+        a.update_on_exit = true;
+        a.update_status =
+            L"Update will install when you close FastPDF. Help → Cancel update to keep this version.";
+    } else {
+        a.update_on_exit = false;
+        a.update_status = L"Update ready. Help → Check for updates to install.";
+    }
+}
+static void start_update_job(App& a, std::optional<deployment::Release> release = {}) {
+    a.update_cancel = false;
+    a.update_status = release ? L"Downloading update…  Help → Cancel update" : L"Checking for updates…";
+    a.update_job = std::async(std::launch::async, [&a, release] {
+        UpdateResult result;
+        result.downloading = release.has_value();
+        try {
+            if (release)
+                result.download = deployment::download_release(*release, a.update_cancel);
+            else
+                result.release = deployment::check_release(a.update_cancel);
+        } catch (const std::exception& error) {
+            result.error = utf8(error.what());
+        }
+        return result;
+    });
+    SetTimer(a.window, 2, 200, nullptr);
+}
+static void poll_update(App& a) {
+    if (!a.update_job.valid() || a.update_job.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return;
+    KillTimer(a.window, 2);
+    auto result = a.update_job.get();
+    a.update_status.clear();
+    if (a.update_cancel) {
+        deployment::cleanup_download(result.download);
+        a.update_status = L"Update canceled.";
+    } else if (!result.error.empty()) {
+        MessageBoxW(a.window, result.error.c_str(), L"FastPDF update", MB_OK | MB_ICONERROR);
+    } else if (result.downloading) {
+        a.pending_update = std::move(result.download);
+        a.update_status = L"Update ready. Help → Check for updates to install.";
+        ready_update(a);
+    } else if (result.release.version <= deployment::parse_version(FASTPDF_VERSION)) {
+        MessageBoxW(a.window, L"FastPDF " FASTPDF_VERSION_W L" is up to date.", L"FastPDF update",
+                    MB_OK | MB_ICONINFORMATION);
+    } else if (task_dialog(a, L"A FastPDF update is available",
+                           L"Version " + utf8(result.release.tag) + L" is available. Download it now?",
+                           {{100, L"Download update"}}) == 100) {
+        start_update_job(a, result.release);
+    }
+    InvalidateRect(a.window, nullptr, FALSE);
+}
+static void cancel_update(App& a) {
+    a.update_cancel = true;
+    a.update_on_exit = false;
+    deployment::cleanup_download(a.pending_update);
+    a.pending_update = {};
+    a.update_status = a.update_job.valid() ? L"Canceling update…" : L"Update canceled.";
+}
 static void command(App& a, int id) {
-    if (id == cmd_open)
+    if (id == cmd_install)
+        installation_dialog(a);
+    else if (id == cmd_portable)
+        a.portable_choice = true;
+    else if (id == cmd_cancel_update)
+        cancel_update(a);
+    else if (id == cmd_updates) {
+        if (!a.installed) {
+            MessageBoxW(a.window,
+                        L"Install FastPDF to update it here. You can also download a new portable copy from "
+                        L"GitHub Releases.",
+                        L"FastPDF updates", MB_OK | MB_ICONINFORMATION);
+            installation_dialog(a);
+        } else if (!a.pending_update.directory.empty())
+            ready_update(a);
+        else if (!a.update_job.valid())
+            start_update_job(a);
+    } else if (id == cmd_open)
         choose_file(a);
     else if (id == cmd_prev)
         goto_page(a, a.page - 1);
@@ -692,7 +869,8 @@ static void command(App& a, int id) {
         DialogBoxParamW(a.instance, MAKEINTRESOURCEW(IDD_LICENSES), a.window, licenses_dialog,
                         reinterpret_cast<LPARAM>(a.instance));
     } else if (id == cmd_info) {
-        std::wstring info = L"FastPDF\nNative C++ reader with an owned PDF engine.\n\n";
+        std::wstring info =
+            L"FastPDF " FASTPDF_VERSION_W L"\nNative C++ reader with an owned PDF engine.\n\n";
         if (!a.pages.empty())
             info += std::to_wstring(a.pages.size()) + L" pages\n" + a.path + L"\n\n";
         if (a.bitmap && !a.bitmap->warnings.empty()) {
@@ -809,6 +987,21 @@ static void paint_app(App& a, HDC dc) {
         label(dc, {vp.left + px(a, 40), center + px(a, 32), vp.right - px(a, 40), center + px(a, 64)},
               L"Native Windows · Local files · An independent PDF engine", RGB(111, 122, 144), a.small_font,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (!a.installed && !a.portable_choice && a.path.empty()) {
+            const int midpoint = (vp.left + vp.right) / 2;
+            RECT install_rect{midpoint - px(a, 188), center + px(a, 88), midpoint - px(a, 8),
+                              center + px(a, 126)};
+            RECT portable_rect{midpoint + px(a, 8), center + px(a, 88), midpoint + px(a, 188),
+                               center + px(a, 126)};
+            fill_rect(dc, install_rect, RGB(93, 77, 204));
+            fill_rect(dc, portable_rect, RGB(50, 55, 67));
+            label(dc, install_rect, L"Install FastPDF", RGB(235, 237, 245), a.font,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            label(dc, portable_rect, L"Continue portable", RGB(235, 237, 245), a.font,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            a.buttons.push_back({install_rect, cmd_install, L"Install FastPDF"});
+            a.buttons.push_back({portable_rect, cmd_portable, L"Continue portable"});
+        }
     } else {
         RECT page = page_rect(a);
         RECT shadow = page;
@@ -850,8 +1043,8 @@ static void paint_app(App& a, HDC dc) {
     RestoreDC(dc, saved);
     RECT status{0, r.bottom - px(a, 30), r.right, r.bottom};
     fill_rect(dc, status, RGB(20, 23, 29));
-    label(dc, {px(a, 14), status.top, r.right - px(a, 250), status.bottom}, a.status, RGB(158, 169, 191),
-          a.small_font);
+    label(dc, {px(a, 14), status.top, r.right - px(a, 250), status.bottom},
+          a.update_status.empty() ? a.status : a.update_status, RGB(158, 169, 191), a.small_font);
     if (!a.pages.empty()) {
         std::wstring details = std::to_wstring(int(a.scale * 72 / a.dpi * 100)) + L"%";
         if (a.bitmap)
@@ -936,6 +1129,13 @@ static void receive(App& a) {
             a.pages = std::move(result.pages);
             a.outline = std::move(result.outline);
             a.status = result.message;
+            if (a.restore) {
+                a.page = std::clamp(a.restore->page, 0, std::max(0, int(a.pages.size()) - 1));
+                a.rotation = a.restore->rotation;
+                a.fit = Fit(a.restore->fit);
+                a.zoom = a.restore->zoom;
+                a.restore.reset();
+            }
             update_sidebar(a);
             layout(a);
             request_render(a, true);
@@ -1080,7 +1280,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             }
             return 0;
         case WM_TIMER:
-            if (wp == 1) {
+            if (wp == 2)
+                poll_update(a);
+            else if (wp == 1) {
                 KillTimer(window, 1);
                 request_render(a);
             }
@@ -1126,6 +1328,18 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             label(item->hDC, rect, text, selected ? RGB(243, 241, 255) : RGB(177, 187, 208), a.font);
             return TRUE;
         }
+        case WM_INITMENUPOPUP:
+            EnableMenuItem(
+                GetMenu(window), cmd_cancel_update,
+                MF_BYCOMMAND |
+                    (a.update_job.valid() || !a.pending_update.directory.empty() ? MF_ENABLED : MF_GRAYED));
+            EnableMenuItem(GetMenu(window), cmd_updates,
+                           MF_BYCOMMAND | (a.update_job.valid() ? MF_GRAYED : MF_ENABLED));
+            EnableMenuItem(
+                GetMenu(window), cmd_install,
+                MF_BYCOMMAND |
+                    (a.update_job.valid() || !a.pending_update.directory.empty() ? MF_GRAYED : MF_ENABLED));
+            return 0;
         case WM_COMMAND:
             if (LOWORD(wp) == id_sidebar && HIWORD(wp) == LBN_SELCHANGE) {
                 int index = int(SendMessageW(a.sidebar, LB_GETCURSEL, 0, 0));
@@ -1330,6 +1544,18 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             receive(a);
             return 0;
         case WM_CLOSE:
+            if (a.update_on_exit && !a.pending_update.directory.empty()) {
+                deployment::start_update(a.pending_update, current_session(a), false);
+                a.pending_update = {};
+                a.update_on_exit = false;
+            }
+            a.update_cancel = true;
+            if (a.update_job.valid()) {
+                auto result = a.update_job.get();
+                deployment::cleanup_download(result.download);
+            }
+            deployment::cleanup_download(a.pending_update);
+            a.pending_update = {};
             DestroyWindow(window);
             return 0;
         case WM_DESTROY:
@@ -1356,25 +1582,65 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
     }
     return DefWindowProcW(window, message, wp, lp);
 }
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+struct InstanceLock {
+    HANDLE handle = nullptr;
+    ~InstanceLock() {
+        if (handle)
+            CloseHandle(handle);
+    }
+};
+static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>& arguments) {
+    const int maintenance = deployment::maintenance_command(arguments);
+    if (maintenance >= 0)
+        return maintenance;
+    deployment::cleanup_stale_helpers();
+    if (arguments.size() == 1 && arguments[0] == L"--uninstall") {
+        if (!deployment::installation_present())
+            throw std::runtime_error("FastPDF is not installed for this Windows account.");
+        if (MessageBoxW(nullptr, L"Uninstall FastPDF? Your PDF files will be kept.", L"Uninstall FastPDF",
+                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
+            deployment::start_uninstall();
+        return 0;
+    }
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&controls);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     App app;
     app.instance = instance;
+    app.installed = deployment::installed_instance();
+    InstanceLock instance_lock{deployment::acquire_instance_lock()};
     std::wstring initial_path;
-    int argc = 0;
-    auto args = CommandLineToArgvW(GetCommandLineW(), &argc);
-    for (int i = 1; i < argc; ++i) {
-        std::wstring arg = args[i];
-        if (arg == L"--screenshot" && i + 1 < argc) {
+    const bool install = arguments.size() == 1 && arguments[0] == L"--install";
+    if (!arguments.empty() && arguments[0] == L"--restore-view") {
+        const bool capture = arguments.size() == 8 && arguments[6] == L"--screenshot";
+        if (arguments.size() != 6 && !capture &&
+            !(arguments.size() == 8 && arguments[6] == L"--update-ready" &&
+              arguments[7].starts_with(L"Local\\FastPDF.Ready.")))
+            throw std::runtime_error("Invalid restored session arguments");
+        app.restore = deployment::parse_session({arguments.begin(), arguments.begin() + 6});
+        initial_path = app.restore->document;
+        if (capture) {
             app.smoke = true;
-            app.smoke_output = args[++i];
-        } else
-            initial_path = arg;
+            app.smoke_output = arguments[7];
+        }
+    } else if (!install) {
+        bool literal = false;
+        for (size_t i = 0; i < arguments.size(); ++i) {
+            const auto& arg = arguments[i];
+            if (!literal && arg == L"--") {
+                literal = true;
+                continue;
+            }
+            if (!literal && arg == L"--screenshot" && i + 1 < arguments.size()) {
+                app.smoke = true;
+                app.smoke_output = arguments[++i];
+            } else {
+                if ((!literal && arg.starts_with(L"--")) || !initial_path.empty())
+                    throw std::runtime_error("Usage: fastpdf [document.pdf] | --install | --uninstall");
+                initial_path = arg;
+            }
+        }
     }
-    LocalFree(args);
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = window_proc;
     wc.hInstance = instance;
@@ -1396,6 +1662,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     AppendMenuW(view, MF_STRING, cmd_bookmarks, L"&Bookmarks\tB");
     AppendMenuW(help, MF_STRING, cmd_info, L"&About and shortcuts\tF1");
     AppendMenuW(help, MF_STRING, cmd_licenses, L"Third-party &notices…");
+    AppendMenuW(help, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(help, MF_STRING, cmd_install, L"&Installation…");
+    AppendMenuW(help, MF_STRING, cmd_updates, L"Check for &updates…");
+    AppendMenuW(help, MF_STRING, cmd_cancel_update, L"&Cancel update");
     AppendMenuW(menu, MF_POPUP, UINT_PTR(file), L"&File");
     AppendMenuW(menu, MF_POPUP, UINT_PTR(view), L"&View");
     AppendMenuW(menu, MF_POPUP, UINT_PTR(help), L"&Help");
@@ -1403,11 +1673,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                                   WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL | WS_CLIPCHILDREN,
                                   CW_USEDEFAULT, CW_USEDEFAULT, 1280, 900, nullptr, menu, instance, &app);
     if (!window) {
-        CoUninitialize();
         return 1;
     }
     ShowWindow(window, app.smoke ? SW_HIDE : show);
     UpdateWindow(window);
+    deployment::startup_succeeded(arguments);
+    if (install)
+        PostMessageW(window, WM_COMMAND, cmd_install, 0);
     if (!initial_path.empty())
         load_file(app, initial_path);
     else if (app.smoke) {
@@ -1419,6 +1691,24 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-    CoUninitialize();
     return int(message.wParam);
+}
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    int result = 1;
+    try {
+        int count = 0;
+        auto raw = CommandLineToArgvW(GetCommandLineW(), &count);
+        if (!raw)
+            throw std::runtime_error("Cannot read command-line arguments");
+        std::vector<std::wstring> arguments;
+        for (int i = 1; i < count; ++i)
+            arguments.emplace_back(raw[i]);
+        LocalFree(raw);
+        result = run_app(instance, show, arguments);
+    } catch (const std::exception& error) {
+        MessageBoxW(nullptr, utf8(error.what()).c_str(), L"FastPDF", MB_OK | MB_ICONERROR);
+    }
+    CoUninitialize();
+    return result;
 }

@@ -8,6 +8,7 @@
 - Run all CTest checks, including Python integration and codec tests, before release. Resolve build warnings and test failures.
 - For release tooling changes, run `python -m unittest discover -s .github/scripts -p 'test_*.py'` and `node --test .github/scripts/resolve-release-build.test.cjs`.
 - Keep generated builds, downloaded reference data, and release artifacts in the ignored build or artifacts directories.
+- Installation and update tests must use isolated filesystem and registry fixtures; never modify a real user installation as part of CTest. Updates are manual-only, with no tray icon or scheduled/background checks.
 
 ## Version updates
 

@@ -2,6 +2,13 @@
 
 Notable changes by release tag, newest first.
 
+## v0.3.0
+
+- Install FastPDF for your Windows account from the welcome screen or Help → Installation, with an optional Start menu shortcut and uninstall support in Windows Installed Apps.
+- Check for updates manually from Help. Downloads are verified before installation, with options to restart now or install when the reader closes. No automatic checks, startup app, or tray icon are added.
+- Reopen the current PDF at the same page, zoom mode, and rotation after an update. Passwords are not saved; protected documents may ask again.
+- Continue using the single executable portably without installing it.
+
 ## v0.2.0
 
 - Download and run `fastpdf.exe` directly. Releases now contain only the standalone Windows x64 reader and `SHA256SUMS.txt`, replacing the ZIP bundle.

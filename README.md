@@ -42,6 +42,41 @@ The local release files are written to `artifacts/release/`.
 See [CHANGELOG.md](CHANGELOG.md) for release notes and [AGENTS.md](AGENTS.md) for
 the versioning and tag-based release process.
 
+## Installation and manual updates
+
+The downloaded `fastpdf.exe` works portably. On the empty welcome screen, choose
+**Install FastPDF** or **Continue portable**. Opening a PDF directly goes straight
+to the document. Installation is also available from **Help → Installation…** or
+`fastpdf.exe --install`.
+
+Installation copies the reader to `%LOCALAPPDATA%\Programs\FastPDF`, optionally
+creates a Start menu shortcut, and registers FastPDF in Windows **Installed Apps**.
+It needs no administrator privileges and does not change the default PDF application.
+The Installation dialog lets you change the shortcut option or uninstall. You can
+also uninstall through Windows Settings or `fastpdf.exe --uninstall`. Uninstall
+removes FastPDF's files and registration and leaves your PDFs alone.
+
+Use **Help → Check for updates…** from the installed reader. FastPDF checks the
+latest stable GitHub release only when requested, then asks before downloading.
+The download runs separately from document rendering and can be canceled from
+**Help → Cancel update**. It verifies the executable's SHA-256 checksum, Windows
+x64 architecture, version, and required embedded resources.
+
+Once an update is ready, choose **Restart now**, **Install when I close FastPDF**,
+or **Later**. Close other FastPDF windows before installing. Restart restores the
+current document, page, zoom mode, and rotation; document passwords are never
+saved. Choosing Later keeps the download for the current session; closing without
+choosing installation discards it. Cancel update also cancels installation on exit.
+Portable copies must be installed to use the updater, or replaced with a fresh
+download from GitHub Releases.
+
+The executable briefly runs a temporary copy of itself to finish an update or
+uninstall after the reader exits. Replacement retains the previous executable until
+the new reader starts successfully. Temporary maintenance files are cleaned when
+possible, with any still-running helper cleaned on a subsequent FastPDF launch.
+There are no automatic update checks, scheduled tasks, login startup entries,
+background services, or tray icons.
+
 ## Reader controls
 
 - Open: Ctrl+O or drag a PDF into the window.
@@ -53,6 +88,7 @@ the versioning and tag-based release process.
 - Bookmarks: B or Outline. Links support document destinations and HTTP, HTTPS, and mail links.
 - Export the current page: Ctrl+S. Print: Ctrl+P.
 - Document information and compatibility notes: F1 or the File menu.
+- Installation and manual updates: Help menu.
 
 The UI renders in a worker thread, cancels obsolete render/search requests, caches page bitmaps, and prefetches adjacent pages when idle. Search reads text without rasterizing the page's images and graphics. The current UI displays one page at a time.
 
