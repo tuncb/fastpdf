@@ -97,6 +97,50 @@ def rect(hwnd):
     return value
 
 
+def check_bookmarks(window, toolbar, page):
+    sidebar = user.GetDlgItem(window, 200)
+    assert user.SendMessageW(toolbar, TB_ISBUTTONCHECKED, 10, 0), "Bookmarks did not open by default"
+
+    def selection(expected):
+        assert user.SendMessageW(sidebar, 0x188, 0, 0) == expected, "Wrong selected bookmark"
+        if expected >= 0:
+            assert user.SendMessageW(sidebar, 0x19F, 0, 0) == expected, "Bookmark focus does not match selection"
+
+    def point(index):
+        row = w.RECT()
+        assert user.SendMessageW(sidebar, 0x198, index, c.addressof(row)) != -1  # LB_GETITEMRECT
+        return (((row.top + row.bottom) // 2) << 16) | 20
+
+    # Click a child that shares its destination with the preceding parent bookmark.
+    user.SendMessageW(sidebar, 0x201, 1, point(2))
+    user.SendMessageW(sidebar, 0x202, 0, point(2))
+    assert text(page) == "2"
+    selection(2)
+    assert focused(window) == sidebar, "Bookmark click lost list focus"
+    for index in (0, 3, 1, 2, 0):
+        user.SendMessageW(sidebar, 0x200, 0, point(index))  # WM_MOUSEMOVE
+        user.SendMessageW(sidebar, 0xF, 0, 0)  # WM_PAINT
+        selection(2)
+    user.SendMessageW(sidebar, 0x2A3, 0, 0)  # WM_MOUSELEAVE
+    selection(2)
+
+    # Page navigation selects the nearest destination, even if the outline is not sorted.
+    user.SendMessageW(window, WM_COMMAND, 3, 0)
+    selection(3)
+    user.SendMessageW(window, WM_COMMAND, 2, 0)
+    selection(1)
+    user.SendMessageW(sidebar, WM_KEYDOWN, 0x28, 0)
+    selection(2)  # A second bookmark on the same page must remain selectable.
+    user.SendMessageW(sidebar, WM_KEYDOWN, 0x28, 0)
+    selection(3)
+    assert text(page) == "3"
+    user.SendMessageW(window, WM_COMMAND, 3, 0)
+    assert text(page) == "4"
+    selection(3)  # Keep the section selected on pages with no bookmark destination.
+    enter(page, "1")
+    selection(-1)  # The first bookmark starts on page 2.
+
+
 def run(executable, output):
     output.mkdir(parents=True, exist_ok=True)
     objects = base()
@@ -104,11 +148,26 @@ def run(executable, output):
     objects.extend([objects[2], objects[2]])
     sample = output / "toolbar.pdf"
     sample.write_bytes(pdf(objects))
+    objects[0] = b"<< /Type /Catalog /Pages 2 0 R /Outlines 8 0 R >>"
+    objects[1] = b"<< /Type /Pages /Kids [3 0 R 6 0 R 7 0 R 15 0 R] /Count 4 >>"
+    objects.extend([
+        b"<< /Type /Outlines /First 9 0 R /Last 14 0 R /Count 6 >>",
+        b"<< /Title (Heading without a destination) /Parent 8 0 R /Next 10 0 R >>",
+        b"<< /Title (Section) /Parent 8 0 R /Prev 9 0 R /Next 12 0 R /First 11 0 R /Last 11 0 R /Count 1 /Dest [6 0 R /Fit] >>",
+        b"<< /Title (Child) /Parent 10 0 R /Dest [6 0 R /Fit] >>",
+        b"<< /Title (Last section) /Parent 8 0 R /Prev 10 0 R /Next 13 0 R /Dest [7 0 R /Fit] >>",
+        b"<< /Title (Earlier section) /Parent 8 0 R /Prev 12 0 R /Next 14 0 R /Dest [6 0 R /Fit] >>",
+        b"<< /Title (Heading without a destination) /Parent 8 0 R /Prev 13 0 R >>",
+        objects[2],
+    ])
+    bookmarked = output / "bookmarks.pdf"
+    bookmarked.write_bytes(pdf(objects))
     startup = subprocess.STARTUPINFO()
     startup.dwFlags = subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = 0
-    for loaded in (False, True):
-        process = subprocess.Popen([str(executable)] + ([str(sample)] if loaded else []), startupinfo=startup)
+    for document in (None, sample, bookmarked):
+        loaded = document is not None
+        process = subprocess.Popen([str(executable)] + ([str(document)] if loaded else []), startupinfo=startup)
         try:
             window = wait_for(lambda: find_window(process.pid), "reader window")
             toolbar = wait_for(lambda: user.GetDlgItem(window, 202), "native toolbar")
@@ -116,6 +175,8 @@ def run(executable, output):
             zoom = wait_for(lambda: user.GetDlgItem(toolbar, 204), "zoom field")
             if loaded:
                 wait_for(lambda: user.IsWindowEnabled(page) and text(page) == "1", "PDF opened")
+                if document == bookmarked:
+                    check_bookmarks(window, toolbar, page)
             else:
                 wait_for(lambda: text(page) == "—", "empty state")
             assert bool(user.SendMessageW(toolbar, TB_ISBUTTONENABLED, 1, 0))
@@ -140,15 +201,16 @@ def run(executable, output):
                 continue
 
             # Native navigation, direct page entry, bounds, and invalid-input rejection.
+            last_page = "4" if document == bookmarked else "3"
             user.SendMessageW(window, WM_COMMAND, 3, 0)
             wait_for(lambda: text(page) == "2", "next page")
-            enter(page, "3")
-            wait_for(lambda: text(page) == "3", "direct page entry")
+            enter(page, last_page)
+            wait_for(lambda: text(page) == last_page, "direct page entry")
             assert not user.SendMessageW(toolbar, TB_ISBUTTONENABLED, 3, 0)
             enter(page, "99")
             assert text(page) == "99", "Invalid page unexpectedly accepted"
             user.SendMessageW(page, WM_KEYDOWN, 27, 0)
-            assert text(page) == "3", "Escape did not restore the page"
+            assert text(page) == last_page, "Escape did not restore the page"
 
             enter(zoom, "125%")
             wait_for(lambda: text(zoom) == "125%", "zoom entry")
@@ -167,7 +229,8 @@ def run(executable, output):
             assert not user.SendMessageW(toolbar, TB_ISBUTTONCHECKED, 6, 0)
 
             # Switching from bookmarks to pages shows pages instead of hiding the sidebar.
-            user.SendMessageW(window, WM_COMMAND, 10, 0)
+            if not user.SendMessageW(toolbar, TB_ISBUTTONCHECKED, 10, 0):
+                user.SendMessageW(window, WM_COMMAND, 10, 0)
             assert user.SendMessageW(toolbar, TB_ISBUTTONCHECKED, 10, 0)
             user.SendMessageW(window, WM_COMMAND, 9, 0)
             assert user.SendMessageW(toolbar, TB_ISBUTTONCHECKED, 9, 0)
@@ -213,7 +276,7 @@ def run(executable, output):
                 process.wait()
                 raise AssertionError("Reader did not close")
         assert process.returncode == 0
-    print("Toolbar: empty/loaded states, navigation, input validation, zoom, toggles, and resizing passed")
+    print("Toolbar: empty/loaded states, bookmarks, navigation, input validation, zoom, toggles, and resizing passed")
 
 
 if __name__ == "__main__":

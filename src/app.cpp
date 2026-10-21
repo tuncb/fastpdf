@@ -143,7 +143,7 @@ struct App {
     int page = 0, rotation = 0, scroll_x = 0, scroll_y = 0;
     double scale = 1, bitmap_scale = 1, zoom = 1;
     Fit fit = Fit::page;
-    bool show_sidebar = true, bookmarks = false, find_open = false, busy = false, dragging = false,
+    bool show_sidebar = false, bookmarks = true, find_open = false, busy = false, dragging = false,
          panning = false, selected_all = false;
     POINT drag_start{}, drag_end{}, pan_start{};
     int pan_x = 0, pan_y = 0;
@@ -534,12 +534,47 @@ static void layout(App& a) {
     layout_toolbar(a);
     sync_toolbar(a);
 }
-static void update_sidebar(App& a) {
-    a.sidebar_hover = -1;
-    SendMessageW(a.sidebar, LB_SETCOUNT, WPARAM(a.bookmarks ? a.outline.size() : a.pages.size()), 0);
-    if (!a.bookmarks)
-        SendMessageW(a.sidebar, LB_SETCURSEL, WPARAM(a.page), 0);
-    InvalidateRect(a.sidebar, nullptr, TRUE);
+static void set_sidebar_hover(App& a, int hover) {
+    if (hover == a.sidebar_hover)
+        return;
+    int selected = int(SendMessageW(a.sidebar, LB_GETCURSEL, 0, 0));
+    for (int index : {a.sidebar_hover, hover}) {
+        RECT rect{};
+        if (index >= 0 && index != selected &&
+            SendMessageW(a.sidebar, LB_GETITEMRECT, WPARAM(index), LPARAM(&rect)) != LB_ERR)
+            InvalidateRect(a.sidebar, &rect, FALSE);
+    }
+    a.sidebar_hover = hover;
+}
+static void update_sidebar(App& a, bool reset = false) {
+    int current = reset ? -1 : int(SendMessageW(a.sidebar, LB_GETCURSEL, 0, 0));
+    int selected = a.pages.empty() ? -1 : a.page;
+    if (a.bookmarks) {
+        selected = -1;
+        int best_page = -1;
+        for (size_t i = 0; i < a.outline.size(); ++i) {
+            int page = a.outline[i].page;
+            if (page > best_page && page <= a.page) {
+                best_page = page;
+                selected = int(i);
+            }
+        }
+        // Keep the user's choice when several bookmarks have the same destination.
+        if (best_page >= 0 && current >= 0 && size_t(current) < a.outline.size() &&
+            a.outline[size_t(current)].page == best_page)
+            selected = current;
+    }
+    int count = int(a.bookmarks ? a.outline.size() : a.pages.size());
+    if (reset || SendMessageW(a.sidebar, LB_GETCOUNT, 0, 0) != count) {
+        // LB_SETCOUNT resets the selection and caret, even when the count is unchanged.
+        SendMessageW(a.sidebar, LB_SETCOUNT, WPARAM(count), 0);
+        a.sidebar_hover = -1;
+        InvalidateRect(a.sidebar, nullptr, FALSE);
+    }
+    if (SendMessageW(a.sidebar, LB_GETCURSEL, 0, 0) != selected) {
+        set_sidebar_hover(a, -1);
+        SendMessageW(a.sidebar, LB_SETCURSEL, WPARAM(selected), 0);
+    }
 }
 static void load_file(App& a, const std::wstring& path, const std::wstring& password = {}) {
     if (a.restore && (a.restore->document.empty() ||
@@ -957,7 +992,7 @@ static void command(App& a, int id) {
         bool bookmarks = id == cmd_bookmarks;
         a.show_sidebar = !(a.show_sidebar && a.bookmarks == bookmarks);
         a.bookmarks = bookmarks;
-        update_sidebar(a);
+        update_sidebar(a, true);
         layout(a);
         request_render(a);
     } else if (id == cmd_search) {
@@ -1384,6 +1419,8 @@ static void receive(App& a) {
         if (result.kind == Job::open) {
             a.pages = std::move(result.pages);
             a.outline = std::move(result.outline);
+            a.bookmarks = true;
+            a.show_sidebar = !a.outline.empty();
             a.status = result.message;
             if (a.restore) {
                 a.page = std::clamp(a.restore->page, 0, std::max(0, int(a.pages.size()) - 1));
@@ -1392,7 +1429,7 @@ static void receive(App& a) {
                 a.zoom = a.restore->zoom;
                 a.restore.reset();
             }
-            update_sidebar(a);
+            update_sidebar(a, true);
             layout(a);
             request_render(a, true);
         } else if (result.kind == Job::render) {
@@ -1490,15 +1527,11 @@ static LRESULT CALLBACK sidebar_proc(HWND window, UINT message, WPARAM wp, LPARA
     if (message == WM_MOUSEMOVE) {
         DWORD item = DWORD(SendMessageW(window, LB_ITEMFROMPOINT, 0, lp));
         int hover = HIWORD(item) ? -1 : int(LOWORD(item));
-        if (hover != a.sidebar_hover) {
-            a.sidebar_hover = hover;
-            InvalidateRect(window, nullptr, FALSE);
-        }
+        set_sidebar_hover(a, hover);
         TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
         TrackMouseEvent(&tracking);
     } else if (message == WM_MOUSELEAVE || message == WM_VSCROLL || message == WM_MOUSEWHEEL) {
-        a.sidebar_hover = -1;
-        InvalidateRect(window, nullptr, FALSE);
+        set_sidebar_hover(a, -1);
     } else if (message == WM_KEYDOWN) {
         if (wp == VK_ESCAPE) {
             SetFocus(a.window);
@@ -1920,9 +1953,13 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             }
             if (item->CtlID != id_sidebar || item->itemID == UINT(-1))
                 break;
+            // The list toggles its native focus rectangle around unrelated row repaints.
+            // Our focus border is part of the selected row; focus changes invalidate it in sidebar_proc.
+            if (item->itemAction == ODA_FOCUS)
+                return TRUE;
             paint_sidebar_item(a, item->hDC, item->rcItem, int(item->itemID),
                                (item->itemState & ODS_SELECTED) != 0,
-                               (item->itemState & ODS_FOCUS) != 0 && GetFocus() == a.sidebar);
+                               (item->itemState & ODS_SELECTED) != 0 && GetFocus() == a.sidebar);
             return TRUE;
         }
         case WM_INITMENUPOPUP:
