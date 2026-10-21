@@ -112,7 +112,7 @@ struct RenderProfile {
     double surface_ms = 0, content_ms = 0, interpret_ms = 0, font_load_ms = 0,
            image_load_ms = 0, image_stream_ms = 0, image_codec_ms = 0, image_convert_ms = 0,
            image_mask_ms = 0, image_resample_ms = 0, image_upload_ms = 0, composite_ms = 0, finish_ms = 0,
-           readback_ms = 0;
+           readback_ms = 0, parse_ms = 0, path_ms = 0, shading_ms = 0, form_decode_ms = 0;
     size_t image_hits = 0, image_misses = 0;
     JpxProfile jpx;
     std::vector<ImageProfile> images;
@@ -142,6 +142,9 @@ struct GradientRamp {
     double low = 0, high = 1;
     int space = 0;
     std::array<Color, 1025> colors{};
+    const Value* definition = nullptr;
+    const Value* resources = nullptr;
+    const Value* tint = nullptr;
 };
 struct Renderer {
     ID2D1Factory* d2d = nullptr;

@@ -11,7 +11,7 @@ add_library(pdf_engine STATIC src/pdf.cpp src/filters.cpp src/security.cpp src/f
 target_include_directories(pdf_engine PUBLIC src)
 target_compile_definitions(pdf_engine PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_compile_options(pdf_engine PUBLIC /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus)
-target_link_libraries(pdf_engine PUBLIC d2d1 dwrite windowscodecs bcrypt ole32 gdi32 normaliz)
+target_link_libraries(pdf_engine PUBLIC d2d1 dwrite windowscodecs bcrypt ole32 gdi32 normaliz mscms)
 if(FASTPDF_SANITIZE)
   target_compile_options(pdf_engine PUBLIC /fsanitize=address /Zi)
   target_link_options(pdf_engine PUBLIC /INCREMENTAL:NO)

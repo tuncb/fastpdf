@@ -1,5 +1,6 @@
 #include "render.h"
 #include <chrono>
+#include <charconv>
 #include <functional>
 #include <numbers>
 
@@ -133,13 +134,17 @@ struct Graphics {
     Value softmask;
     Matrix mask_matrix;
 };
+struct Clip {
+    ID2D1Geometry* geometry = nullptr;
+    D2D1_RECT_F bounds{};
+};
 struct Context {
     Renderer* renderer = nullptr;
     Document* document = nullptr;
     Surface* canvas = nullptr;
     RenderedPage* output = nullptr;
     Graphics g;
-    std::vector<ID2D1Geometry*> clips;
+    std::vector<Clip> clips;
     size_t operations = 0;
     int depth = 0;
     bool collect_text = true;
@@ -152,40 +157,69 @@ static void set_transform(Context& c, Matrix m = {}) {
 }
 static void interpret(Context& c, View bytes, const Value& resources, int depth);
 static void draw_form(Context& c, const Value& form, const Value& resources, int depth, bool group = true);
-static void push_clip(Context& c, ID2D1Geometry* geometry) {
-    require(c.clips.size() < 256, "Graphics clipping depth limit exceeded");
-    auto rt = c.canvas->target;
+static void apply_clip(Context& c, const Clip& clip) {
     set_transform(c);
-    auto parameters =
-        D2D1::LayerParameters(D2D1::InfiniteRect(), geometry, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                              D2D1::Matrix3x2F::Identity(), 1, nullptr, D2D1_LAYER_OPTIONS_NONE);
-    rt->PushLayer(parameters, nullptr);
-    geometry->AddRef();
-    c.clips.push_back(geometry);
+    if (clip.geometry)
+        c.canvas->target->PushLayer(
+            D2D1::LayerParameters(D2D1::InfiniteRect(), clip.geometry, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                  D2D1::Matrix3x2F::Identity(), 1), nullptr);
+    else
+        c.canvas->target->PushAxisAlignedClip(clip.bounds, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+}
+static void push_clip(Context& c, Clip clip) {
+    require(c.clips.size() < 256, "Graphics clipping depth limit exceeded");
+    c.clips.push_back(clip);
+    if (clip.geometry)
+        clip.geometry->AddRef();
+    apply_clip(c, clip);
     c.g.clips = c.clips.size();
+}
+static void push_clip(Context& c, ID2D1Geometry* geometry) {
+    Clip clip{geometry};
+    hr(geometry->GetBounds(nullptr, &clip.bounds), "Measure clipping bounds");
+    push_clip(c, clip);
+}
+static void remove_clip(Context& c, const Clip& clip) {
+    if (clip.geometry)
+        c.canvas->target->PopLayer();
+    else
+        c.canvas->target->PopAxisAlignedClip();
 }
 static void pop_clips(Context& c, size_t count) {
     while (c.clips.size() > count) {
-        c.canvas->target->PopLayer();
-        auto geometry = c.clips.back();
-        release(geometry);
+        auto clip = c.clips.back();
+        remove_clip(c, clip);
+        release(clip.geometry);
         c.clips.pop_back();
     }
     c.g.clips = c.clips.size();
 }
 static void suspend(Context& c) {
-    for (size_t i = 0; i < c.clips.size(); ++i)
-        c.canvas->target->PopLayer();
+    for (auto it = c.clips.rbegin(); it != c.clips.rend(); ++it)
+        remove_clip(c, *it);
     hr(c.canvas->target->EndDraw(), "Finish drawing for composition");
 }
 static void resume(Context& c) {
     c.canvas->target->BeginDraw();
     set_transform(c);
-    for (auto geometry : c.clips)
-        c.canvas->target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), geometry,
-                                                          D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                                          D2D1::Matrix3x2F::Identity(), 1),
-                                    nullptr);
+    for (const auto& clip : c.clips)
+        apply_clip(c, clip);
+}
+static bool axis_rectangle(const std::vector<Segment>& path, D2D1_RECT_F& bounds) {
+    if (path.size() < 4 || path.size() > 6 || path[0].type != 0 || path[1].type != 1 ||
+        path[2].type != 1 || path[3].type != 1)
+        return false;
+    for (size_t i = 4; i < path.size(); ++i)
+        if (path[i].type != 3 && (path[i].type != 1 || path[i].p1.x != path[0].p1.x ||
+                                 path[i].p1.y != path[0].p1.y))
+            return false;
+    const auto a = path[0].p1, b = path[1].p1, c = path[2].p1, d = path[3].p1;
+    if (!((a.y == b.y && b.x == c.x && c.y == d.y && d.x == a.x) ||
+          (a.x == b.x && b.y == c.y && c.x == d.x && d.y == a.y)))
+        return false;
+    bounds = {float(std::min(a.x, c.x)), float(std::min(a.y, c.y)),
+              float(std::max(a.x, c.x)), float(std::max(a.y, c.y))};
+    return true;
 }
 static ID2D1PathGeometry* geometry(Context& c, const std::vector<Segment>& path, bool evenodd = false,
                                   bool stroked = false) {
@@ -257,6 +291,11 @@ static void clip_rect(Context& c, Rect r, Matrix m) {
                               {1, transform(m, {r.x1, r.y1}), {}, {}},
                               {1, transform(m, {r.x0, r.y1}), {}, {}},
                               {3, {}, {}, {}}};
+    D2D1_RECT_F bounds{};
+    if (axis_rectangle(path, bounds)) {
+        push_clip(c, Clip{nullptr, bounds});
+        return;
+    }
     auto shape = geometry(c, path);
     push_clip(c, shape);
     release(shape);
@@ -481,8 +520,7 @@ static void paint(Context& c, const Value& resources, const std::function<void(C
     bounds.x1 = std::min(bounds.x1, double(c.origin_x) + c.canvas->width);
     bounds.y1 = std::min(bounds.y1, double(c.origin_y) + c.canvas->height);
     for (auto clip : c.clips) {
-        D2D1_RECT_F box{};
-        hr(clip->GetBounds(nullptr, &box), "Measure clipping bounds");
+        auto box = clip.bounds;
         bounds.x0 = std::max(bounds.x0, double(box.left) - 1);
         bounds.y0 = std::max(bounds.y0, double(box.top) - 1);
         bounds.x1 = std::min(bounds.x1, double(box.right) + 1);
@@ -585,19 +623,12 @@ static ID2D1Brush* make_brush(Context& c, const Value& resources, bool stroke);
 static Rect transformed_box(Matrix m, Rect r);
 static void draw_path(Context& c, const Value& resources, const std::vector<Segment>& path, bool fill,
                       bool stroke, bool evenodd) {
+    ProfileTimer timer(c.renderer->profiling ? &c.renderer->profile.path_ms : nullptr);
     bool line = !fill && stroke && path.size() == 2 && path[0].type == 0 && path[1].type == 1;
     if (line && c.g.cap != 1 && path[0].p1.x == path[1].p1.x && path[0].p1.y == path[1].p1.y)
         return;
-    bool box = fill && !stroke && path.size() == 5 && path[0].type == 0 && path[1].type == 1 &&
-               path[2].type == 1 && path[3].type == 1 && path[4].type == 3 &&
-               ((path[0].p1.y == path[1].p1.y && path[1].p1.x == path[2].p1.x &&
-                 path[2].p1.y == path[3].p1.y && path[3].p1.x == path[0].p1.x) ||
-                (path[0].p1.x == path[1].p1.x && path[1].p1.y == path[2].p1.y &&
-                 path[2].p1.x == path[3].p1.x && path[3].p1.y == path[0].p1.y));
     D2D1_RECT_F box_bounds{};
-    if (box)
-        box_bounds = {float(std::min(path[0].p1.x, path[2].p1.x)), float(std::min(path[0].p1.y, path[2].p1.y)),
-                      float(std::max(path[0].p1.x, path[2].p1.x)), float(std::max(path[0].p1.y, path[2].p1.y))};
+    bool box = fill && !stroke && axis_rectangle(path, box_bounds);
     auto shape = line || box ? nullptr : geometry(c, path, evenodd, stroke && !fill);
     ID2D1PathGeometry* stroke_shape = nullptr;
     try {
@@ -639,7 +670,10 @@ static void draw_path(Context& c, const Value& resources, const std::vector<Segm
                         brush = make_brush(target, resources, true);
                         double scale = std::sqrt(std::max(1e-16, std::abs(target.g.ctm.a * target.g.ctm.d -
                                                                           target.g.ctm.b * target.g.ctm.c)));
-                        float width = float(target.g.width == 0 ? 1 / scale : std::abs(target.g.width));
+                        // Direct2D drops strokes below its coverage precision.
+                        // Keep hairlines and very thin plot grids visible at
+                        // display resolution, including when the PDF width is 0.
+                        float width = float(std::max(0.2 / scale, std::abs(target.g.width)));
                         auto props = D2D1::StrokeStyleProperties();
                         props.startCap = props.endCap = props.dashCap =
                             target.g.cap == 1   ? D2D1_CAP_STYLE_ROUND
@@ -985,6 +1019,7 @@ static void finish_text_clip(Context& c, std::vector<ID2D1Geometry*>& clips) {
 
 static std::shared_ptr<Image> shading_image(Context& c, const Value& input, const Value& resources,
                                            Rect* region = nullptr) {
+    ProfileTimer timer(c.renderer->profiling ? &c.renderer->profile.shading_ms : nullptr);
     auto& d = *c.document;
     auto& sh = resolve(d, input);
     int type = integer(get(sh, "ShadingType"));
@@ -1008,8 +1043,7 @@ static std::shared_ptr<Image> shading_image(Context& c, const Value& input, cons
             bounds.y1 = std::min(bounds.y1, box.y1 + 1);
         };
         for (auto clip : c.clips) {
-            D2D1_RECT_F box{};
-            hr(clip->GetBounds(nullptr, &box), "Measure shading clip");
+            auto box = clip.bounds;
             intersect({box.left, box.top, box.right, box.bottom});
         }
         auto& box = entry(d, sh, "BBox");
@@ -1058,11 +1092,26 @@ static std::shared_ptr<Image> shading_image(Context& c, const Value& input, cons
             direct = direct->alternate.get();
         int kind = direct->name == "DeviceRGB" ? 3 : direct->name == "DeviceGray" ? 1 :
                    direct->name == "DeviceCMYK" ? 4 : 0;
+        const Value* tint = nullptr;
+        if (!kind && (direct->name == "Separation" || direct->name == "DeviceN") &&
+            direct->alternate && direct->function.kind == Kind::ref) {
+            auto base = direct->alternate.get();
+            while (base->name == "ICCBased" && base->alternate)
+                base = base->alternate.get();
+            int base_kind = base->name == "DeviceRGB" ? 3 : base->name == "DeviceGray" ? 1 :
+                            base->name == "DeviceCMYK" ? 4 : 0;
+            if (base_kind) {
+                kind = 16 + 256 * direct->components + base_kind;
+                tint = &resolve(d, direct->function);
+            }
+        }
         auto key = &resolve(d, function);
+        auto definition = &entry(d, sh, "ColorSpace");
         auto& ramps = c.renderer->gradient_ramps;
         auto cached = ramps.find(key);
-        if (kind && cached != ramps.end() && cached->second.space == kind &&
-            cached->second.low == d0 && cached->second.high == d1)
+        if (cached != ramps.end() && cached->second.space == kind &&
+            cached->second.low == d0 && cached->second.high == d1 && cached->second.tint == tint &&
+            (kind || (cached->second.definition == definition && cached->second.resources == &resources)))
             stops = cached->second.colors;
         else {
             for (size_t i = 0; i < stops.size(); ++i) {
@@ -1070,11 +1119,9 @@ static std::shared_ptr<Image> shading_image(Context& c, const Value& input, cons
                 auto components = evaluate_function(d, function, std::span(&v, 1));
                 stops[i] = color(d, space, components);
             }
-            if (kind) {
-                if (ramps.size() >= 256)
-                    ramps.clear();
-                ramps[key] = {d0, d1, kind, stops};
-            }
+            if (ramps.size() >= 256)
+                ramps.clear();
+            ramps[key] = {d0, d1, kind, stops, definition, &resources, tint};
         }
         double x0 = num(at(coords, 0)), y0 = num(at(coords, 1)), r0 = type == 3 ? num(at(coords, 2)) : 0,
                x1 = num(at(coords, type == 3 ? 3 : 2)), y1 = num(at(coords, type == 3 ? 4 : 3)),
@@ -1565,7 +1612,9 @@ static void draw_form(Context& c, const Value& input, const Value& resources, in
         if (get(form, "BBox").kind != Kind::null)
             clip_rect(c, rectangle(entry(d, form, "BBox")), c.g.ctm);
         auto& res = entry(d, form, "Resources");
+        ProfileTimer decode_timer(c.renderer->profiling ? &c.renderer->profile.form_decode_ms : nullptr);
         auto bytes = decode_stream(d, form).bytes;
+        decode_timer.stop();
         interpret(c, bytes, res.kind == Kind::null ? resources : res, depth);
         pop_clips(c, count);
         c.g = saved;
@@ -1750,7 +1799,15 @@ static void interpret(Context& c, View bytes, const Value& resources, int depth)
     require(depth < 48, "Content recursion limit exceeded");
     Parser p{bytes, 0, 0, false};
     size_t tokens = 0;
-    std::vector<Value> operands;
+    std::vector<Value> operands(8);
+    size_t operand_count = 0;
+    Value parsed;
+    auto next_operand = [&]() -> Value& {
+        require(operand_count < 4096, "Content operand limit exceeded");
+        if (operand_count == operands.size())
+            operands.emplace_back();
+        return operands[operand_count++];
+    };
     std::vector<Graphics> saved;
     std::vector<Segment> path;
     std::vector<ID2D1Geometry*> text_clips;
@@ -1760,7 +1817,7 @@ static void interpret(Context& c, View bytes, const Value& resources, int depth)
     size_t initial_clips = c.clips.size();
     Point current{}, start{};
     auto arg = [&](size_t i) -> const Value& {
-        require(i < operands.size(), "Missing content operator operand");
+        require(i < operand_count, "Missing content operator operand");
         return operands[i];
     };
     auto n = [&](size_t i) {
@@ -1769,7 +1826,7 @@ static void interpret(Context& c, View bytes, const Value& resources, int depth)
         return v.number;
     };
     auto need = [&](size_t count) {
-        require(operands.size() == count, "Incorrect content operator operand count");
+        require(operand_count == count, "Incorrect content operator operand count");
     };
     auto add = [&](uint8_t type, Point a = {}, Point b = {}, Point cc = {}) {
         require(path.size() < 1000000, "Path segment limit exceeded");
@@ -1783,9 +1840,14 @@ static void interpret(Context& c, View bytes, const Value& resources, int depth)
         if (!hidden && !c.text_only && (fill || stroke))
             draw_path(c, resources, path, fill, stroke, evenodd);
         if (pending_clip && !hidden && !c.text_only) {
-            auto shape = geometry(c, path, pending_clip == 2);
-            push_clip(c, shape);
-            release(shape);
+            D2D1_RECT_F bounds{};
+            if (axis_rectangle(path, bounds))
+                push_clip(c, Clip{nullptr, bounds});
+            else {
+                auto shape = geometry(c, path, pending_clip == 2);
+                push_clip(c, shape);
+                release(shape);
+            }
         }
         pending_clip = 0;
         path.clear();
@@ -1816,14 +1878,41 @@ static void interpret(Context& c, View bytes, const Value& resources, int depth)
                 break;
             if ((++tokens & 255) == 0)
                 check_cancel(*c.document);
-            Value value = parse(p);
-            if (value.kind != Kind::keyword) {
-                require(operands.size() < 4096, "Content operand limit exceeded");
-                operands.push_back(std::move(value));
-                continue;
+            ProfileTimer parse_timer(c.renderer->profiling ? &c.renderer->profile.parse_ms : nullptr);
+            size_t token_start = p.pos;
+            auto first = p.data[p.pos];
+            if ((first >= '0' && first <= '9') || first == '.' || first == '+' || first == '-') {
+                auto text = token(p);
+                if (!text.empty() && text.front() == '+')
+                    text.remove_prefix(1);
+                double number = 0;
+                auto result = std::from_chars(text.data(), text.data() + text.size(), number);
+                if (result.ec == std::errc() && result.ptr == text.data() + text.size() && std::isfinite(number)) {
+                    auto& operand = next_operand();
+                    operand.kind = Kind::number;
+                    operand.number = number;
+                    continue;
+                }
+                p.pos = token_start;
             }
+            std::string_view op;
+            if ((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '\'' || first == '"') {
+                op = token(p);
+                if (op == "true" || op == "false" || op == "null") {
+                    op = {};
+                    p.pos = token_start;
+                }
+            }
+            if (op.empty()) {
+                parsed = parse(p);
+                if (parsed.kind != Kind::keyword) {
+                    next_operand() = std::move(parsed);
+                    continue;
+                }
+                op = parsed.text;
+            }
+            parse_timer.stop();
             require(++c.operations < 10000000, "Page operator limit exceeded");
-            auto& op = value.text;
             if (op == "q") {
                 need(0);
                 require(saved.size() < 256, "Graphics state stack limit exceeded");
@@ -1947,7 +2036,7 @@ static void interpret(Context& c, View bytes, const Value& resources, int depth)
                 auto space = stroke ? c.g.stroke_space : c.g.fill_space;
                 std::string pattern;
                 std::vector<double> values;
-                for (auto& v : operands) {
+                for (auto& v : std::span(operands).first(operand_count)) {
                     if (v.kind == Kind::name)
                         pattern = v.text;
                     else {
@@ -2069,7 +2158,7 @@ static void interpret(Context& c, View bytes, const Value& resources, int depth)
             } else if (op == "BMC" || op == "BDC") {
                 require(marked.size() < 128, "Marked-content nesting limit");
                 marked.push_back(hidden);
-                if (op == "BDC" && operands.size() == 2 && named(arg(0), "OC")) {
+                if (op == "BDC" && operand_count == 2 && named(arg(0), "OC")) {
                     const Value& property =
                         arg(1).kind == Kind::name
                             ? get(entry(*c.document, resources, "Properties"), arg(1).text)
@@ -2087,8 +2176,13 @@ static void interpret(Context& c, View bytes, const Value& resources, int depth)
                 compatibility = std::max(0, compatibility - 1);
             else if (op == "ri" || op == "i" || op == "MP" || op == "DP" || op == "d0" || op == "d1") {
             } else if (!compatibility)
-                warn(*c.document, "Unknown content operator: " + op);
-            operands.clear();
+                warn(*c.document, "Unknown content operator: " + std::string(op));
+            // Retain the small numeric slots used by dense vector content.
+            // Release complex operands after each operator.
+            for (auto& operand : std::span(operands).first(operand_count))
+                if (operand.kind != Kind::number)
+                    operand = {};
+            operand_count = 0;
             // Content operands have now been consumed. Keep the allocation
             // limit per live operand set; the separate operation budget bounds
             // long streams without rejecting millions of already-freed values.

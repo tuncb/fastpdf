@@ -1,5 +1,6 @@
 #include "render.h"
 #include "image_codecs.h"
+#include <icm.h>
 
 namespace pdf {
 ColorSpace color_space(Document& d, const Value& input, const Value& resources, int depth) {
@@ -63,6 +64,89 @@ ColorSpace color_space(Document& d, const Value& input, const Value& resources, 
 static float unit(double v) {
     return float(std::clamp(v, 0.0, 1.0));
 }
+static std::vector<Color> device_cmyk_table() {
+    // Use the installed Windows SWOP profile. Build a small immutable display
+    // table once, so individual PDF colors do not need a system API call.
+    wchar_t directory[MAX_PATH]{};
+    UINT length = GetSystemDirectoryW(directory, MAX_PATH);
+    if (!length || length >= MAX_PATH)
+        return {};
+    std::array<HPROFILE, 2> profiles{};
+    HTRANSFORM transform = nullptr;
+    auto close = [&] {
+        if (transform)
+            DeleteColorTransform(transform);
+        for (auto profile : profiles)
+            if (profile)
+                CloseColorProfile(profile);
+    };
+    try {
+        constexpr const wchar_t* names[] = {L"RSWOP.icm", L"sRGB Color Space Profile.icm"};
+        for (unsigned i = 0; i < 2; ++i) {
+            auto path = (std::filesystem::path(directory) / L"spool" / L"drivers" / L"color" / names[i]).wstring();
+            PROFILE profile{PROFILE_FILENAME, path.data(), DWORD((path.size() + 1) * sizeof(wchar_t))};
+            profiles[i] = OpenColorProfileW(&profile, PROFILE_READ, FILE_SHARE_READ, OPEN_EXISTING);
+            if (!profiles[i]) {
+                close();
+                return {};
+            }
+        }
+        DWORD intent = INTENT_RELATIVE_COLORIMETRIC;
+        transform = CreateMultiProfileTransform(profiles.data(), 2, &intent, 1, BEST_MODE, INDEX_DONT_CARE);
+        if (!transform) {
+            close();
+            return {};
+        }
+        constexpr unsigned count = 17 * 17 * 17 * 17;
+        std::vector<COLOR> input(count), output(count);
+        for (unsigned i = 0; i < count; ++i) {
+            auto channel = [&](unsigned stride) { return WORD(((i / stride) % 17) * 65535 / 16); };
+            input[i].cmyk = {channel(1), channel(17), channel(289), channel(4913)};
+        }
+        if (!TranslateColors(transform, input.data(), count, COLOR_CMYK, output.data(), COLOR_RGB)) {
+            close();
+            return {};
+        }
+        std::vector<Color> table(count);
+        for (unsigned i = 0; i < count; ++i)
+            table[i] = {output[i].rgb.red / 65535.f, output[i].rgb.green / 65535.f,
+                        output[i].rgb.blue / 65535.f, 1};
+        table[0] = {1, 1, 1, 1};
+        close();
+        return table;
+    } catch (...) {
+        close();
+        throw;
+    }
+}
+static Color device_cmyk(double c, double m, double y, double k) {
+    static const auto table = device_cmyk_table();
+    if (table.empty())
+        return {unit(1 - std::min(1.0, c + k)), unit(1 - std::min(1.0, m + k)),
+                unit(1 - std::min(1.0, y + k)), 1};
+    std::array<float, 4> fractions{};
+    unsigned index = 0, stride = 1;
+    const double samples[] = {c, m, y, k};
+    for (unsigned i = 0; i < 4; ++i) {
+        double value = std::clamp(samples[i], 0.0, 1.0) * 16;
+        auto low = std::min(unsigned(value), 15u);
+        index += low * stride;
+        fractions[i] = float(value - low);
+        stride *= 17;
+    }
+    auto mix = [](Color a, Color b, float t) {
+        return Color{a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1};
+    };
+    std::array<Color, 8> pairs{};
+    for (unsigned i = 0; i < 8; ++i) {
+        unsigned at = index + (i & 1) * 17 + ((i >> 1) & 1) * 289 + (i >> 2) * 4913;
+        pairs[i] = mix(table[at], table[at + 1], fractions[0]);
+    }
+    for (unsigned level = 1, count = 4; count; ++level, count /= 2)
+        for (unsigned i = 0; i < count; ++i)
+            pairs[i] = mix(pairs[2 * i], pairs[2 * i + 1], fractions[level]);
+    return pairs[0];
+}
 static Color xyz(double x, double y, double z) {
     auto gamma = [](double v) {
         return unit(v <= 0.0031308 ? 12.92 * v : 1.055 * std::pow(v, 1 / 2.4) - 0.055);
@@ -77,9 +161,7 @@ Color color(Document& d, const ColorSpace& s, std::span<const double> values, in
     if (s.name == "DeviceRGB")
         return {unit(v(0)), unit(v(1)), unit(v(2)), 1};
     if (s.name == "DeviceCMYK") {
-        double k = v(3);
-        return {unit(1 - std::min(1.0, v(0) + k)), unit(1 - std::min(1.0, v(1) + k)),
-                unit(1 - std::min(1.0, v(2) + k)), 1};
+        return device_cmyk(v(0), v(1), v(2), v(3));
     }
     if (s.name == "Indexed" || s.name == "I") {
         require(bool(s.alternate), "Missing indexed color space");
@@ -420,19 +502,23 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                 "Image codec dimensions disagree with the PDF dictionary");
         out->stencil = stencil;
         bool invert = fax && boolean(get(decoded.params, "BlackIs1"));
-        bool gray_jpeg = (decoded.image_filter == "DCTDecode" || decoded.image_filter == "DCT") &&
-                         space.components == 1 && !stencil;
+        bool mapped_samples = (decoded.image_filter == "DCTDecode" || decoded.image_filter == "DCT" ||
+                               fax || decoded.image_filter == "JBIG2Decode") &&
+                              space.components == 1 && !stencil;
         std::array<uint32_t, 256> palette{};
-        if (gray_jpeg) {
-            // WIC expands a one-component JPEG to equal RGB channels. These
-            // bytes are still PDF samples: apply Decode and the PDF color space
-            // before drawing. A Separation sample is a tint, not display gray.
+        if (mapped_samples) {
+            // Codecs expand one-component samples to equal RGB channels.
+            // Apply PDF Decode and the color space to those samples, including
+            // Indexed palettes and Separation tints on bilevel images.
             double lo = num(at(decode, 0));
-            double hi = num(at(decode, 1), space.name == "Indexed" || space.name == "I" ? 255 : 1);
+            unsigned maximum = (1u << bits) - 1;
+            double hi = num(at(decode, 1), space.name == "Indexed" || space.name == "I" ? maximum : 1);
             for (size_t i = 0; i < palette.size(); ++i) {
-                double sample = lo + (hi - lo) * i / 255.0;
+                unsigned raw = invert ? 255 - unsigned(i) : unsigned(i);
+                double sample = lo + (hi - lo) * raw / 255.0;
                 auto c = color(d, space, std::span(&sample, 1));
-                if (mask.kind == Kind::array && i >= num(at(mask, 0)) && i <= num(at(mask, 1)))
+                unsigned raw_sample = raw * maximum / 255;
+                if (mask.kind == Kind::array && raw_sample >= num(at(mask, 0)) && raw_sample <= num(at(mask, 1)))
                     c.a = 0;
                 palette[i] = uint32_t(unit(c.b * c.a) * 255 + 0.5f) |
                              (uint32_t(unit(c.g * c.a) * 255 + 0.5f) << 8) |
@@ -447,7 +533,7 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                 for (unsigned sample = 0; sample < 256; ++sample)
                     cmyk_samples[channel][sample] = low + (high - low) * sample / 255.0;
             }
-        bool transform_samples = cmyk_jpeg || gray_jpeg || invert || stencil ||
+        bool transform_samples = cmyk_jpeg || mapped_samples || invert || stencil ||
                                  (!jpx && (decode.array.size() == 2 || decode.array.size() == 6));
         for (size_t p = 0; transform_samples && p < out->pixels.size(); p += 4) {
             if (cmyk_jpeg) {
@@ -468,7 +554,7 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                 out->pixels[p + 3] = transparent ? 0 : 255;
                 continue;
             }
-            if (gray_jpeg) {
+            if (mapped_samples) {
                 uint32_t pixel = palette[out->pixels[p]];
                 std::memcpy(out->pixels.data() + p, &pixel, 4);
                 continue;

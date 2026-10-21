@@ -1264,7 +1264,17 @@ std::vector<Glyph> decode_text(Font& f, std::string_view text) {
         } else if (auto it = f.cff_names.find(g.name); it != f.cff_names.end())
             g.index = it->second;
         else if (f.face) {
-            f.face->GetGlyphIndices(&unicode, 1, &g.index);
+            // A symbolic TrueType cmap is indexed by the PDF character code.
+            // DirectWrite also aliases low Unicode values into that cmap, so
+            // trying the glyph-name Unicode first can return a wrong glyph.
+            if (f.embedded && f.symbolic && f.face->IsSymbolFont()) {
+                uint32_t symbol = 0xf000 + (code & 255);
+                f.face->GetGlyphIndices(&symbol, 1, &g.index);
+                if (!g.index)
+                    f.face->GetGlyphIndices(&code, 1, &g.index);
+            }
+            if (!g.index)
+                f.face->GetGlyphIndices(&unicode, 1, &g.index);
             if (!g.index && f.symbolic) {
                 uint32_t symbol = 0xf000 + (code & 255);
                 f.face->GetGlyphIndices(&symbol, 1, &g.index);

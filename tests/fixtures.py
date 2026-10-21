@@ -5,6 +5,8 @@ These are test data generators, not a runtime dependency of FastPDF.
 from pathlib import Path
 import base64
 import hashlib
+import json
+import os
 import random
 import struct
 import zlib
@@ -310,6 +312,17 @@ def generate(directory):
     objects = base()
     objects[4] = stream(b"BT\n" + b"0 0 Td\n" * 700000 + b"ET\n" + CONTENT, compression=True)
     add("long_content", pdf(objects), text="FastPDF hello world", pixel=(50, 150, (255, 0, 0)))
+    objects = base(b".001 w 20 50.5 m 220 50.5 l S 0 w 20 80.5 m 220 80.5 l S")
+    add("visible_thin_strokes", pdf(objects), pixels=[(100, 169, (204, 204, 204)),
+                                                     (100, 139, (204, 204, 204))], tolerance=24)
+    objects = base(b"BT /F1 100 Tf 20 50 Td <01> Tj ET")
+    objects[3] = (b"<< /Type /Font /Subtype /TrueType /BaseFont /FastPDFSymbolSubset /FirstChar 1 /LastChar 1 "
+                  b"/Widths [1000] /Encoding << /BaseEncoding /WinAnsiEncoding /Differences [1 /A] >> "
+                  b"/FontDescriptor << /Type /FontDescriptor /FontName /FastPDFSymbolSubset /Flags 6 "
+                  b"/FontBBox [0 0 1000 700] /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 "
+                  b"/FontFile2 6 0 R >> >>")
+    objects.append(stream((Path(__file__).parent / "data" / "symbol-subset.ttf").read_bytes()))
+    add("symbolic_truetype_codes", pdf(objects), text="A", pixels=[(40, 150, (0, 0, 0)), (100, 150, (255, 255, 255))])
     for count in range(1000):
         encoded = zlib.compress(CONTENT + b"%" + b"a" * count + b"\n")
         if encoded[-1] == 10:
@@ -348,6 +361,17 @@ def generate(directory):
     add("cff_native_differences", pdf(objects), pixels=[(22, 110, (51, 51, 51)),
                                                        (23, 110, (255, 255, 255)), (35, 110, (0, 0, 0))], tolerance=16)
     cmyk_jpeg = (Path(__file__).parent / "data" / "cmyk-panels.jpg").read_bytes()
+    fax_cases = json.loads((Path(__file__).parent / "data" / "fax-aligned.json").read_text())
+    fax = next(case for case in fax_cases if case['width'] == 17)
+    for black_is_one in (False, True):
+        objects = base(b"q 170 0 0 170 20 20 cm /I Do Q", resources=b"/XObject << /I 6 0 R >>")
+        attributes = (f"/Type /XObject /Subtype /Image /Width 17 /Height {fax['height']} /BitsPerComponent 1 "
+                      f"/ColorSpace [/Indexed /DeviceRGB 1 <ff0000ffffff>] /Filter /CCITTFaxDecode "
+                      f"/DecodeParms << /K -1 /Columns 17 /Rows {fax['height']} /EncodedByteAlign true "
+                      f"/BlackIs1 {str(black_is_one).lower()} >>").encode()
+        objects.append(stream(base64.b64decode(fax['data']), attributes))
+        top, bottom = ((255, 0, 0), (255, 255, 255)) if black_is_one else ((255, 255, 255), (255, 0, 0))
+        add(f"fax_indexed_{black_is_one}", pdf(objects), pixels=[(25, 32, top), (25, 37, bottom)])
     # The JPEG has four constant CMYK panels. Its original JPEG samples have
     # opposite polarity from WIC's normalized CMYK output.
     for inverse in (False, True):
@@ -358,7 +382,15 @@ def generate(directory):
             attributes += b" /Decode [1 0 1 0 1 0 1 0]"
         objects.append(stream(cmyk_jpeg, attributes))
         colors = [(255, 255, 255), (0, 255, 255), (255, 0, 0), (0, 0, 0)] if inverse else [(0, 0, 0)] * 4
-        add(f"jpeg_cmyk_{inverse}", pdf(objects), pixels=[(52 + 64*i, 90, c) for i, c in enumerate(colors)])
+        profile_dir = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/spool/drivers/color"
+        managed = (profile_dir / "RSWOP.icm").exists() and (profile_dir / "sRGB Color Space Profile.icm").exists()
+        if managed:
+            # Independent SWOP-to-sRGB reference colors. Installed profile
+            # revisions can differ slightly, but cannot reverse sample polarity.
+            colors = ([(255, 255, 255), (0, 174, 239), (237, 28, 36), (35, 31, 32)] if inverse else
+                      [(0, 0, 0), (34, 0, 0), (0, 14, 35), (54, 54, 57)])
+        add(f"jpeg_cmyk_{inverse}", pdf(objects), pixels=[(52 + 64*i, 90, c) for i, c in enumerate(colors)],
+            tolerance=30 if managed else 1)
 
     gray_jpeg = (Path(__file__).parent / "data" / "gray-tints.jpg").read_bytes()
     for inverse in [False, True]:
@@ -505,6 +537,16 @@ def generate(directory):
                 b"<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [20 120 120 120] /Domain [.5 1] /Function 8 0 R >>",
                 b"<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>"]
     add("shared_gradient_domains", pdf(objects), pixels=[(70, 180, (64, 64, 64)), (70, 80, (192, 192, 192))], tolerance=2)
+    objects = base(b"q 20 20 100 40 re W n /A sh Q q 20 120 100 40 re W n /B sh Q q 160 20 100 40 re W n /C sh Q",
+                   b"/Shading << /A 6 0 R /B 7 0 R /C 11 0 R >>")
+    objects += [b"<< /ShadingType 2 /ColorSpace [/Separation /Red /DeviceRGB 9 0 R] /Coords [20 20 120 20] /Function 8 0 R >>",
+                b"<< /ShadingType 2 /ColorSpace [/Separation /Blue /DeviceRGB 10 0 R] /Coords [20 120 120 120] /Function 8 0 R >>",
+                b"<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>",
+                b"<< /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [1 0 0] /N 1 >>",
+                b"<< /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [0 0 1] /N 1 >>",
+                b"<< /ShadingType 2 /ColorSpace [/Separation /Red /DeviceRGB 9 0 R] /Coords [160 20 260 20] /Function 8 0 R >>"]
+    add("shared_gradient_tints", pdf(objects), pixels=[(70, 180, (255, 126, 126)), (70, 80, (126, 126, 255)),
+                                                      (210, 180, (255, 126, 126))], tolerance=2)
     objects=base(b"20 20 100 100 re W n /Sh sh",b"/Shading << /Sh 6 0 R >>")
     objects += [b"<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [70 70 0 70 70 50] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> /Extend [true true] >>"]
     add("radial",pdf(objects),pixel=(70,150,(251,0,4)),tolerance=5)
@@ -551,6 +593,13 @@ def generate(directory):
     add('widget_without_appearance',pdf(objects),text='Owned form appearance',pixel=(240,100,(204,230,255)))
     objects=base(b"q 20 20 20 20 re W n 1 0 0 rg 0 0 300 220 re f Q 0 0 1 rg 60 20 20 20 re f")
     add("clip_restore",pdf(objects),pixel=(70,190,(0,0,255)))
+    content = (b"0 0 1 rg 10 10 200 200 re f q 20 20 160 160 re W n "
+               b"q 20 20 m 180 20 l 20 180 l h W n q 40 40 120 120 re W n "
+               b"/M gs 1 0 0 rg 0 0 300 220 re f Q 0 1 0 rg 30 30 5 5 re f Q "
+               b"1 0 0 rg 140 140 10 10 re f Q 1 1 0 rg 5 5 5 5 re f")
+    objects = base(content, b"/ExtGState << /M << /BM /Multiply >> >>")
+    add("mixed_clip_composition", pdf(objects), pixels=[(60, 160, (0, 0, 0)), (32, 188, (0, 255, 0)),
+        (145, 75, (255, 0, 0)), (7, 213, (255, 255, 0)), (170, 50, (0, 0, 255))])
     objects=base(extra_page=b"/Annots [6 0 R]",extra_catalog=b"/Outlines 7 0 R")
     objects += [b"<< /Type /Annot /Subtype /Link /Rect [20 170 200 200] /A << /S /URI /URI (https://example.com) >> >>", b"<< /Type /Outlines /First 8 0 R /Last 8 0 R /Count 1 >>", b"<< /Title (Start) /Parent 7 0 R /Dest [3 0 R /Fit] >>"]
     add("links_outline",pdf(objects),text="FastPDF hello world")

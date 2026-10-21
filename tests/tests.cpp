@@ -191,7 +191,11 @@ int main() {
         cs.components = 4;
         double values[] = {1, 0, 0, 0};
         auto rgb = color(d, cs, values);
-        test(rgb.r == 0 && rgb.g == 1 && rgb.b == 1, "CMYK conversion");
+        test(rgb.r < 0.2 && rgb.g > 0.5 && rgb.b > 0.7, "CMYK cyan display conversion");
+        double white[] = {0, 0, 0, 0}, black[] = {0, 0, 0, 1};
+        auto paper = color(d, cs, white), ink = color(d, cs, black);
+        test(paper.r == 1 && paper.g == 1 && paper.b == 1, "CMYK paper stays white");
+        test(ink.r < 0.2 && ink.g < 0.2 && ink.b < 0.2, "CMYK black stays dark");
         std::cout << assertions << " engine assertions passed\n";
         return 0;
     } catch (const std::exception& e) {

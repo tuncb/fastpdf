@@ -35,7 +35,9 @@ static void write_profile(std::ostream& out, const pdf::RenderProfile& p) {
         << ",\"image_convert_ms\":" << p.image_convert_ms << ",\"image_mask_ms\":" << p.image_mask_ms
         << ",\"image_resample_ms\":" << p.image_resample_ms << ",\"image_upload_ms\":" << p.image_upload_ms
         << ",\"composite_ms\":" << p.composite_ms << ",\"finish_ms\":" << p.finish_ms
-        << ",\"readback_ms\":" << p.readback_ms << ",\"image_hits\":" << p.image_hits
+        << ",\"readback_ms\":" << p.readback_ms << ",\"parse_ms\":" << p.parse_ms
+        << ",\"path_ms\":" << p.path_ms << ",\"shading_ms\":" << p.shading_ms
+        << ",\"form_decode_ms\":" << p.form_decode_ms << ",\"image_hits\":" << p.image_hits
         << ",\"image_misses\":" << p.image_misses << ",\"jpx_packets_ms\":" << p.jpx.packets_ms
         << ",\"jpx_blocks_ms\":" << p.jpx.blocks_ms << ",\"jpx_wavelet_ms\":" << p.jpx.wavelet_ms
         << ",\"jpx_output_ms\":" << p.jpx.output_ms << ",\"images\":[";
