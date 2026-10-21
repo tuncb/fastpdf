@@ -52,6 +52,17 @@ static void write_profile(std::ostream& out, const pdf::RenderProfile& p) {
     }
     out << "]}";
 }
+static std::string pixel_hash(pdf::View pixels) {
+    constexpr char digits[] = "0123456789abcdef";
+    auto digest = pdf::digest(L"SHA256", pixels);
+    std::string result;
+    result.reserve(digest.size() * 2);
+    for (auto value : digest) {
+        result += digits[value >> 4];
+        result += digits[value & 15];
+    }
+    return result;
+}
 static void save_bmp(const pdf::RenderedPage& page, const std::filesystem::path& path) {
     BITMAPFILEHEADER header{};
     BITMAPINFOHEADER info{};
@@ -82,6 +93,7 @@ int wmain(int argc, wchar_t** argv) {
                "page\n  --benchmark N     Repeat rendering N times\n  --timings         Include per-render "
                "timings\n"
                "  --profile         Include rendering stage timings and image metadata\n"
+               "  --pixel-hash      Include a SHA-256 hash of each BGRA page (outside the render timer)\n"
                "  --render-dir DIR  Save each rendered page as page-NNNNNN.png\n"
                "  --render-format FORMAT  Use png (default) or uncompressed bmp in DIR\n"
                "  --last-page N     Render from --page through this page\n"
@@ -103,6 +115,7 @@ int wmain(int argc, wchar_t** argv) {
         bool text = false, all = false, strict = false, timings = false, benchmark = false;
         bool continue_on_error = false;
         bool bmp = false;
+        bool hash_pixels = false;
         std::filesystem::path output, extract, render_dir, progress_path;
         std::string password;
         for (int i = 2; i < argc; ++i) {
@@ -113,6 +126,10 @@ int wmain(int argc, wchar_t** argv) {
             };
             if (arg == L"--page")
                 page = std::stoi(next());
+            else if (arg == L"--pixel-hash") {
+                hash_pixels = true;
+                timings = true;
+            }
             else if (arg == L"--last-page")
                 last_page = std::stoi(next());
             else if (arg == L"--scale")
@@ -223,6 +240,8 @@ int wmain(int argc, wchar_t** argv) {
                                    << ",\"text_spans\":" << result.text.size();
                             if (renderer.profiling)
                                 write_profile(record, renderer.profile);
+                            if (hash_pixels)
+                                record << ",\"pixel_sha256\":" << json(pixel_hash(result.pixels));
                         }
                         record << ",\"new_warnings\":[";
                         for (size_t i = previous_warnings; i < doc.warnings.size(); ++i) {

@@ -1,5 +1,6 @@
 """Check that a bad page does not hide later pages or discard progress."""
 import json
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -23,7 +24,7 @@ def main():
     ]))
     progress = root / "progress.jsonl"
     result = subprocess.run([str(executable), str(source), "--all", "--timings",
-                             "--continue-on-error", "--progress", str(progress),
+                             "--continue-on-error", "--pixel-hash", "--progress", str(progress),
                              "--render-dir", str(root / "pages")],
                             capture_output=True, text=True, encoding="utf-8", timeout=20)
     assert result.returncode == 2, result.stdout + result.stderr
@@ -50,6 +51,7 @@ def main():
     data = (root / "bmp/page-000003.bmp").read_bytes()
     assert data[:2] == b"BM" and len(data) == 54 + 100 * 100 * 4
     assert data[54 + (60 * 100 + 30) * 4:54 + (60 * 100 + 30) * 4 + 4] == bytes([255, 0, 0, 255])
+    assert summary["samples"][2]["pixel_sha256"] == hashlib.sha256(data[54:]).hexdigest()
     print("Batch page output, progress, error recovery and page ranges passed")
 
 
