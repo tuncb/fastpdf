@@ -18,6 +18,14 @@ Requirements: x64 Windows 10 version 1703 or later, Visual Studio with Desktop d
 
 The build script configures the Visual Studio environment, compiles the app and tools, and runs all available CTest checks. The release uses the static Microsoft C/C++ runtime. No third-party C++ packages need to be installed or downloaded.
 
+The reader and console tools support Unicode file names. Paths longer than 260
+characters work when the Windows `LongPathsEnabled` setting is enabled. Explicit
+extended paths, such as `\\?\C:\documents\example.pdf` or
+`\\?\UNC\server\share\example.pdf`, do not require that setting. You can enter
+these paths in **File → Open** or pass them on the command line. `pdfprobe` also
+supports long paths for PNG and text output. File system limits on each file or
+folder name still apply.
+
 To build from an existing x64 Visual Studio developer shell:
 
 ```powershell
