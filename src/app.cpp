@@ -89,8 +89,7 @@ enum Command {
     cmd_about,
     cmd_install,
     cmd_updates,
-    cmd_cancel_update,
-    cmd_portable,
+    cmd_portable = 20,
     cmd_exit
 };
 struct UpdateResult {
@@ -820,7 +819,7 @@ static int task_dialog(App& a, const wchar_t* title, const std::wstring& content
 }
 static void installation_dialog(App& a) {
     if (a.update_job.valid() || !a.pending_update.directory.empty())
-        throw std::runtime_error("Finish or cancel the current update before changing the installation.");
+        throw std::runtime_error("Finish the current update before changing the installation.");
     const bool present = deployment::installation_present();
     ui::InstallationOptions options{deployment::install_directory().wstring(), a.installed, present,
                                     !present || deployment::shortcut_present(),
@@ -866,8 +865,7 @@ static void ready_update(App& a) {
     } else if (result == 101) {
         deployment::require_no_other_instances();
         a.update_on_exit = true;
-        a.update_status =
-            L"Update will install when you close FastPDF. Help → Cancel update to keep this version.";
+        a.update_status = L"Update will install when you close FastPDF.";
     } else {
         a.update_on_exit = false;
         a.update_status = L"Update ready. Help → Check for updates to install.";
@@ -875,7 +873,7 @@ static void ready_update(App& a) {
 }
 static void start_update_job(App& a, std::optional<deployment::Release> release = {}) {
     a.update_cancel = false;
-    a.update_status = release ? L"Downloading update…  Help → Cancel update" : L"Checking for updates…";
+    a.update_status = release ? L"Downloading update…" : L"Checking for updates…";
     a.update_job = std::async(std::launch::async, [&a, release] {
         UpdateResult result;
         result.downloading = release.has_value();
@@ -916,13 +914,6 @@ static void poll_update(App& a) {
     }
     InvalidateRect(a.window, nullptr, FALSE);
 }
-static void cancel_update(App& a) {
-    a.update_cancel = true;
-    a.update_on_exit = false;
-    deployment::cleanup_download(a.pending_update);
-    a.pending_update = {};
-    a.update_status = a.update_job.valid() ? L"Canceling update…" : L"Update canceled.";
-}
 static void command(App& a, int id) {
     if (a.pages.empty() && id >= cmd_prev && id <= cmd_goto)
         return;
@@ -934,9 +925,7 @@ static void command(App& a, int id) {
         a.portable_choice = true;
         SetFocus(a.window);
         layout(a);
-    } else if (id == cmd_cancel_update)
-        cancel_update(a);
-    else if (id == cmd_updates) {
+    } else if (id == cmd_updates) {
         if (!a.installed) {
             MessageBoxW(a.window,
                         L"Install FastPDF to update it here. You can also download a new portable copy from "
@@ -1937,10 +1926,6 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             return TRUE;
         }
         case WM_INITMENUPOPUP:
-            EnableMenuItem(
-                GetMenu(window), cmd_cancel_update,
-                MF_BYCOMMAND |
-                    (a.update_job.valid() || !a.pending_update.directory.empty() ? MF_ENABLED : MF_GRAYED));
             EnableMenuItem(GetMenu(window), cmd_updates,
                            MF_BYCOMMAND | (a.update_job.valid() ? MF_GRAYED : MF_ENABLED));
             EnableMenuItem(
@@ -2268,7 +2253,6 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
     AppendMenuW(help, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(help, MF_STRING, cmd_install, L"&Installation…");
     AppendMenuW(help, MF_STRING, cmd_updates, L"Check for &updates…");
-    AppendMenuW(help, MF_STRING, cmd_cancel_update, L"&Cancel update");
     AppendMenuW(menu, MF_POPUP, UINT_PTR(file), menu_titles[0]);
     AppendMenuW(menu, MF_POPUP, UINT_PTR(view), menu_titles[1]);
     AppendMenuW(menu, MF_POPUP, UINT_PTR(help), menu_titles[2]);

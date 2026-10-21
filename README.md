@@ -65,15 +65,15 @@ removes FastPDF's files and registration and leaves your PDFs alone.
 
 Use **Help → Check for updates…** from the installed reader. FastPDF checks the
 latest stable GitHub release only when requested, then asks before downloading.
-The download runs separately from document rendering and can be canceled from
-**Help → Cancel update**. It verifies the executable's SHA-256 checksum, Windows
+The download runs separately from document rendering.
+FastPDF verifies the executable's SHA-256 checksum, Windows
 x64 architecture, version, and required embedded resources.
 
 Once an update is ready, choose **Restart now**, **Install when I close FastPDF**,
 or **Later**. Close other FastPDF windows before installing. Restart restores the
 current document, page, zoom mode, and rotation; document passwords are never
 saved. Choosing Later keeps the download for the current session; closing without
-choosing installation discards it. Cancel update also cancels installation on exit.
+choosing installation discards it.
 Portable copies must be installed to use the updater, or replaced with a fresh
 download from GitHub Releases.
 
