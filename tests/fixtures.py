@@ -211,7 +211,7 @@ def hash_r6(password, salt, user=b"", revision=6):
     return key[:32]
 
 
-def encrypted_pdf(revision, password=b"secret", owner=b"owner"):
+def encrypted_pdf(revision, password=b"secret", owner=b"owner", content=CONTENT):
     permissions = -4
     if revision <= 4:
         length = 5 if revision == 2 else 16
@@ -257,7 +257,7 @@ def encrypted_pdf(revision, password=b"secret", owner=b"owner"):
             iv = bytes(range(16))
             return iv + aes(data, key, iv, True)
     objects = base()
-    objects[4] = stream(encrypt(zlib.compress(CONTENT), 5), b"/Filter /FlateDecode")
+    objects[4] = stream(encrypt(zlib.compress(content), 5), b"/Filter /FlateDecode")
     objects += [enc]
     return pdf(objects, f"/Encrypt 6 0 R /ID [<{FILE_ID.hex()}> <{FILE_ID.hex()}>]".encode())
 
@@ -307,6 +307,21 @@ def generate(directory):
         (root / f"{name}.pdf").write_bytes(data)
         cases[name] = expected
     add("plain", pdf(base()), text="FastPDF hello world", pixel=(50, 150, (255, 0, 0)))
+    objects = base()
+    objects[4] = stream(b"BT\n" + b"0 0 Td\n" * 700000 + b"ET\n" + CONTENT, compression=True)
+    add("long_content", pdf(objects), text="FastPDF hello world", pixel=(50, 150, (255, 0, 0)))
+    for count in range(1000):
+        encoded = zlib.compress(CONTENT + b"%" + b"a" * count + b"\n")
+        if encoded[-1] == 10:
+            break
+    else:
+        raise AssertionError("Cannot construct a newline checksum fixture")
+    objects = base()
+    objects[4] = stream(encoded[:-1], b"/Filter /FlateDecode")
+    add("flate_missing_eol_checksum", pdf(objects), text="FastPDF hello world",
+        pixel=(50, 150, (255, 0, 0)), warnings=["Recovered a truncated Flate stream (object 5)"])
+    objects[4] = stream(encoded[:-4], b"/Filter /FlateDecode")
+    add("flate_missing_checksum", pdf(objects), error=True)
     inline_mask = b"BI /W 8 /H 8 /IM true /BPC 1 ID " + b"\x00" * 8 + b" EI"
     inverse_mask = inline_mask.replace(b"/BPC 1", b"/BPC 1 /D [1 0]")
     content = (b"q 1 0 0 rg 40 0 0 40 20 20 cm " + inline_mask + b" Q\n" +
@@ -314,6 +329,24 @@ def generate(directory):
                b"q 1 0 0 rg 40 0 0 40 140 20 cm " + inverse_mask + b" Q\n")
     add("inline_stencil_reuse", pdf(base(content)),
         pixels=[(40, 180, (255, 0, 0)), (100, 180, (0, 0, 255)), (160, 180, (255, 255, 255))])
+    for cap in (0, 1, 2):
+        content = f"20 w {cap} J 50 50 m 50 50 l s 100 50 m 100 50 l S 150 50 m h S 200 50 m S ".encode()
+        # The last stroke contains a degenerate and a non-degenerate subpath.
+        content += b"50 100 m 50 100 l h 100 100 m 130 100 l S"
+        dot = (0, 0, 0) if cap == 1 else (255, 255, 255)
+        add(f"degenerate_stroke_{cap}", pdf(base(content)), pixels=[(50, 170, dot), (100, 170, dot),
+            (150, 170, dot), (200, 170, (255, 255, 255)), (50, 120, dot), (115, 120, (0, 0, 0))])
+    # The custom CFF encoding maps A to an owned thin-stem glyph called C65.
+    # The PDF changes C only, so the native A mapping must remain in use.
+    objects = base(b"BT /F1 20 Tf 20 100 Td (AC) Tj ET")
+    objects[3] = (b"<< /Type /Font /Subtype /Type1 /BaseFont /FastPDFThinStem /FirstChar 65 /LastChar 67 "
+                  b"/Widths [600 600 600] /Encoding 7 0 R /FontDescriptor << /Type /FontDescriptor "
+                  b"/FontName /FastPDFThinStem /Flags 4 /FontBBox [0 0 600 700] /Ascent 700 /Descent 0 "
+                  b"/CapHeight 700 /StemV 40 /ItalicAngle 0 /FontFile3 6 0 R >> >>")
+    objects.append(stream((Path(__file__).parent / "data" / "thin-stem.cff").read_bytes(), b"/Subtype /Type1C"))
+    objects.append(b"<< /Differences [67 /A] >>")
+    add("cff_native_differences", pdf(objects), pixels=[(22, 110, (51, 51, 51)),
+                                                       (23, 110, (255, 255, 255)), (35, 110, (0, 0, 0))], tolerance=16)
     gray_jpeg = (Path(__file__).parent / "data" / "gray-tints.jpg").read_bytes()
     for inverse in [False, True]:
         objects = base(b"q 160 0 0 80 20 20 cm /Im Do Q", b"/XObject << /Im 6 0 R >>")
@@ -388,6 +421,14 @@ def generate(directory):
     for revision in range(2, 7):
         add(f"encrypted_r{revision}", encrypted_pdf(revision), text="FastPDF hello world", password="secret", owner="owner")
     add("encrypted_empty", encrypted_pdf(6, b""), text="FastPDF hello world")
+    samples = b"\xff\0\0\0\0\xff"
+    inline = (b"q 40 0 0 40 20 100 cm BI /W 2 /H 1 /BPC 8 /CS /RGB ID " + samples + b" EI Q "
+              b"q 40 0 0 40 80 100 cm BI /W 2 /H 1 /BPC 8 /CS /RGB /F /FlateDecode ID " +
+              zlib.compress(samples) + b" EI Q")
+    for revision in (2, 4, 6):
+        add(f"encrypted_inline_r{revision}", encrypted_pdf(revision, b"", content=inline),
+            pixels=[(25, 100, (255, 0, 0)), (55, 100, (0, 0, 255)),
+                    (85, 100, (255, 0, 0)), (115, 100, (0, 0, 255))])
     add("encrypted_unicode_r6",encrypted_pdf(6,b'IX'),text="FastPDF hello world",password='\u2168')
     add("encrypted_unicode_r3",encrypted_pdf(3,b'caf\xe9'),text="FastPDF hello world",password='caf\u00e9')
     add('jbig2_shared_symbols',jbig2_huffman_fixture(),pixel=(38,114,(0,0,0)))
@@ -443,6 +484,14 @@ def generate(directory):
     objects=base(b"20 20 100 100 re W n /Sh sh",b"/Shading << /Sh 6 0 R >>")
     objects += [b"<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [20 20 120 20] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> /Extend [true true] >>"]
     add("axial",pdf(objects),pixel=(70,150,(126,0,129)),tolerance=4)
+    objects[4] = stream(b"q 0 0 0 0 50 50 cm /Sh sh Q 0 1 0 rg 20 20 100 100 re f")
+    add("collapsed_shading", pdf(objects), pixels=[(70, 150, (0, 255, 0)), (150, 150, (255, 255, 255))])
+    objects = base(b"q 20 20 100 40 re W n /A sh Q q 20 120 100 40 re W n /B sh Q",
+                   b"/Shading << /A 6 0 R /B 7 0 R >>")
+    objects += [b"<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [20 20 120 20] /Domain [0 .5] /Function 8 0 R >>",
+                b"<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [20 120 120 120] /Domain [.5 1] /Function 8 0 R >>",
+                b"<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>"]
+    add("shared_gradient_domains", pdf(objects), pixels=[(70, 180, (64, 64, 64)), (70, 80, (192, 192, 192))], tolerance=2)
     objects=base(b"20 20 100 100 re W n /Sh sh",b"/Shading << /Sh 6 0 R >>")
     objects += [b"<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [70 70 0 70 70 50] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> /Extend [true true] >>"]
     add("radial",pdf(objects),pixel=(70,150,(251,0,4)),tolerance=5)

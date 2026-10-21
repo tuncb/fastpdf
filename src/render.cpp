@@ -31,8 +31,13 @@ void clear_resources(Renderer& r) {
         release(pair.second->face);
     r.fonts.clear();
     r.type1_programs.clear();
+    r.type3_contents.clear();
+    r.type3_content_bytes = 0;
     r.images.clear();
+    r.inline_stencils.clear();
+    r.inline_stencil_bytes = 0;
     r.character_maps.clear();
+    r.gradient_ramps.clear();
     r.image_bytes = 0;
     r.image_clock = 0;
     if (r.loader && r.write) {
@@ -47,8 +52,13 @@ void close_renderer(Renderer& r) {
         release(pair.second->face);
     r.fonts.clear();
     r.type1_programs.clear();
+    r.type3_contents.clear();
+    r.type3_content_bytes = 0;
     r.images.clear();
+    r.inline_stencils.clear();
+    r.inline_stencil_bytes = 0;
     r.character_maps.clear();
+    r.gradient_ramps.clear();
     if (r.loader && r.write)
         r.write->UnregisterFontFileLoader(r.loader);
     release(r.loader);
@@ -65,13 +75,28 @@ static D2D1_POINT_2F point(Point p) {
 static D2D1_COLOR_F rgba(Color c, float alpha = 1) {
     return {c.r, c.g, c.b, c.a * alpha};
 }
+struct StencilBitmap {
+    std::shared_ptr<Image> source;
+    Color color;
+    ID2D1Bitmap* bitmap = nullptr;
+};
 struct Surface {
     IWICBitmap* bitmap = nullptr;
     ID2D1RenderTarget* target = nullptr;
+    ID2D1SolidColorBrush* solid_brush = nullptr;
+    ID2D1StrokeStyle* stroke_style = nullptr;
+    D2D1_STROKE_STYLE_PROPERTIES stroke_properties{};
+    std::vector<float> stroke_dashes;
+    std::unordered_map<const Image*, StencilBitmap> stencils;
+    size_t stencil_bytes = 0;
     unsigned width = 0, height = 0;
 };
 static void destroy_surface(Surface* s) {
     if (s) {
+        for (auto& [key, entry] : s->stencils)
+            release(entry.bitmap);
+        release(s->solid_brush);
+        release(s->stroke_style);
         release(s->target);
         release(s->bitmap);
         delete s;
@@ -162,7 +187,8 @@ static void resume(Context& c) {
                                                           D2D1::Matrix3x2F::Identity(), 1),
                                     nullptr);
 }
-static ID2D1PathGeometry* geometry(Context& c, const std::vector<Segment>& path, bool evenodd = false) {
+static ID2D1PathGeometry* geometry(Context& c, const std::vector<Segment>& path, bool evenodd = false,
+                                  bool stroked = false) {
     ID2D1PathGeometry* shape = nullptr;
     ID2D1GeometrySink* sink = nullptr;
     hr(c.renderer->d2d->CreatePathGeometry(&shape), "Create vector path");
@@ -170,10 +196,34 @@ static ID2D1PathGeometry* geometry(Context& c, const std::vector<Segment>& path,
         hr(shape->Open(&sink), "Open vector path");
         sink->SetFillMode(evenodd ? D2D1_FILL_MODE_ALTERNATE : D2D1_FILL_MODE_WINDING);
         bool open = false;
-        for (auto& seg : path) {
+        for (size_t i = 0; i < path.size(); ++i) {
+            auto& seg = path[i];
             if (seg.type == 0) {
                 if (open)
                     sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                open = false;
+                if (stroked) {
+                    size_t end = i + 1;
+                    bool dot = true;
+                    auto same = [&](Point p) { return p.x == seg.p1.x && p.y == seg.p1.y; };
+                    while (end < path.size() && path[end].type != 0) {
+                        auto& s = path[end++];
+                        if ((s.type == 1 && !same(s.p1)) ||
+                            (s.type == 2 && (!same(s.p1) || !same(s.p2) || !same(s.p3))))
+                            dot = false;
+                    }
+                    if (dot) {
+                        // A degenerate subpath has no cap direction. PDF paints
+                        // it only with round caps; a trailing move paints nothing.
+                        if (c.g.cap == 1 && end > i + 1) {
+                            sink->BeginFigure(point(seg.p1), D2D1_FIGURE_BEGIN_HOLLOW);
+                            sink->AddLine(point(seg.p1));
+                            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                        }
+                        i = end - 1;
+                        continue;
+                    }
+                }
                 sink->BeginFigure(point(seg.p1), D2D1_FIGURE_BEGIN_FILLED);
                 open = true;
             } else if (seg.type == 1) {
@@ -535,17 +585,39 @@ static ID2D1Brush* make_brush(Context& c, const Value& resources, bool stroke);
 static Rect transformed_box(Matrix m, Rect r);
 static void draw_path(Context& c, const Value& resources, const std::vector<Segment>& path, bool fill,
                       bool stroke, bool evenodd) {
-    auto shape = geometry(c, path, evenodd);
-    D2D1_RECT_F extent{};
-    hr(shape->GetBounds(nullptr, &extent), "Measure paint bounds");
-    double padding =
-        stroke
-            ? std::max(2.0, std::abs(c.g.width) *
-                                std::max(std::hypot(c.g.ctm.a, c.g.ctm.b), std::hypot(c.g.ctm.c, c.g.ctm.d)) *
-                                std::max(1.0, c.g.miter))
-            : 2;
-    Rect bounds{extent.left - padding, extent.top - padding, extent.right + padding, extent.bottom + padding};
+    bool line = !fill && stroke && path.size() == 2 && path[0].type == 0 && path[1].type == 1;
+    if (line && c.g.cap != 1 && path[0].p1.x == path[1].p1.x && path[0].p1.y == path[1].p1.y)
+        return;
+    bool box = fill && !stroke && path.size() == 5 && path[0].type == 0 && path[1].type == 1 &&
+               path[2].type == 1 && path[3].type == 1 && path[4].type == 3 &&
+               ((path[0].p1.y == path[1].p1.y && path[1].p1.x == path[2].p1.x &&
+                 path[2].p1.y == path[3].p1.y && path[3].p1.x == path[0].p1.x) ||
+                (path[0].p1.x == path[1].p1.x && path[1].p1.y == path[2].p1.y &&
+                 path[2].p1.x == path[3].p1.x && path[3].p1.y == path[0].p1.y));
+    D2D1_RECT_F box_bounds{};
+    if (box)
+        box_bounds = {float(std::min(path[0].p1.x, path[2].p1.x)), float(std::min(path[0].p1.y, path[2].p1.y)),
+                      float(std::max(path[0].p1.x, path[2].p1.x)), float(std::max(path[0].p1.y, path[2].p1.y))};
+    auto shape = line || box ? nullptr : geometry(c, path, evenodd, stroke && !fill);
+    ID2D1PathGeometry* stroke_shape = nullptr;
     try {
+        if (fill && stroke)
+            stroke_shape = geometry(c, path, evenodd, true);
+        Rect bounds{-1e30, -1e30, 1e30, 1e30};
+        if ((c.g.blend != "Normal" && c.g.blend != "Compatible") || c.g.softmask.kind != Kind::null) {
+            D2D1_RECT_F extent{};
+            if (line)
+                extent = {float(std::min(path[0].p1.x, path[1].p1.x)), float(std::min(path[0].p1.y, path[1].p1.y)),
+                          float(std::max(path[0].p1.x, path[1].p1.x)), float(std::max(path[0].p1.y, path[1].p1.y))};
+            else if (box)
+                extent = box_bounds;
+            else
+                hr(shape->GetBounds(nullptr, &extent), "Measure paint bounds");
+            double padding = stroke ? std::max(2.0, std::abs(c.g.width) *
+                std::max(std::hypot(c.g.ctm.a, c.g.ctm.b), std::hypot(c.g.ctm.c, c.g.ctm.d)) *
+                std::max(1.0, c.g.miter)) : 2;
+            bounds = {extent.left - padding, extent.top - padding, extent.right + padding, extent.bottom + padding};
+        }
         paint(
             c, resources,
             [&](Context& target) {
@@ -557,7 +629,10 @@ static void draw_path(Context& c, const Value& resources, const std::vector<Segm
                 try {
                     if (fill) {
                         brush = make_brush(target, resources, false);
-                        rt->FillGeometry(shape, brush);
+                        if (box)
+                            rt->FillRectangle(box_bounds, brush);
+                        else
+                            rt->FillGeometry(shape, brush);
                         release(brush);
                     }
                     if (stroke) {
@@ -584,17 +659,38 @@ static void draw_path(Context& c, const Value& resources, const std::vector<Segm
                             auto copy = dash;
                             dash.insert(dash.end(), copy.begin(), copy.end());
                         }
-                        hr(target.renderer->d2d->CreateStrokeStyle(
-                               props, dash.empty() ? nullptr : dash.data(), UINT32(dash.size()), &style),
-                           "Create stroke style");
+                        auto& canvas = *target.canvas;
+                        auto& old_props = canvas.stroke_properties;
+                        if (!canvas.stroke_style || old_props.startCap != props.startCap ||
+                            old_props.endCap != props.endCap || old_props.dashCap != props.dashCap ||
+                            old_props.lineJoin != props.lineJoin || old_props.miterLimit != props.miterLimit ||
+                            old_props.dashStyle != props.dashStyle || old_props.dashOffset != props.dashOffset ||
+                            canvas.stroke_dashes != dash) {
+                            auto cached_dash = dash;
+                            hr(target.renderer->d2d->CreateStrokeStyle(
+                                   props, dash.empty() ? nullptr : dash.data(), UINT32(dash.size()), &style),
+                               "Create stroke style");
+                            release(canvas.stroke_style);
+                            canvas.stroke_style = style;
+                            canvas.stroke_properties = props;
+                            canvas.stroke_dashes = std::move(cached_dash);
+                        } else
+                            style = canvas.stroke_style;
+                        style->AddRef();
                         Matrix inv = inverse(target.g.ctm);
-                        hr(target.renderer->d2d->CreateTransformedGeometry(shape, matrix(inv), &local),
-                           "Transform stroke geometry");
+                        if (!line)
+                            hr(target.renderer->d2d->CreateTransformedGeometry(stroke_shape ? stroke_shape : shape,
+                                                                              matrix(inv), &local),
+                               "Transform stroke geometry");
                         D2D1_MATRIX_3X2_F old;
                         brush->GetTransform(&old);
                         brush->SetTransform(old * matrix(inv));
                         set_transform(target, target.g.ctm);
-                        rt->DrawGeometry(local, brush, width, style);
+                        if (line)
+                            rt->DrawLine(point(transform(inv, path[0].p1)), point(transform(inv, path[1].p1)),
+                                         brush, width, style);
+                        else
+                            rt->DrawGeometry(local, brush, width, style);
                         release(local);
                         release(style);
                         release(brush);
@@ -608,14 +704,18 @@ static void draw_path(Context& c, const Value& resources, const std::vector<Segm
             },
             false, 1, bounds);
     } catch (...) {
+        release(stroke_shape);
         release(shape);
         throw;
     }
+    release(stroke_shape);
     release(shape);
 }
-static void draw_image(Context& c, const Value& image, const Value& resources) {
+static void draw_image(Context& c, const Value& image, const Value& resources,
+                       std::shared_ptr<Image> decoded = {}) {
     double width = std::hypot(c.g.ctm.a, c.g.ctm.b), height = std::hypot(c.g.ctm.c, c.g.ctm.d);
-    auto decoded = load_image(*c.renderer, *c.document, image, resources, 0, width, height);
+    if (!decoded)
+        decoded = load_image(*c.renderer, *c.document, image, resources, 0, width, height);
     ProfileTimer resample_timer(c.renderer->profiling ? &c.renderer->profile.image_resample_ms : nullptr);
     decoded = image_level(*c.document, decoded, width, height);
     resample_timer.stop();
@@ -623,9 +723,16 @@ static void draw_image(Context& c, const Value& image, const Value& resources) {
         c, resources,
         [&](Context& target) {
             ID2D1Bitmap* bitmap = nullptr;
+            auto& canvas = *target.canvas;
+            auto cached = canvas.stencils.find(decoded.get());
+            if (cached != canvas.stencils.end() && cached->second.color.r == target.g.fill.r &&
+                cached->second.color.g == target.g.fill.g && cached->second.color.b == target.g.fill.b) {
+                bitmap = cached->second.bitmap;
+                bitmap->AddRef();
+            }
             Bytes pixels_copy;
             auto* data = decoded->pixels.data();
-            if (decoded->stencil) {
+            if (!bitmap && decoded->stencil) {
                 pixels_copy = decoded->pixels;
                 for (size_t i = 0; i < pixels_copy.size(); i += 4) {
                     unsigned a = pixels_copy[i + 3];
@@ -636,13 +743,25 @@ static void draw_image(Context& c, const Value& image, const Value& resources) {
                 data = pixels_copy.data();
             }
             ProfileTimer upload_timer(c.renderer->profiling ? &c.renderer->profile.image_upload_ms : nullptr);
-            hr(target.canvas->target->CreateBitmap(
+            if (!bitmap)
+                hr(target.canvas->target->CreateBitmap(
                    D2D1::SizeU(decoded->width, decoded->height), data, decoded->width * 4,
                    D2D1::BitmapProperties(
                        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)),
                    &bitmap),
                "Upload image pixels");
             upload_timer.stop();
+            if (decoded->stencil && cached == canvas.stencils.end() && decoded->pixels.size() <= 65536 &&
+                canvas.stencils.size() < 4096 && canvas.stencil_bytes + decoded->pixels.size() * 2 < 16 * 1024 * 1024) {
+                try {
+                    canvas.stencils.emplace(decoded.get(), StencilBitmap{decoded, target.g.fill, bitmap});
+                    bitmap->AddRef();
+                    canvas.stencil_bytes += decoded->pixels.size() * 2;
+                } catch (...) {
+                    release(bitmap);
+                    throw;
+                }
+            }
             set_transform(target, multiply(target.g.ctm, {1, 0, 0, -1, 0, 1}));
             bool interpolate = boolean(get(image, "Interpolate"), true);
             target.canvas->target->DrawBitmap(bitmap, D2D1::RectF(0, 0, 1, 1), target.g.fill_alpha,
@@ -663,6 +782,22 @@ static Rect transformed_box(Matrix m, Rect r) {
         out.y1 = std::max(out.y1, q.y);
     }
     return out;
+}
+static std::shared_ptr<Bytes> type3_content(Renderer& r, Document& d, const Value& procedure) {
+    if (auto found = r.type3_contents.find(&procedure); found != r.type3_contents.end())
+        return found->second;
+    auto bytes = std::make_shared<Bytes>(decode_stream(d, procedure).bytes);
+    size_t cost = bytes->size() + 256;
+    constexpr size_t limit = 16 * 1024 * 1024;
+    if (cost <= limit) {
+        if (r.type3_content_bytes + cost > limit || r.type3_contents.size() >= 4096) {
+            r.type3_contents.clear();
+            r.type3_content_bytes = 0;
+        }
+        r.type3_contents.emplace(&procedure, bytes);
+        r.type3_content_bytes += cost;
+    }
+    return bytes;
 }
 static void show_text(Context& c, std::string_view text, const Value& resources,
                       std::vector<ID2D1Geometry*>& text_clips) {
@@ -734,9 +869,9 @@ static void show_text(Context& c, std::string_view text, const Value& resources,
                     size_t clips = c.clips.size();
                     c.g.ctm = multiply(local, f.matrix);
                     auto& font_resources = entry(*c.document, f.dictionary, "Resources");
-                    auto bytes = decode_stream(*c.document, procedure).bytes;
+                    auto bytes = type3_content(*c.renderer, *c.document, procedure);
                     try {
-                        interpret(c, bytes, font_resources.kind == Kind::null ? resources : font_resources,
+                        interpret(c, *bytes, font_resources.kind == Kind::null ? resources : font_resources,
                                   c.depth + 1);
                     } catch (...) {
                         pop_clips(c, clips);
@@ -751,13 +886,16 @@ static void show_text(Context& c, std::string_view text, const Value& resources,
         }
     } else if (f.face) {
         auto draw_run = [&](size_t start, size_t count, Matrix mat, const float* advances_data) {
+            // DirectWrite's raw CFF rasterizer can make thin stems too heavy.
+            // Its unhinted outlines retain the embedded font's stroke widths.
+            bool outline_fill = fill && f.face->GetType() == DWRITE_FONT_FACE_TYPE_RAW_CFF;
             DWRITE_GLYPH_RUN run{f.face,        1.0f,    UINT32(count), indices.data() + start,
                                  advances_data, nullptr, FALSE,         0};
             ID2D1PathGeometry* outline = nullptr;
             ID2D1TransformedGeometry* transformed = nullptr;
             ID2D1GeometrySink* sink = nullptr;
             try {
-                if (stroke || clip) {
+                if (stroke || clip || outline_fill) {
                     hr(c.renderer->d2d->CreatePathGeometry(&outline), "Create glyph outlines");
                     hr(outline->Open(&sink), "Open glyph outline sink");
                     hr(f.face->GetGlyphRunOutline(1, run.glyphIndices, run.glyphAdvances, nullptr,
@@ -765,8 +903,9 @@ static void show_text(Context& c, std::string_view text, const Value& resources,
                        "Read font glyph outlines");
                     hr(sink->Close(), "Close glyph outlines");
                     release(sink);
-                    hr(c.renderer->d2d->CreateTransformedGeometry(outline, matrix(mat), &transformed),
-                       "Transform glyph outlines");
+                    if (stroke || clip)
+                        hr(c.renderer->d2d->CreateTransformedGeometry(outline, matrix(mat), &transformed),
+                           "Transform glyph outlines");
                 }
                 if (fill || stroke)
                     paint(c, resources, [&](Context& target) {
@@ -780,7 +919,10 @@ static void show_text(Context& c, std::string_view text, const Value& resources,
                                 brush->GetTransform(&bm);
                                 brush->SetTransform(bm * matrix(inv));
                                 set_transform(target, mat);
-                                rt->DrawGlyphRun({0, 0}, &run, brush, DWRITE_MEASURING_MODE_NATURAL);
+                                if (outline_fill)
+                                    rt->FillGeometry(outline, brush);
+                                else
+                                    rt->DrawGlyphRun({0, 0}, &run, brush, DWRITE_MEASURING_MODE_NATURAL);
                                 release(brush);
                             }
                             if (stroke) {
@@ -841,7 +983,8 @@ static void finish_text_clip(Context& c, std::vector<ID2D1Geometry*>& clips) {
     clips.clear();
 }
 
-static std::shared_ptr<Image> shading_image(Context& c, const Value& input, const Value& resources) {
+static std::shared_ptr<Image> shading_image(Context& c, const Value& input, const Value& resources,
+                                           Rect* region = nullptr) {
     auto& d = *c.document;
     auto& sh = resolve(d, input);
     int type = integer(get(sh, "ShadingType"));
@@ -854,12 +997,41 @@ static std::shared_ptr<Image> shading_image(Context& c, const Value& input, cons
     auto image = std::make_shared<Image>();
     image->width = c.canvas->width;
     image->height = c.canvas->height;
+    int origin_x = c.origin_x, origin_y = c.origin_y;
+    if (region) {
+        Rect bounds{double(origin_x), double(origin_y), double(origin_x) + image->width,
+                    double(origin_y) + image->height};
+        auto intersect = [&](Rect box) {
+            bounds.x0 = std::max(bounds.x0, box.x0 - 1);
+            bounds.y0 = std::max(bounds.y0, box.y0 - 1);
+            bounds.x1 = std::min(bounds.x1, box.x1 + 1);
+            bounds.y1 = std::min(bounds.y1, box.y1 + 1);
+        };
+        for (auto clip : c.clips) {
+            D2D1_RECT_F box{};
+            hr(clip->GetBounds(nullptr, &box), "Measure shading clip");
+            intersect({box.left, box.top, box.right, box.bottom});
+        }
+        auto& box = entry(d, sh, "BBox");
+        if (box.kind == Kind::array)
+            intersect(transformed_box(c.g.ctm, rectangle(box)));
+        if (bounds.x1 <= bounds.x0 || bounds.y1 <= bounds.y0) {
+            *region = {0, 0, 0, 0};
+            return image;
+        }
+        origin_x = int(std::floor(bounds.x0));
+        origin_y = int(std::floor(bounds.y0));
+        image->width = unsigned(std::ceil(bounds.x1) - origin_x);
+        image->height = unsigned(std::ceil(bounds.y1) - origin_y);
+        *region = {double(origin_x), double(origin_y), double(origin_x) + image->width,
+                   double(origin_y) + image->height};
+    }
     image->pixels.assign(size_t(image->width) * image->height * 4, 0);
     Matrix inv = inverse(c.g.ctm);
     auto mesh_point = [&](double x, double y) {
         auto p = transform(c.g.ctm, {x, y});
-        p.x -= c.origin_x;
-        p.y -= c.origin_y;
+        p.x -= origin_x;
+        p.y -= origin_y;
         return p;
     };
     Rect bbox = rectangle(entry(d, sh, "BBox"), {-1e30, -1e30, 1e30, 1e30});
@@ -881,10 +1053,28 @@ static std::shared_ptr<Image> shading_image(Context& c, const Value& input, cons
     if (type == 2 || type == 3) {
         std::array<Color, 1025> stops{};
         double d0 = num(at(domain, 0)), d1 = num(at(domain, 1), 1);
-        for (size_t i = 0; i < stops.size(); ++i) {
-            double v = d0 + (d1 - d0) * i / (stops.size() - 1);
-            auto components = evaluate_function(d, function, std::span(&v, 1));
-            stops[i] = color(d, space, components);
+        const auto* direct = &space;
+        while (direct->name == "ICCBased" && direct->alternate)
+            direct = direct->alternate.get();
+        int kind = direct->name == "DeviceRGB" ? 3 : direct->name == "DeviceGray" ? 1 :
+                   direct->name == "DeviceCMYK" ? 4 : 0;
+        auto key = &resolve(d, function);
+        auto& ramps = c.renderer->gradient_ramps;
+        auto cached = ramps.find(key);
+        if (kind && cached != ramps.end() && cached->second.space == kind &&
+            cached->second.low == d0 && cached->second.high == d1)
+            stops = cached->second.colors;
+        else {
+            for (size_t i = 0; i < stops.size(); ++i) {
+                double v = d0 + (d1 - d0) * i / (stops.size() - 1);
+                auto components = evaluate_function(d, function, std::span(&v, 1));
+                stops[i] = color(d, space, components);
+            }
+            if (kind) {
+                if (ramps.size() >= 256)
+                    ramps.clear();
+                ramps[key] = {d0, d1, kind, stops};
+            }
         }
         double x0 = num(at(coords, 0)), y0 = num(at(coords, 1)), r0 = type == 3 ? num(at(coords, 2)) : 0,
                x1 = num(at(coords, type == 3 ? 3 : 2)), y1 = num(at(coords, type == 3 ? 4 : 3)),
@@ -893,7 +1083,7 @@ static std::shared_ptr<Image> shading_image(Context& c, const Value& input, cons
             if ((y & 63) == 0)
                 check_cancel(d);
             for (unsigned x = 0; x < image->width; ++x) {
-                Point p = transform(inv, {x + 0.5 + c.origin_x, y + 0.5 + c.origin_y});
+                Point p = transform(inv, {x + 0.5 + origin_x, y + 0.5 + origin_y});
                 if (p.x < bbox.x0 || p.x > bbox.x1 || p.y < bbox.y0 || p.y > bbox.y1)
                     continue;
                 double px = p.x - x0, py = p.y - y0, t = 0;
@@ -963,7 +1153,7 @@ static std::shared_ptr<Image> shading_image(Context& c, const Value& input, cons
             }
         for (unsigned y = 0; y < image->height; ++y)
             for (unsigned x = 0; x < image->width; ++x) {
-                auto p = transform(to_function, {x + 0.5 + c.origin_x, y + 0.5 + c.origin_y});
+                auto p = transform(to_function, {x + 0.5 + origin_x, y + 0.5 + origin_y});
                 if (p.x < x0 || p.x > x1 || p.y < y0 || p.y > y1)
                     continue;
                 double fx = (p.x - x0) / (x1 - x0) * grid, fy = (p.y - y0) / (y1 - y0) * grid;
@@ -1249,9 +1439,14 @@ static ID2D1Brush* make_brush(Context& c, const Value& resources, bool stroke) {
     auto& pattern_name = stroke ? c.g.stroke_pattern : c.g.fill_pattern;
     float alpha = stroke ? c.g.stroke_alpha : c.g.fill_alpha;
     if (pattern_name.empty()) {
-        ID2D1SolidColorBrush* brush = nullptr;
-        hr(c.canvas->target->CreateSolidColorBrush(rgba(stroke ? c.g.stroke : c.g.fill, alpha), &brush),
-           "Create color paint");
+        auto& brush = c.canvas->solid_brush;
+        auto value = rgba(stroke ? c.g.stroke : c.g.fill, alpha);
+        if (!brush)
+            hr(c.canvas->target->CreateSolidColorBrush(value, &brush), "Create color paint");
+        else
+            brush->SetColor(value);
+        brush->SetTransform(D2D1::Matrix3x2F::Identity());
+        brush->AddRef();
         return brush;
     }
     require(c.depth < 24, "Pattern recursion limit");
@@ -1436,7 +1631,8 @@ static void apply_ext(Context& c, const Value& value, const Value& resources) {
         warn(d, "Graphics transfer functions are not applied");
     (void)resources;
 }
-static Value inline_image(Context& c, Parser& p, const Value& resources) {
+static Value inline_image(Context& c, Parser& p, const Value& resources, std::shared_ptr<Image>& decoded) {
+    size_t dictionary_start = p.pos;
     Value image;
     image.kind = Kind::dict;
     size_t entries = 0;
@@ -1460,6 +1656,33 @@ static Value inline_image(Context& c, Parser& p, const Value& resources) {
     } else if (p.pos < p.data.size() && whitespace(p.data[p.pos]))
         ++p.pos;
     size_t start = p.pos, end = std::string::npos;
+    std::string stencil_key;
+    auto find_stencil = [&](size_t stop) {
+        if (!boolean(get(image, "ImageMask")) || stop - dictionary_start > 16384)
+            return false;
+        stencil_key = string(p.data.subspan(dictionary_start, stop - dictionary_start));
+        auto found = c.renderer->inline_stencils.find(stencil_key);
+        if (found == c.renderer->inline_stencils.end())
+            return false;
+        decoded = found->second;
+        if (c.renderer->profiling)
+            ++c.renderer->profile.image_hits;
+        return true;
+    };
+    auto remember_stencil = [&] {
+        if (stencil_key.empty() || !decoded || decoded->pixels.size() > 65536)
+            return;
+        auto& r = *c.renderer;
+        // Retain small glyph masks only. The key includes the dictionary and
+        // encoded bytes, and the cached pixels contain alpha, not the fill color.
+        size_t cost = decoded->pixels.size() * 2 + stencil_key.size() + 256;
+        if (r.inline_stencil_bytes + cost > 16 * 1024 * 1024 || r.inline_stencils.size() >= 4096) {
+            r.inline_stencils.clear();
+            r.inline_stencil_bytes = 0;
+        }
+        if (r.inline_stencils.emplace(stencil_key, decoded).second)
+            r.inline_stencil_bytes += cost;
+    };
     auto& filter = get(image, "Filter");
     if (filter.kind == Kind::null) {
         int width = integer(get(image, "Width")), height = integer(get(image, "Height")),
@@ -1483,13 +1706,21 @@ static Value inline_image(Context& c, Parser& p, const Value& resources) {
                 image.stream = p.data.subspan(start, stop - start);
                 image.has_stream = true;
                 try {
-                    auto decoded = decode_stream(*c.document, image, true);
-                    if (decoded.image_filter.empty()) {
+                    if (find_stencil(stop)) {
+                        end = stop;
+                        break;
+                    }
+                    auto stream = decode_stream(*c.document, image, true);
+                    if (stream.image_filter.empty()) {
                         end = stop;
                         break;
                     }
                     auto data = load_image(*c.renderer, *c.document, image, resources);
                     if (data) {
+                        if (data->stencil) {
+                            decoded = std::move(data);
+                            remember_stencil();
+                        }
                         end = stop;
                         break;
                     }
@@ -1504,6 +1735,12 @@ static Value inline_image(Context& c, Parser& p, const Value& resources) {
     require(end != std::string::npos, "Unterminated or invalid inline image");
     image.stream = p.data.subspan(start, end - start);
     image.has_stream = true;
+    if (!decoded && boolean(get(image, "ImageMask"))) {
+        if (!find_stencil(end)) {
+            decoded = load_image(*c.renderer, *c.document, image, resources);
+            remember_stencil();
+        }
+    }
     p.pos = end;
     require(token(p) == "EI", "Missing inline image terminator");
     return image;
@@ -1512,6 +1749,7 @@ static Value inline_image(Context& c, Parser& p, const Value& resources) {
 static void interpret(Context& c, View bytes, const Value& resources, int depth) {
     require(depth < 48, "Content recursion limit exceeded");
     Parser p{bytes, 0, 0, false};
+    size_t tokens = 0;
     std::vector<Value> operands;
     std::vector<Graphics> saved;
     std::vector<Segment> path;
@@ -1576,15 +1814,15 @@ static void interpret(Context& c, View bytes, const Value& resources, int depth)
             skip_space(p);
             if (p.pos == bytes.size())
                 break;
-            if ((++c.operations & 255) == 0)
+            if ((++tokens & 255) == 0)
                 check_cancel(*c.document);
-            require(c.operations < 10000000, "Page operator limit exceeded");
             Value value = parse(p);
             if (value.kind != Kind::keyword) {
                 require(operands.size() < 4096, "Content operand limit exceeded");
                 operands.push_back(std::move(value));
                 continue;
             }
+            require(++c.operations < 10000000, "Page operator limit exceeded");
             auto& op = value.text;
             if (op == "q") {
                 need(0);
@@ -1804,27 +2042,30 @@ static void interpret(Context& c, View bytes, const Value& resources, int depth)
                 }
             } else if (op == "sh") {
                 need(1);
-                if (!hidden && !c.text_only) {
+                // A collapsed shading has no area and no inverse coordinates.
+                if (!hidden && !c.text_only && std::abs(c.g.ctm.a * c.g.ctm.d - c.g.ctm.b * c.g.ctm.c) > 1e-16) {
                     auto& shading = entry(*c.document, entry(*c.document, resources, "Shading"), arg(0).text);
                     paint(c, resources, [&](Context& target) {
-                        auto image = shading_image(target, shading, resources);
+                        Rect region;
+                        auto image = shading_image(target, shading, resources, &region);
+                        if (region.x1 <= region.x0 || region.y1 <= region.y0)
+                            return;
                         auto brush = bitmap_brush(
-                            target, *image, {1, 0, 0, 1, double(target.origin_x), double(target.origin_y)},
+                            target, *image, {1, 0, 0, 1, region.x0, region.y0},
                             target.g.fill_alpha, false);
                         set_transform(target);
                         target.canvas->target->FillRectangle(
-                            D2D1::RectF(float(target.origin_x), float(target.origin_y),
-                                        float(target.origin_x) + target.canvas->width,
-                                        float(target.origin_y) + target.canvas->height),
+                            D2D1::RectF(float(region.x0), float(region.y0), float(region.x1), float(region.y1)),
                             brush);
                         release(brush);
                     });
                 }
             } else if (op == "BI") {
                 need(0);
-                auto image = inline_image(c, p, resources);
+                std::shared_ptr<Image> decoded;
+                auto image = inline_image(c, p, resources, decoded);
                 if (!hidden && !c.text_only)
-                    draw_image(c, image, resources);
+                    draw_image(c, image, resources, std::move(decoded));
             } else if (op == "BMC" || op == "BDC") {
                 require(marked.size() < 128, "Marked-content nesting limit");
                 marked.push_back(hidden);
@@ -1848,6 +2089,10 @@ static void interpret(Context& c, View bytes, const Value& resources, int depth)
             } else if (!compatibility)
                 warn(*c.document, "Unknown content operator: " + op);
             operands.clear();
+            // Content operands have now been consumed. Keep the allocation
+            // limit per live operand set; the separate operation budget bounds
+            // long streams without rejecting millions of already-freed values.
+            p.nodes = 0;
         }
         finish_text_clip(c, text_clips);
         if (!saved.empty()) {

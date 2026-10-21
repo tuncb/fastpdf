@@ -426,7 +426,9 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                              (uint32_t(unit(c.a) * 255 + 0.5f) << 24);
             }
         }
-        for (size_t p = 0; p < out->pixels.size(); p += 4) {
+        bool transform_samples = gray_jpeg || invert || stencil ||
+                                 (!jpx && (decode.array.size() == 2 || decode.array.size() == 6));
+        for (size_t p = 0; transform_samples && p < out->pixels.size(); p += 4) {
             if (gray_jpeg) {
                 uint32_t pixel = palette[out->pixels[p]];
                 std::memcpy(out->pixels.data() + p, &pixel, 4);

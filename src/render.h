@@ -138,6 +138,11 @@ struct ProfileTimer {
     ProfileTimer(const ProfileTimer&) = delete;
     ProfileTimer& operator=(const ProfileTimer&) = delete;
 };
+struct GradientRamp {
+    double low = 0, high = 1;
+    int space = 0;
+    std::array<Color, 1025> colors{};
+};
 struct Renderer {
     ID2D1Factory* d2d = nullptr;
     IDWriteFactory5* write = nullptr;
@@ -145,8 +150,13 @@ struct Renderer {
     IWICImagingFactory* wic = nullptr;
     std::unordered_map<const Value*, std::unique_ptr<Font>> fonts;
     std::unordered_map<const Value*, std::shared_ptr<Type1Program>> type1_programs;
+    std::unordered_map<const Value*, std::shared_ptr<Bytes>> type3_contents;
+    size_t type3_content_bytes = 0;
     std::unordered_map<const Value*, CachedImage> images;
+    std::unordered_map<std::string, std::shared_ptr<Image>> inline_stencils;
+    size_t inline_stencil_bytes = 0;
     std::unordered_map<std::string, std::shared_ptr<CMap>> character_maps;
+    std::unordered_map<const Value*, GradientRamp> gradient_ramps;
     size_t image_bytes = 0;
     size_t image_cache_limit = 128 * 1024 * 1024;
     uint64_t image_clock = 0;

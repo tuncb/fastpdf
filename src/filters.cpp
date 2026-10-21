@@ -454,7 +454,9 @@ DecodeResult decode_stream(Document& d, const Value& input, bool image) {
         list.push_back(&filters);
     bool explicit_crypt = std::any_of(list.begin(), list.end(), [](auto f) { return named(*f, "Crypt"); });
     Bytes bytes;
-    if (d.security.enabled && !explicit_crypt && !named(get(s, "Type"), "XRef") &&
+    // Inline images are already decrypted with their containing content stream.
+    // Only an indirect stream has an object key for implicit decryption.
+    if (d.security.enabled && s.object && !explicit_crypt && !named(get(s, "Type"), "XRef") &&
         (d.security.metadata || !named(get(s, "Type"), "Metadata")))
         bytes = decrypt(d, s.stream, s.object, s.generation, d.security.stream_method);
     else
@@ -464,8 +466,32 @@ DecodeResult decode_stream(Document& d, const Value& input, bool image) {
         const auto& f = *list[i];
         const auto& p = resolve(d, parms.kind == Kind::array ? at(parms, i) : parms);
         auto n = f.text;
-        if (n == "FlateDecode" || n == "Fl")
-            bytes = predictor(inflate(bytes), p);
+        if (n == "FlateDecode" || n == "Fl") {
+            Bytes expanded;
+            try {
+                expanded = inflate(bytes);
+            } catch (const std::exception& error) {
+                bool recovered = false;
+                // Some producers count a final CR/LF checksum byte as the
+                // stream delimiter. Restore only line endings and accept them
+                // only if the complete DEFLATE stream and Adler checksum pass.
+                for (std::string_view suffix : {"\n", "\r", "\r\n"}) {
+                    auto repaired = bytes;
+                    repaired.insert(repaired.end(), suffix.begin(), suffix.end());
+                    try {
+                        expanded = inflate(repaired);
+                        recovered = true;
+                        break;
+                    } catch (const std::exception&) {
+                        check_cancel(d);
+                    }
+                }
+                if (!recovered)
+                    fail("Flate stream " + std::to_string(s.object) + ": " + error.what());
+                warn(d, "Recovered a truncated Flate stream (object " + std::to_string(s.object) + ")");
+            }
+            bytes = predictor(std::move(expanded), p);
+        }
         else if (n == "LZWDecode" || n == "LZW")
             bytes = predictor(lzw(bytes, integer(get(p, "EarlyChange"), 1)), p);
         else if (n == "ASCIIHexDecode" || n == "AHx")

@@ -432,7 +432,7 @@ static std::vector<View> cff_index(View data, size_t& p) {
     p = base + last - 1;
     return out;
 }
-static void cff_metadata(Font& f) {
+static void cff_metadata(Font& f, bool native_encoding) {
     View data = f.program;
     require(data.size() >= 4 && data[0] == 1, "Unsupported CFF header");
     size_t p = data[2];
@@ -537,7 +537,7 @@ static void cff_metadata(Font& f) {
                 f.cff_names[name] = uint16_t(i);
         }
     }
-    if (!cid && get(f.dictionary, "Encoding").kind == Kind::null) {
+    if (!cid && native_encoding) {
         int enc = field(16);
         if (enc > 1) {
             p = size_t(enc);
@@ -1010,21 +1010,9 @@ Font& load_font(Renderer& r, Document& d, const Value& input) {
     f.descent = integer(get(descriptor, "Descent"), -200);
     auto& encoding = entry(d, dictionary, "Encoding");
     auto encoding_name = encoding.kind == Kind::name ? encoding.text : get(encoding, "BaseEncoding").text;
+    bool native_encoding = encoding.kind == Kind::null ||
+                           (encoding.kind == Kind::dict && get(encoding, "BaseEncoding").kind == Kind::null);
     base_encoding(f, encoding_name);
-    if (encoding.kind == Kind::dict) {
-        int code = 0;
-        for (auto& v : entry(d, encoding, "Differences").array) {
-            if (v.kind == Kind::number)
-                code = integer(v);
-            else if (v.kind == Kind::name) {
-                if (code >= 0 && code < 256) {
-                    f.glyph_names[code] = v.text;
-                    f.encoding[code] = glyph_unicode(v.text);
-                }
-                ++code;
-            }
-        }
-    }
     auto& unicode = entry(d, dictionary, "ToUnicode");
     if (unicode.has_stream) {
         try {
@@ -1141,7 +1129,7 @@ Font& load_font(Renderer& r, Document& d, const Value& input) {
                     }
                     // Font dictionaries can share one program but have different
                     // encodings and widths. Only the decoded program is shared.
-                    if (encoding.kind == Kind::null)
+                    if (native_encoding)
                         for (size_t i = 0; i < f.glyph_names.size(); ++i) {
                             auto& name = f.type1_program->glyph_names[i];
                             if (!name.empty()) {
@@ -1154,7 +1142,7 @@ Font& load_font(Renderer& r, Document& d, const Value& input) {
                 } else {
                     f.program = decode_stream(d, *program).bytes;
                     if (cff)
-                        cff_metadata(f);
+                        cff_metadata(f, native_encoding);
                     hr(r.loader->CreateInMemoryFontFileReference(r.write, f.program.data(),
                                                                  UINT32(f.program.size()), nullptr, &file),
                        "Load embedded font file");
@@ -1184,6 +1172,22 @@ Font& load_font(Renderer& r, Document& d, const Value& input) {
         }
         if (!f.face && !f.type1)
             f.face = system_face(r, f);
+    }
+    // Without BaseEncoding, Differences changes the font's own encoding.
+    // Apply it after the embedded program has supplied that base mapping.
+    if (!f.composite && encoding.kind == Kind::dict) {
+        int code = 0;
+        for (auto& v : entry(d, encoding, "Differences").array) {
+            if (v.kind == Kind::number)
+                code = integer(v);
+            else if (v.kind == Kind::name) {
+                if (code >= 0 && code < 256) {
+                    f.glyph_names[code] = v.text;
+                    f.encoding[code] = glyph_unicode(v.text);
+                }
+                ++code;
+            }
+        }
     }
     if (f.composite && f.to_unicode.unicode.empty() && !f.cid_unicode)
         reverse_font_cmap(f);

@@ -69,7 +69,7 @@ def run(executable,root):
             for x,y,expected in pixels:
                 actual=png_pixel(output,x,y)
                 assert all(abs(a-b)<=case.get("tolerance",1) for a,b in zip(actual,expected)),f"pixel {x},{y}: {actual} != {expected}; {info}"
-            if not case.get("repaired"): assert not info["warnings"],info
+            if not case.get("repaired"): assert info["warnings"] == case.get("warnings", []),info
             if "owner" in case:
                 owner=subprocess.run([str(executable),str(root/f"{name}.pdf"),"--text","--password",case["owner"]],capture_output=True,text=True,encoding="utf-8",timeout=20)
                 assert owner.returncode==0,owner.stderr

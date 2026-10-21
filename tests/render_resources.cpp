@@ -12,8 +12,8 @@ static pdf::Value object(std::string_view text) {
 static void shared_type1_programs(pdf::Renderer& renderer) {
     pdf::clear_resources(renderer);
     pdf::Document doc;
-    std::string header = "%!PS-AdobeFont-1.0\n/Encoding 256 array dup 65 /A put def\ncurrentfile eexec\n";
-    std::string plain = "abcd/lenIV -1 def /Subrs 0 array def /CharStrings 1 dict /A 5 RD ";
+    std::string header = "%!PS-AdobeFont-1.0\n/Encoding 256 array dup 65 /B put def\ncurrentfile eexec\n";
+    std::string plain = "abcd/lenIV -1 def /Subrs 0 array def /CharStrings 1 dict /B 5 RD ";
     plain.append("\x8b\xf8\xec\x0d\x0e", 5); // 0 600 hsbw endchar
     plain += " ND end closefile";
     pdf::Bytes bytes(header.begin(), header.end());
@@ -32,7 +32,7 @@ static void shared_type1_programs(pdf::Renderer& renderer) {
     auto native = object("<< /Subtype /Type1 /BaseFont /Test /FirstChar 65 /Widths [600] "
                          "/FontDescriptor << /FontFile 77 0 R >> >>");
     auto remapped = object("<< /Subtype /Type1 /BaseFont /Test /FirstChar 66 /Widths [900] "
-                           "/Encoding << /Differences [66 /A] >> "
+                           "/Encoding << /Differences [66 /B] >> "
                            "/FontDescriptor << /FontFile 77 0 R >> >>");
     // Load the explicit encoding first. It must not suppress the native encoding
     // when another dictionary later uses the same font program.
@@ -41,9 +41,12 @@ static void shared_type1_programs(pdf::Renderer& renderer) {
     test(a.type1 && b.type1 && a.type1_program == b.type1_program && renderer.type1_programs.size() == 1,
          "Font dictionaries share the decoded Type 1 program");
     auto ga = pdf::decode_text(a, "B"), gb = pdf::decode_text(b, "A");
-    test(ga.size() == 1 && gb.size() == 1 && ga[0].text == L"A" && gb[0].text == L"A" &&
+    test(ga.size() == 1 && gb.size() == 1 && ga[0].text == L"B" && gb[0].text == L"B" &&
              ga[0].advance == 900 && gb[0].advance == 600,
          "Shared font programs preserve separate encodings and widths");
+    auto inherited = pdf::decode_text(a, "A");
+    test(inherited.size() == 1 && inherited[0].text == L"B" && inherited[0].name == "B",
+         "Differences without BaseEncoding retain the native Type 1 mapping");
     pdf::clear_resources(renderer);
     test(renderer.type1_programs.empty(), "Document changes clear shared Type 1 programs");
 }
