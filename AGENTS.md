@@ -24,12 +24,12 @@
 2. Run the release tooling tests and `./scripts/build.ps1 -Configuration Release`. Then run `./scripts/package.ps1` and `python .github/scripts/release.py verify artifacts/release`.
 3. Commit the complete release changes and wait for the commit to succeed. Push `main` with `git push origin main`.
 4. Only after the commit succeeds, create and push the matching tag. On this workstation, the Woby convention is `nu C:\tools\gittag.nu vX.Y.Z`; this creates the tag and pushes the branch and all local tags. Use it only if all local tags are intended for publication. The portable equivalent is `git tag vX.Y.Z` followed by `git push origin vX.Y.Z`.
-5. Check both the **Build and Test** and **Release** workflow runs. Confirm the GitHub release has `FastPDF-x64.zip` and `SHA256SUMS.txt`.
+5. Check both the **Build and Test** and **Release** workflow runs. Confirm the GitHub release has only `fastpdf.exe` and `SHA256SUMS.txt` as uploaded assets.
 
 The workflows follow Woby's build/release split. Pushes to `main` build and test Windows x64, then upload the portable package. A pushed `vX.Y.Z` tag validates the version and changelog and must point to a commit reachable from `origin/main`. Branch pushes alone do not publish releases.
 
-The release workflow waits for and reuses a successful `main` build of the exact tagged commit. If no usable build exists or its artifacts expired, it invokes the same build workflow on the tag. It verifies the archive checksums, embedded commit/version manifest, required files, and x64 executable architecture before publishing. Release notes come from the matching changelog entry.
+The release workflow waits for and reuses a successful `main` build of the exact tagged commit. If no usable build exists or its artifacts expired, it invokes the same build workflow on the tag. It verifies the executable checksum, embedded commit/version manifest, embedded data licenses, release file set, and x64 executable architecture before publishing. Release notes come from the matching changelog entry.
 
-The ZIP contains `fastpdf.exe`, `pdfprobe.exe`, documentation, data licenses, and `release-manifest.json`. The Microsoft C/C++ runtime is statically linked. Only Windows x64 is built and released.
+The standalone `fastpdf.exe` embeds data licenses and `release-manifest.json` as Windows resources. The notices are accessible from the Help menu. The Microsoft C/C++ runtime is statically linked. `pdfprobe.exe` is built for development and integration tests but is not installed or published. Only Windows x64 is built and released.
 
 If a workflow fails, fix the cause and rerun the failed run when appropriate. You can also dispatch **Release** with an existing tag selected. Never move or overwrite a published version tag; ship fixes as a new version. Rerunning a release uploads verified assets to the existing release.

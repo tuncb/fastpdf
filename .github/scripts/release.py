@@ -6,18 +6,15 @@ import re
 import struct
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
-MANIFEST = 'release-manifest.json'
-ARCHIVE = 'FastPDF-x64.zip'
-FILES = {
-    'fastpdf.exe', 'pdfprobe.exe', 'README.md', 'CHANGELOG.md',
-    'docs/ARCHITECTURE.md', 'docs/COMPATIBILITY.md', 'docs/VALIDATION.md',
-    'docs/validation-corpus.json', 'docs/FONT-DATA-LICENSE.txt', 'docs/UNICODE-LICENSE.txt',
-}
+EXECUTABLE = 'fastpdf.exe'
+# RCDATA IDs in src/resource.h. Read PE resources without loading/executing the app,
+# so verification works on both Windows builds and Linux release runners.
+BUILD_METADATA = 201
+LICENSES = {202: 'docs/FONT-DATA-LICENSE.txt', 203: 'docs/UNICODE-LICENSE.txt'}
 
 
 def repository_version():
@@ -65,57 +62,85 @@ def validate_x64(data):
         raise ValueError('Package executable must target Windows x64')
 
 
-def create_manifest(stage):
-    version = repository_version()
-    validate_tag('v' + version)
-    actual = {p.relative_to(stage).as_posix() for p in stage.rglob('*') if p.is_file()}
-    if actual - {MANIFEST} != FILES:
-        raise ValueError('Package files differ from the required release file set')
-    files = {}
-    for name in sorted(FILES):
-        data = (stage / name).read_bytes()
-        if name.endswith('.exe'):
-            validate_x64(data)
-        files[name] = hashlib.sha256(data).hexdigest()
-    manifest = dict(version=version, commit=commit_sha(), platform='windows-x64', files=files)
-    (stage / MANIFEST).write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+def embedded_resources(data):
+    validate_x64(data)
+
+    def read(blob, offset, size):
+        if offset < 0 or size < 0 or offset + size > len(blob):
+            raise ValueError('Truncated PE resource or header')
+        return blob[offset:offset + size]
+
+    def unpack(fmt, blob, offset):
+        return struct.unpack(fmt, read(blob, offset, struct.calcsize(fmt)))
+
+    pe = unpack('<I', data, 60)[0]
+    sections = unpack('<H', data, pe + 6)[0]
+    optional_size = unpack('<H', data, pe + 20)[0]
+    optional = read(data, pe + 24, optional_size)
+    if unpack('<H', optional, 0)[0] != 0x20b or unpack('<I', optional, 108)[0] < 3:
+        raise ValueError('Executable must contain PE32+ resource metadata')
+    resource_rva, resource_size = unpack('<II', optional, 128)
+    section_table = read(data, pe + 24 + optional_size, sections * 40)
+
+    def rva_bytes(rva, size):
+        for offset in range(0, len(section_table), 40):
+            _, address, raw_size, raw_offset = unpack('<IIII', section_table, offset + 8)
+            delta = rva - address
+            if 0 <= delta and delta + size <= raw_size:
+                return read(data, raw_offset + delta, size)
+        raise ValueError('PE resource points outside section data')
+
+    resources = rva_bytes(resource_rva, resource_size)
+
+    def entries(offset):
+        named, numbered = unpack('<HH', resources, offset + 12)
+        table = read(resources, offset + 16, (named + numbered) * 8)
+        return list(struct.iter_unpack('<II', table))
+
+    def directory(offset, identifier):
+        matches = [target for name, target in entries(offset) if name == identifier]
+        if len(matches) != 1 or not matches[0] & 0x80000000:
+            raise ValueError(f'Missing or invalid embedded resource directory: {identifier}')
+        return matches[0] & 0x7fffffff
+
+    rcdata = directory(0, 10)  # RT_RCDATA
+    result = {}
+    for identifier in (BUILD_METADATA, *LICENSES):
+        languages = entries(directory(rcdata, identifier))
+        if len(languages) != 1 or languages[0][1] & 0x80000000:
+            raise ValueError(f'Ambiguous or invalid embedded resource: {identifier}')
+        rva, size, _, _ = unpack('<IIII', resources, languages[0][1])
+        result[identifier] = rva_bytes(rva, size)
+    return result
 
 
 def verify_package(directory):
     version = repository_version()
-    archive = directory / ARCHIVE
-    expected = hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + ARCHIVE
+    data = (directory / EXECUTABLE).read_bytes()
+    expected = hashlib.sha256(data).hexdigest() + '  ' + EXECUTABLE
     if (directory / 'SHA256SUMS.txt').read_text(encoding='ascii').strip() != expected:
-        raise ValueError('Archive SHA-256 checksum does not match')
-    prefix = 'FastPDF-x64/'
-    with zipfile.ZipFile(archive) as package:
-        entries = [entry.filename for entry in package.infolist() if not entry.is_dir()]
-        if len(entries) != len(set(entries)) or set(entries) != {prefix + name for name in FILES | {MANIFEST}}:
-            raise ValueError('Archive has missing, duplicate, or unexpected files')
-        manifest = json.loads(package.read(prefix + MANIFEST))
-        if (manifest['version'], manifest['commit'], manifest['platform']) != (version, commit_sha(), 'windows-x64'):
-            raise ValueError('Archive version, commit, or platform does not match this checkout')
-        if set(manifest['files']) != FILES:
-            raise ValueError('Manifest file set does not match the release')
-        for name, digest in manifest['files'].items():
-            data = package.read(prefix + name)
-            if hashlib.sha256(data).hexdigest() != digest:
-                raise ValueError('Archive file checksum mismatch: ' + name)
-            if name.endswith('.exe'):
-                validate_x64(data)
+        raise ValueError('Executable SHA-256 checksum does not match')
+    if {p.name for p in directory.iterdir()} != {EXECUTABLE, 'SHA256SUMS.txt'}:
+        raise ValueError('Release has unexpected files')
+    resources = embedded_resources(data)
+    manifest = json.loads(resources[BUILD_METADATA])
+    if manifest != dict(version=version, commit=commit_sha(), platform='windows-x64'):
+        raise ValueError('Executable version, commit, or platform does not match this checkout')
+    for identifier, name in LICENSES.items():
+        # Windows and Linux Git checkouts can use different line endings.
+        if resources[identifier].replace(b'\r\n', b'\n') != (ROOT / name).read_bytes().replace(b'\r\n', b'\n'):
+            raise ValueError('Embedded notice does not match: ' + name)
 
 
 if __name__ == '__main__':
     if len(sys.argv) != 3:
-        raise SystemExit('Usage: release.py validate-tag TAG | notes TAG | manifest STAGE | verify DIRECTORY')
+        raise SystemExit('Usage: release.py validate-tag TAG | notes TAG | verify DIRECTORY')
     command, argument = sys.argv[1:]
     if command == 'validate-tag':
         validate_tag(argument)
     elif command == 'notes':
         validate_tag(argument)
         print(release_notes(argument))
-    elif command == 'manifest':
-        create_manifest(Path(argument))
     elif command == 'verify':
         verify_package(Path(argument))
     else:

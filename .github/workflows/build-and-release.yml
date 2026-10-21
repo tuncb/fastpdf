@@ -40,6 +40,6 @@ jobs:
         with:
           name: fastpdf-windows-x64
           path: |
-            artifacts/release/FastPDF-x64.zip
+            artifacts/release/fastpdf.exe
             artifacts/release/SHA256SUMS.txt
           if-no-files-found: error

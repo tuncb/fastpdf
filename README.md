@@ -8,7 +8,7 @@ The application opens local PDFs, renders pages, navigates outlines and links, s
 
 ## Build and run
 
-Requirements: x64 Windows 10 version 1703 or later, Visual Studio with Desktop development with C++, a Windows SDK, CMake 3.24+, and Ninja. Python is optional for building the app and is used for the integration tests.
+Requirements: x64 Windows 10 version 1703 or later, Visual Studio with Desktop development with C++, a Windows SDK, CMake 3.24+, Ninja, and Git. Build from a Git checkout so the executable can embed its source commit. Python is optional for building the app and is used for the integration tests.
 
 ```powershell
 .\scripts\build.ps1 -Configuration Release
@@ -26,7 +26,7 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-To make a portable ZIP after a successful build:
+To prepare the standalone executable and checksum after a successful build:
 
 ```powershell
 .\scripts\package.ps1
@@ -34,7 +34,11 @@ To make a portable ZIP after a successful build:
 
 Packaging requires Python 3.10 or newer. Download Windows x64 builds from
 [GitHub Releases](https://github.com/tuncb/fastpdf/releases). Each release includes
-`FastPDF-x64.zip` and `SHA256SUMS.txt`. Extract the ZIP and run `fastpdf.exe`.
+`fastpdf.exe` and `SHA256SUMS.txt`. Download and run `fastpdf.exe` directly;
+there is no installer, extraction step, or companion file required. The checksum
+file is optional and lets you verify the download. Third-party notices are embedded
+in the executable and available under **Help → Third-party notices**.
+The local release files are written to `artifacts/release/`.
 See [CHANGELOG.md](CHANGELOG.md) for release notes and [AGENTS.md](AGENTS.md) for
 the versioning and tag-based release process.
 
@@ -63,6 +67,10 @@ The UI renders in a worker thread, cancels obsolete render/search requests, cach
 .\build\pdfprobe.exe example.pdf --page 10 --benchmark 3 --profile
 .\build\pdfprobe.exe protected.pdf --password secret --render page.png
 ```
+
+`pdfprobe` is a developer command-line tool built alongside the reader and used by
+the integration tests. The reader does not launch or depend on it. From v0.2.0
+onward it is available in source builds, rather than the GitHub release download.
 
 `pdfprobe` writes JSON with page counts, open/render timings, memory use, extracted text when requested, and compatibility warnings. Exit codes: 0 success, 2 error, 3 warnings with `--strict`. `--all` validates every page; PNG and text output refer to the selected `--page`. The benchmark includes the first render and subsequent renders with the engine's resource caches populated; the GUI also has a separate rendered-page cache. `--timings` separates individual samples, and `--profile` breaks down decoding work. `--full-resolution` disables resolution-aware image decoding, and `--image-workers 1` selects serial decoding. See the [measurement notes](docs/ARCHITECTURE.md#measuring-rendering) for the reproducible benchmark harness.
 

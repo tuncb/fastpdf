@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FastPDF VERSION 0.1.0 LANGUAGES CXX)
+project(FastPDF VERSION 0.2.0 LANGUAGES CXX)
 if(NOT WIN32)
   message(FATAL_ERROR "FastPDF uses the Windows SDK. Build on Windows 10 or newer.")
 endif()
@@ -20,6 +20,16 @@ else()
   target_link_options(pdf_engine PUBLIC $<$<CONFIG:Release>:/LTCG>)
 endif()
 add_executable(fastpdf WIN32 src/app.cpp src/app.rc src/app.manifest)
+add_custom_target(build_metadata
+  COMMAND ${CMAKE_COMMAND} "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+    "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}" "-DVERSION=${PROJECT_VERSION}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build-metadata.cmake"
+  BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/release-manifest.json"
+  VERBATIM)
+add_dependencies(fastpdf build_metadata)
+set_source_files_properties(src/app.rc PROPERTIES
+  OBJECT_DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/release-manifest.json")
+target_include_directories(fastpdf PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/docs")
 target_link_libraries(fastpdf PRIVATE pdf_engine comctl32 comdlg32 shell32 dwmapi msimg32)
 add_executable(pdfprobe src/cli.cpp)
 target_link_libraries(pdfprobe PRIVATE pdf_engine)
@@ -39,6 +49,4 @@ if(Python3_FOUND)
   add_test(NAME codecs COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/codec_regression.py $<TARGET_FILE:codec_probe> ${CMAKE_CURRENT_BINARY_DIR}/codec-results)
   set_tests_properties(codecs PROPERTIES TIMEOUT 180)
 endif()
-install(TARGETS fastpdf pdfprobe RUNTIME DESTINATION .)
-install(FILES README.md DESTINATION .)
-install(FILES docs/ARCHITECTURE.md docs/COMPATIBILITY.md docs/VALIDATION.md docs/validation-corpus.json docs/FONT-DATA-LICENSE.txt docs/UNICODE-LICENSE.txt DESTINATION docs)
+install(TARGETS fastpdf RUNTIME DESTINATION .)

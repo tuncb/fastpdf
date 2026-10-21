@@ -1,0 +1,5 @@
+{
+  "version": "@VERSION@",
+  "commit": "@COMMIT@",
+  "platform": "windows-x64"
+}

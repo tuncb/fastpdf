@@ -84,7 +84,8 @@ enum Command {
     cmd_export,
     cmd_print,
     cmd_info,
-    cmd_goto
+    cmd_goto,
+    cmd_licenses
 };
 struct App {
     HWND window = nullptr, sidebar = nullptr, search = nullptr;
@@ -500,6 +501,35 @@ static INT_PTR CALLBACK password_dialog(HWND window, UINT message, WPARAM wp, LP
     }
     return FALSE;
 }
+static INT_PTR CALLBACK licenses_dialog(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    if (message == WM_INITDIALOG) {
+        const auto instance = reinterpret_cast<HINSTANCE>(lp);
+        std::wstring notices;
+        for (int id : {IDR_FONT_LICENSE, IDR_UNICODE_LICENSE}) {
+            const auto resource = FindResourceW(instance, MAKEINTRESOURCEW(id), RT_RCDATA);
+            const auto loaded = resource ? LoadResource(instance, resource) : nullptr;
+            const auto bytes = loaded ? static_cast<const char*>(LockResource(loaded)) : nullptr;
+            if (!bytes) {
+                notices += L"Unable to load embedded notices.\r\n";
+                continue;
+            }
+            const auto text = utf8(std::string_view(bytes, SizeofResource(instance, resource)));
+            for (size_t i = 0; i < text.size(); ++i) {
+                if (text[i] == L'\n' && (i == 0 || text[i - 1] != L'\r'))
+                    notices += L'\r';
+                notices += text[i];
+            }
+            notices += L"\r\n\r\n";
+        }
+        SetDlgItemTextW(window, IDC_LICENSES, notices.c_str());
+        return TRUE;
+    }
+    if (message == WM_COMMAND && (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL)) {
+        EndDialog(window, LOWORD(wp));
+        return TRUE;
+    }
+    return FALSE;
+}
 static INT_PTR CALLBACK goto_dialog(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     if (message == WM_INITDIALOG) {
         SetWindowLongPtrW(window, DWLP_USER, lp);
@@ -658,6 +688,9 @@ static void command(App& a, int id) {
             GlobalFree(dialog.hDevMode);
         if (dialog.hDevNames)
             GlobalFree(dialog.hDevNames);
+    } else if (id == cmd_licenses) {
+        DialogBoxParamW(a.instance, MAKEINTRESOURCEW(IDD_LICENSES), a.window, licenses_dialog,
+                        reinterpret_cast<LPARAM>(a.instance));
     } else if (id == cmd_info) {
         std::wstring info = L"FastPDF\nNative C++ reader with an owned PDF engine.\n\n";
         if (!a.pages.empty())
@@ -1362,6 +1395,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     AppendMenuW(view, MF_STRING, cmd_sidebar, L"Page &list");
     AppendMenuW(view, MF_STRING, cmd_bookmarks, L"&Bookmarks\tB");
     AppendMenuW(help, MF_STRING, cmd_info, L"&About and shortcuts\tF1");
+    AppendMenuW(help, MF_STRING, cmd_licenses, L"Third-party &notices…");
     AppendMenuW(menu, MF_POPUP, UINT_PTR(file), L"&File");
     AppendMenuW(menu, MF_POPUP, UINT_PTR(view), L"&View");
     AppendMenuW(menu, MF_POPUP, UINT_PTR(help), L"&Help");

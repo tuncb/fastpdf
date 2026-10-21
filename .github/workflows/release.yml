@@ -89,8 +89,8 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+            gh release upload "$RELEASE_TAG" release-assets/fastpdf.exe release-assets/SHA256SUMS.txt --clobber
           else
-            gh release create "$RELEASE_TAG" release-assets/* \
+            gh release create "$RELEASE_TAG" release-assets/fastpdf.exe release-assets/SHA256SUMS.txt \
               --verify-tag --title "$RELEASE_TAG" --notes-file release-notes.md
           fi
