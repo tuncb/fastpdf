@@ -14,6 +14,7 @@
 #include <thread>
 #include <cwctype>
 #include <future>
+#include <exception>
 #include <optional>
 #include "ui_style.h"
 
@@ -567,15 +568,66 @@ static void load_file(App& a, const std::wstring& path, const std::wstring& pass
     enqueue(a, std::move(request));
     InvalidateRect(a.window, nullptr, FALSE);
 }
+struct FileSelection {
+    std::wstring extended_path;
+    std::exception_ptr error;
+};
+static LRESULT CALLBACK file_dialog_proc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR subclass,
+                                         DWORD_PTR data) {
+    if (message == WM_NCDESTROY)
+        RemoveWindowSubclass(window, file_dialog_proc, subclass);
+    if (message == WM_COMMAND && LOWORD(wp) == IDOK) {
+        auto& selection = *reinterpret_cast<FileSelection*>(data);
+        try {
+            const LRESULT size = SendMessageW(window, CDM_GETSPEC, 0, 0);
+            if (size > 0 && size <= 32768) {
+                std::wstring path(size_t(size), L'\0');
+                const LRESULT copied =
+                    SendMessageW(window, CDM_GETSPEC, WPARAM(path.size()), LPARAM(path.data()));
+                if (copied > 0 && copied <= size) {
+                    path.resize(wcslen(path.c_str()));
+                    if (path.size() >= 2 && path.front() == L'"' && path.back() == L'"')
+                        path = path.substr(1, path.size() - 2);
+                    if (path.starts_with(L"\\\\?\\")) {
+                        // The shell treats '?' as a wildcard. Preserve the exact path for file I/O.
+                        selection.extended_path = std::move(path);
+                        SendMessageW(window, WM_COMMAND, IDCANCEL, 0);
+                        return 0;
+                    }
+                }
+            }
+        } catch (...) {
+            selection.error = std::current_exception();
+            SendMessageW(window, WM_COMMAND, IDCANCEL, 0);
+            return 0;
+        }
+    }
+    return DefSubclassProc(window, message, wp, lp);
+}
+static UINT_PTR CALLBACK file_dialog_hook(HWND window, UINT message, WPARAM, LPARAM lp) {
+    if (message == WM_INITDIALOG) {
+        const auto& dialog = *reinterpret_cast<OPENFILENAMEW*>(lp);
+        SetWindowSubclass(GetParent(window), file_dialog_proc, 1, DWORD_PTR(dialog.lCustData));
+    }
+    return 0;
+}
 static void choose_file(App& a) {
     wchar_t path[32768]{};
+    FileSelection selection;
     OPENFILENAMEW dialog{sizeof(dialog)};
     dialog.hwndOwner = a.window;
     dialog.lpstrFilter = L"PDF documents (*.pdf)\0*.pdf\0All files\0*.*\0";
     dialog.lpstrFile = path;
     dialog.nMaxFile = 32768;
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
-    if (GetOpenFileNameW(&dialog))
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_ENABLEHOOK;
+    dialog.lpfnHook = file_dialog_hook;
+    dialog.lCustData = LPARAM(&selection);
+    const bool accepted = GetOpenFileNameW(&dialog) != FALSE;
+    if (selection.error)
+        std::rethrow_exception(selection.error);
+    if (!selection.extended_path.empty())
+        load_file(a, selection.extended_path);
+    else if (accepted)
         load_file(a, path);
 }
 static void goto_page(App& a, int page) {
