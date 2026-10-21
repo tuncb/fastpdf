@@ -323,6 +323,18 @@ def generate(directory):
                   b"/FontFile2 6 0 R >> >>")
     objects.append(stream((Path(__file__).parent / "data" / "symbol-subset.ttf").read_bytes()))
     add("symbolic_truetype_codes", pdf(objects), text="A", pixels=[(40, 150, (0, 0, 0)), (100, 150, (255, 255, 255))])
+    for format in (0, 4, 6):
+        objects = base(b"BT /F1 100 Tf 20 50 Td <01> Tj ET")
+        objects[3] = (b"<< /Type /Font /Subtype /TrueType /BaseFont /FastPDFMacSubset /FirstChar 1 /LastChar 1 "
+                      b"/Widths [1000] /ToUnicode 7 0 R "
+                      b"/FontDescriptor << /Type /FontDescriptor /FontName /FastPDFMacSubset /Flags 4 "
+                      b"/FontBBox [0 0 1000 700] /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 "
+                      b"/FontFile2 6 0 R >> >>")
+        objects.append(stream((Path(__file__).parent / "data" / f"mac-subset-{format}.ttf").read_bytes()))
+        objects.append(stream(b"begincmap 1 begincodespacerange <00> <FF> endcodespacerange "
+                              b"1 beginbfchar <01> <0041> endbfchar endcmap"))
+        add(f"macintosh_truetype_{format}", pdf(objects), text="A",
+            pixels=[(40, 150, (0, 0, 0)), (100, 150, (255, 255, 255))])
     for count in range(1000):
         encoded = zlib.compress(CONTENT + b"%" + b"a" * count + b"\n")
         if encoded[-1] == 10:

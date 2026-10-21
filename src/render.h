@@ -47,6 +47,8 @@ struct Font {
     CMap cmap, to_unicode;
     std::shared_ptr<CMap> cid_unicode;
     std::array<uint32_t, 256> encoding{};
+    std::array<uint16_t, 256> mac_glyphs{};
+    bool has_mac_glyphs = false;
     std::array<std::string, 256> glyph_names;
     std::unordered_map<uint32_t, double> widths;
     std::unordered_map<uint32_t, std::array<double, 3>> vertical_metrics;

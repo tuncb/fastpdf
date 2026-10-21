@@ -990,6 +990,77 @@ static void reverse_font_cmap(Font& font) {
     }
     release(face);
 }
+static bool macintosh_glyphs(View table, std::array<uint16_t, 256>& glyphs) {
+    unsigned count = be(table, 2, 2);
+    require(4 + size_t(count) * 8 <= table.size(), "Truncated cmap records");
+    for (unsigned i = 0; i < count; ++i) {
+        size_t record = 4 + size_t(i) * 8;
+        if (be(table, record, 2) != 1 || be(table, record + 2, 2) != 0)
+            continue;
+        size_t offset = be(table, record + 4, 4);
+        require(offset <= table.size(), "Invalid cmap offset");
+        auto map = table.subspan(offset);
+        unsigned format = be(map, 0, 2), length = be(map, 2, 2);
+        require(length <= map.size(), "Truncated cmap subtable");
+        map = map.first(length);
+        if (format == 0) {
+            require(map.size() >= 262, "Truncated byte cmap");
+            for (size_t code = 0; code < glyphs.size(); ++code)
+                glyphs[code] = map[6 + code];
+        } else if (format == 6) {
+            unsigned first = be(map, 6, 2), entries = be(map, 8, 2);
+            require(10 + size_t(entries) * 2 <= map.size(), "Truncated trimmed cmap");
+            for (unsigned code = first; code < glyphs.size() && code - first < entries; ++code)
+                glyphs[code] = uint16_t(be(map, 10 + size_t(code - first) * 2, 2));
+        } else if (format == 4) {
+            unsigned segments = be(map, 6, 2) / 2;
+            require(segments && 16 + size_t(segments) * 8 <= map.size(), "Invalid segmented cmap");
+            size_t starts = 16 + size_t(segments) * 2, deltas = starts + size_t(segments) * 2;
+            size_t ranges = deltas + size_t(segments) * 2;
+            for (unsigned code = 0; code < glyphs.size(); ++code)
+                for (unsigned segment = 0; segment < segments; ++segment) {
+                    if (code > be(map, 14 + size_t(segment) * 2, 2))
+                        continue;
+                    unsigned first = be(map, starts + size_t(segment) * 2, 2);
+                    if (code >= first) {
+                        unsigned delta = be(map, deltas + size_t(segment) * 2, 2);
+                        size_t position = ranges + size_t(segment) * 2;
+                        unsigned range = be(map, position, 2);
+                        unsigned glyph = range ? be(map, position + range + size_t(code - first) * 2, 2) : code;
+                        glyphs[code] = uint16_t(range && !glyph ? 0 : glyph + delta);
+                    }
+                    break;
+                }
+        } else
+            continue;
+        return true;
+    }
+    return false;
+}
+static void load_macintosh_glyphs(Font& font) {
+    // Symbolic PDF TrueType codes address the (1,0) cmap directly. DirectWrite's
+    // Unicode API can remap these codes and select a different subset glyph.
+    if (font.composite || !font.symbolic || font.face->IsSymbolFont())
+        return;
+    const void* data = nullptr;
+    void* context = nullptr;
+    UINT32 size = 0;
+    BOOL exists = FALSE;
+    hr(font.face->TryGetFontTable(DWRITE_MAKE_OPENTYPE_TAG('c', 'm', 'a', 'p'),
+                                 &data, &size, &context, &exists), "Read embedded cmap");
+    if (!exists)
+        return;
+    try {
+        font.has_mac_glyphs = macintosh_glyphs(View(static_cast<const uint8_t*>(data), size), font.mac_glyphs);
+        for (auto& glyph : font.mac_glyphs)
+            if (glyph >= font.face->GetGlyphCount())
+                glyph = 0;
+        font.face->ReleaseFontTable(context);
+    } catch (...) {
+        font.face->ReleaseFontTable(context);
+        throw;
+    }
+}
 Font& load_font(Renderer& r, Document& d, const Value& input) {
     ProfileTimer timer(r.profiling ? &r.profile.font_load_ms : nullptr);
     const auto& dictionary = resolve(d, input);
@@ -1159,6 +1230,8 @@ Font& load_font(Renderer& r, Document& d, const Value& input) {
                     }
                     hr(r.write->CreateFontFace(face_type, 1, &file, 0, DWRITE_FONT_SIMULATIONS_NONE, &f.face),
                        "Create embedded font face");
+                    if (face_type == DWRITE_FONT_FACE_TYPE_TRUETYPE)
+                        load_macintosh_glyphs(f);
                     f.embedded = true;
                 }
                 release(file);
@@ -1167,6 +1240,7 @@ Font& load_font(Renderer& r, Document& d, const Value& input) {
                 release(f.face);
                 f.type1 = false;
                 f.embedded = false;
+                f.has_mac_glyphs = false;
                 warn(d, "Font substitution for " + f.base_name + ": " + e.what());
             }
         }
@@ -1263,6 +1337,8 @@ std::vector<Glyph> decode_text(Font& f, std::string_view text) {
                 g.index = uint16_t(g.cid);
         } else if (auto it = f.cff_names.find(g.name); it != f.cff_names.end())
             g.index = it->second;
+        else if (f.has_mac_glyphs)
+            g.index = f.mac_glyphs[code & 255];
         else if (f.face) {
             // A symbolic TrueType cmap is indexed by the PDF character code.
             // DirectWrite also aliases low Unicode values into that cmap, so
