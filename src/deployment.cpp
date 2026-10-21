@@ -5,6 +5,8 @@
 #include <winhttp.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <shlwapi.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <fstream>
 #include <chrono>
@@ -206,7 +208,78 @@ void require_no_other_instances() {
 static void registry_string(HKEY key, const wchar_t* name, const std::wstring& value) {
     check(RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()),
                          DWORD((value.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS,
-          "Cannot register FastPDF in Windows Installed Apps");
+          "Cannot write the FastPDF registration");
+}
+static constexpr wchar_t pdf_progid[] = L"FastPDF.PDF";
+static constexpr wchar_t capabilities_key[] = L"Software\\FastPDF\\Capabilities";
+static constexpr wchar_t registered_apps_key[] = L"Software\\RegisteredApplications";
+static constexpr wchar_t pdf_open_with_key[] = L"Software\\Classes\\.pdf\\OpenWithProgids";
+static void registry_entry(const wchar_t* path, const wchar_t* name, const std::wstring& value) {
+    Registry key;
+    check(RegCreateKeyExW(HKEY_CURRENT_USER, path, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key.value,
+                          nullptr) == ERROR_SUCCESS,
+          "Cannot register FastPDF as a PDF reader");
+    registry_string(key.value, name, value);
+}
+static void associations_changed() {
+#ifndef FASTPDF_DEPLOYMENT_TEST
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+#endif
+}
+static void register_pdf_reader() {
+    const auto executable = quote_argument(installed_executable().wstring());
+    const auto command = executable + L" -- \"%1\"";
+    registry_entry(L"Software\\Classes\\FastPDF.PDF", nullptr, L"PDF document");
+    registry_entry(L"Software\\Classes\\FastPDF.PDF\\Application", L"ApplicationName", L"FastPDF");
+    registry_entry(L"Software\\Classes\\FastPDF.PDF\\shell\\open\\command", nullptr, command);
+    registry_entry(L"Software\\Classes\\Applications\\fastpdf.exe", L"FriendlyAppName", L"FastPDF");
+    registry_entry(L"Software\\Classes\\Applications\\fastpdf.exe\\SupportedTypes", L".pdf", L"");
+    registry_entry(L"Software\\Classes\\Applications\\fastpdf.exe\\shell\\open\\command", nullptr, command);
+    registry_entry(capabilities_key, L"ApplicationName", L"FastPDF");
+    registry_entry(capabilities_key, L"ApplicationDescription", L"FastPDF PDF reader");
+    registry_entry(L"Software\\FastPDF\\Capabilities\\FileAssociations", L".pdf", pdf_progid);
+    registry_entry(registered_apps_key, L"FastPDF", capabilities_key);
+    Registry key;
+    check(RegCreateKeyExW(HKEY_CURRENT_USER, pdf_open_with_key, 0, nullptr, 0, KEY_SET_VALUE, nullptr,
+                          &key.value, nullptr) == ERROR_SUCCESS &&
+              RegSetValueExW(key.value, pdf_progid, 0, REG_NONE, nullptr, 0) == ERROR_SUCCESS,
+          "Cannot add FastPDF to Open with for PDF files");
+    associations_changed();
+}
+static bool registry_missing(LSTATUS status) {
+    return status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND;
+}
+static void unregister_pdf_reader() {
+    for (const auto path : {L"Software\\Classes\\FastPDF.PDF",
+                            L"Software\\Classes\\Applications\\fastpdf.exe", capabilities_key}) {
+        const auto status = RegDeleteTreeW(HKEY_CURRENT_USER, path);
+        check(status == ERROR_SUCCESS || registry_missing(status),
+              "Cannot remove the FastPDF PDF registration");
+    }
+    for (const auto& entry :
+         {std::pair{registered_apps_key, L"FastPDF"}, std::pair{pdf_open_with_key, pdf_progid}}) {
+        const auto status = RegDeleteKeyValueW(HKEY_CURRENT_USER, entry.first, entry.second);
+        check(status == ERROR_SUCCESS || registry_missing(status),
+              "Cannot remove the FastPDF PDF registration");
+    }
+    associations_changed();
+}
+bool default_pdf_reader() {
+    wchar_t executable[32768]{};
+    DWORD size = DWORD(std::size(executable));
+    return AssocQueryStringW(ASSOCF_NONE, ASSOCSTR_EXECUTABLE, L".pdf", L"open", executable, &size) == S_OK &&
+           same_file(executable, installed_executable());
+}
+void open_pdf_defaults(HWND owner) {
+    // Windows owns the user's default choice. Register capabilities, then let Settings confirm it.
+    check(installation_present(), "Install FastPDF before choosing it as the default PDF reader");
+    auto result = ShellExecuteW(owner, L"open", L"ms-settings:defaultapps?registeredAppUser=FastPDF", nullptr,
+                                nullptr, SW_SHOWNORMAL);
+    if (INT_PTR(result) <= 32)
+        result = ShellExecuteW(owner, L"open", L"ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
+    check(INT_PTR(result) > 32,
+          "FastPDF is installed, but Windows Default apps could not be opened. Open Settings > Apps > "
+          "Default apps and choose FastPDF for .pdf files.");
 }
 static void register_installation(std::string_view version) {
     Registry key;
@@ -226,6 +299,7 @@ static void register_installation(std::string_view version) {
               RegSetValueExW(key.value, L"NoRepair", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value),
                              sizeof(value)) == ERROR_SUCCESS,
           "Cannot finish the uninstall registration");
+    register_pdf_reader();
 }
 bool shortcut_present() {
     return fs::is_regular_file(shortcut_path());
@@ -273,6 +347,11 @@ void install(bool shortcut) {
             std::error_code error;
             fs::remove(installed_executable(), error);
             RegDeleteTreeW(HKEY_CURRENT_USER, uninstall_key);
+            try {
+                unregister_pdf_reader();
+            } catch (...) {
+                // Preserve the installation failure if registry cleanup also fails.
+            }
             throw;
         }
     } else {
@@ -536,6 +615,7 @@ void remove_installation() {
         Handle idle{exclusive_instance_lock(0)};
         reject_reparse(installed_executable());
         set_shortcut(false);
+        unregister_pdf_reader();
         fs::remove(installed_executable());
         const LSTATUS status = RegDeleteTreeW(HKEY_CURRENT_USER, uninstall_key);
         check(status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND,

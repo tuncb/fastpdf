@@ -1,6 +1,9 @@
 #include "deployment.h"
 #include "pdf.h"
+#include "installation_dialog.h"
+#include "resource.h"
 #include <bcrypt.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <objbase.h>
 #include <fstream>
@@ -61,6 +64,109 @@ struct RegistrySandbox {
         RegDeleteTreeW(HKEY_CURRENT_USER, path.c_str());
     }
 };
+static void registry_fixture(const wchar_t* path, const wchar_t* name, const wchar_t* value) {
+    HKEY key = nullptr;
+    test(RegCreateKeyExW(HKEY_CURRENT_USER, path, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) ==
+             ERROR_SUCCESS,
+         "Create isolated registry fixture");
+    const auto status = RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value),
+                                       DWORD((wcslen(value) + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+    test(status == ERROR_SUCCESS, "Write isolated registry fixture");
+}
+static std::wstring registry_value(const wchar_t* path, const wchar_t* name = nullptr) {
+    wchar_t value[32768]{};
+    DWORD size = sizeof(value);
+    test(RegGetValueW(HKEY_CURRENT_USER, path, name, RRF_RT_REG_SZ, nullptr, value, &size) == ERROR_SUCCESS,
+         "Read isolated registry value");
+    return value;
+}
+static bool registry_key_present(const wchar_t* path) {
+    HKEY key = nullptr;
+    const auto status = RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_READ, &key);
+    if (key)
+        RegCloseKey(key);
+    test(status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND,
+         "Inspect isolated registry key");
+    return status == ERROR_SUCCESS;
+}
+static std::function<void(HWND)> dialog_action;
+static std::exception_ptr dialog_error;
+static LRESULT CALLBACK installation_hook(int code, WPARAM wp, LPARAM lp) {
+    const auto window = HWND(wp);
+    if (code == HCBT_ACTIVATE && dialog_action && GetDlgItem(window, IDC_INSTALL_FOLDER)) {
+        auto action = std::move(dialog_action);
+        dialog_action = {};
+        try {
+            action(window);
+        } catch (...) {
+            dialog_error = std::current_exception();
+            SendMessageW(window, WM_COMMAND, IDCANCEL, 0);
+        }
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+static ui::InstallationAction installation_fixture(ui::InstallationOptions& options,
+                                                   std::function<void(HWND)> action) {
+    dialog_action = std::move(action);
+    dialog_error = nullptr;
+    const auto hook = SetWindowsHookExW(WH_CBT, installation_hook, nullptr, GetCurrentThreadId());
+    test(hook != nullptr, "Automate the installation dialog without desktop input");
+    const auto result = ui::show_installation_dialog(GetModuleHandleW(nullptr), nullptr, options);
+    UnhookWindowsHookEx(hook);
+    test(!dialog_action, "Installation dialog was exercised");
+    if (dialog_error)
+        std::rethrow_exception(dialog_error);
+    return result;
+}
+static void installation_dialog_tests() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES};
+    test(InitCommonControlsEx(&controls) != FALSE, "Initialize installation controls");
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ui::InstallationOptions options{L"C:\\isolated user 文書\\LocalAppData\\Programs\\FastPDF"};
+    const auto install = installation_fixture(options, [&](HWND window) {
+        test(IsDlgButtonChecked(window, IDC_INSTALL_SHORTCUT) == BST_CHECKED,
+             "New installations default to a Start menu shortcut");
+        test(IsDlgButtonChecked(window, IDC_INSTALL_PDF) == BST_UNCHECKED, "PDF default choice is opt-in");
+        test(!(GetWindowLongPtrW(GetDlgItem(window, IDC_INSTALL_UNINSTALL), GWL_STYLE) & WS_VISIBLE),
+             "Fresh installation hides uninstall");
+        wchar_t path[256]{};
+        GetDlgItemTextW(window, IDC_INSTALL_FOLDER, path, int(std::size(path)));
+        test(path == options.folder, "Installation folder preserves Unicode and spaces");
+        SendDlgItemMessageW(window, IDC_INSTALL_SHORTCUT, BM_CLICK, 0, 0);
+        SendDlgItemMessageW(window, IDC_INSTALL_PDF, BM_CLICK, 0, 0);
+        SendMessageW(window, WM_COMMAND, IDOK, 0);
+    });
+    test(install == ui::InstallationAction::apply && !options.shortcut && options.default_pdf,
+         "Install submits both independent checkbox choices");
+    const auto cancel = installation_fixture(options, [](HWND window) {
+        SendDlgItemMessageW(window, IDC_INSTALL_PDF, BM_CLICK, 0, 0);
+        SendMessageW(window, WM_CLOSE, 0, 0);
+    });
+    test(cancel == ui::InstallationAction::cancel && options.default_pdf,
+         "Cancel discards changed installation choices");
+    options.installed = options.present = true;
+    const auto apply = installation_fixture(options, [](HWND window) {
+        wchar_t caption[64]{};
+        GetDlgItemTextW(window, IDOK, caption, int(std::size(caption)));
+        test(std::wstring_view(caption) == L"Apply", "Installed reader offers Apply");
+        test(GetWindowLongPtrW(GetDlgItem(window, IDC_INSTALL_UNINSTALL), GWL_STYLE) & WS_VISIBLE,
+             "Installed reader offers Uninstall");
+        SendMessageW(window, WM_COMMAND, IDOK, 0);
+    });
+    test(apply == ui::InstallationAction::apply, "Installed options can be applied");
+    options.installed = false;
+    const auto open = installation_fixture(options, [](HWND window) {
+        for (const int id : {IDC_INSTALL_SHORTCUT, IDC_INSTALL_PDF})
+            test(!(GetWindowLongPtrW(GetDlgItem(window, id), GWL_STYLE) & WS_VISIBLE),
+                 "Portable copy cannot edit an existing installation");
+        SendMessageW(window, WM_COMMAND, IDOK, 0);
+    });
+    test(open == ui::InstallationAction::open, "Portable copy opens the installed reader");
+    const auto uninstall = installation_fixture(
+        options, [](HWND window) { SendMessageW(window, WM_COMMAND, IDC_INSTALL_UNINSTALL, 0); });
+    test(uninstall == ui::InstallationAction::uninstall, "Existing installation can request uninstall");
+}
 static std::wstring environment(const wchar_t* name) {
     std::wstring value(32768, L'\0');
     DWORD size = GetEnvironmentVariableW(name, value.data(), DWORD(value.size()));
@@ -131,6 +237,7 @@ int wmain(int argc, wchar_t** argv) {
         const fs::path reader = fs::absolute(argv[1]);
         const fs::path scratch = fs::absolute(argv[2]);
         fs::create_directories(scratch);
+        installation_dialog_tests();
         test(parse_version("v1.20.3") > parse_version("1.9.99"), "Numeric version ordering");
         test(parse_version("0.3.0") == Version{0, 3, 0}, "Parse current version");
         for (auto text : {"", "1.2", "1.2.3.4", "01.2.3", "1.2.3-beta", "-1.2.3", "65536.0.0", "v.2.3"})
@@ -239,8 +346,36 @@ int wmain(int argc, wchar_t** argv) {
             fs::remove(stage.parent_path());
             fs::remove(stage.parent_path().parent_path());
             test(!installation_present(), "Start with no installation");
+            registry_fixture(L"Software\\Classes\\.pdf", nullptr, L"OtherReader.PDF");
+            registry_fixture(L"Software\\Classes\\.pdf\\OpenWithProgids", L"OtherReader.PDF", L"");
+            registry_fixture(L"Software\\RegisteredApplications", L"OtherReader", L"Software\\OtherReader");
+            constexpr wchar_t choice[] =
+                L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.pdf\\UserChoice";
+            registry_fixture(choice, L"ProgId", L"OtherReader.PDF");
+            registry_fixture(choice, L"Hash", L"untouched-user-choice");
             install(true);
             test(installation_present() && shortcut_present(), "Install reader and Start menu shortcut");
+            test(registry_value(L"Software\\FastPDF\\Capabilities\\FileAssociations", L".pdf") ==
+                         L"FastPDF.PDF" &&
+                     registry_value(L"Software\\RegisteredApplications", L"FastPDF") ==
+                         L"Software\\FastPDF\\Capabilities",
+                 "Register per-user PDF capabilities for Windows Default apps");
+            const auto pdf_command = registry_value(L"Software\\Classes\\FastPDF.PDF\\shell\\open\\command");
+            test(pdf_command ==
+                     quote_argument((install_directory() / "fastpdf.exe").wstring()) + L" -- \"%1\"",
+                 "PDF opening command quotes the installed path and document placeholder");
+            test(registry_value(L"Software\\Classes\\Applications\\fastpdf.exe\\shell\\open\\command") ==
+                     pdf_command,
+                 "Open with launches the installed reader");
+            DWORD type = 0, bytes = 0;
+            test(RegGetValueW(HKEY_CURRENT_USER, L"Software\\Classes\\.pdf\\OpenWithProgids", L"FastPDF.PDF",
+                              RRF_RT_REG_NONE, &type, nullptr, &bytes) == ERROR_SUCCESS &&
+                     type == REG_NONE && bytes == 0,
+                 "List FastPDF as an alternate PDF handler");
+            test(registry_value(L"Software\\Classes\\.pdf") == L"OtherReader.PDF" &&
+                     registry_value(choice, L"ProgId") == L"OtherReader.PDF" &&
+                     registry_value(choice, L"Hash") == L"untouched-user-choice",
+                 "Installation preserves the existing PDF default and protected user choice");
             HKEY uninstall = nullptr;
             test(RegOpenKeyExW(HKEY_CURRENT_USER,
                                L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FastPDF", 0,
@@ -285,6 +420,23 @@ int wmain(int argc, wchar_t** argv) {
                  "Uninstall removes application and shortcut");
             test(get(install_directory() / "user-document.pdf") == "user data",
                  "Uninstall preserves user files");
+            test(!registry_key_present(L"Software\\Classes\\FastPDF.PDF") &&
+                     !registry_key_present(L"Software\\Classes\\Applications\\fastpdf.exe") &&
+                     !registry_key_present(L"Software\\FastPDF\\Capabilities"),
+                 "Uninstall removes FastPDF's PDF handler and capabilities");
+            test(RegGetValueW(HKEY_CURRENT_USER, L"Software\\RegisteredApplications", L"FastPDF", RRF_RT_ANY,
+                              nullptr, nullptr, &bytes) == ERROR_FILE_NOT_FOUND &&
+                     RegGetValueW(HKEY_CURRENT_USER, L"Software\\Classes\\.pdf\\OpenWithProgids",
+                                  L"FastPDF.PDF", RRF_RT_ANY, nullptr, nullptr,
+                                  &bytes) == ERROR_FILE_NOT_FOUND,
+                 "Uninstall removes only FastPDF's values from shared registration keys");
+            test(registry_value(L"Software\\Classes\\.pdf") == L"OtherReader.PDF" &&
+                     registry_value(choice, L"ProgId") == L"OtherReader.PDF" &&
+                     registry_value(choice, L"Hash") == L"untouched-user-choice" &&
+                     registry_value(L"Software\\RegisteredApplications", L"OtherReader") ==
+                         L"Software\\OtherReader" &&
+                     registry_value(L"Software\\Classes\\.pdf\\OpenWithProgids", L"OtherReader.PDF").empty(),
+                 "Uninstall preserves other PDF readers and the user's default choice");
             test(RegOpenKeyExW(HKEY_CURRENT_USER,
                                L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FastPDF", 0,
                                KEY_QUERY_VALUE, &uninstall) == ERROR_FILE_NOT_FOUND,

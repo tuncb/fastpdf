@@ -42,6 +42,8 @@ fs::path install_directory();
 bool installed_instance();
 bool installation_present();
 void install(bool shortcut);
+bool default_pdf_reader();
+void open_pdf_defaults(HWND owner);
 void open_installed(const Session& session);
 void set_shortcut(bool enabled);
 bool shortcut_present();

@@ -20,9 +20,9 @@ else()
   target_link_options(pdf_engine PUBLIC $<$<CONFIG:Release>:/LTCG>)
 endif()
 add_library(deployment STATIC src/deployment.cpp src/deployment_protocol.cpp)
-target_link_libraries(deployment PUBLIC pdf_engine winhttp version shell32 advapi32 uuid)
+target_link_libraries(deployment PUBLIC pdf_engine winhttp version shell32 shlwapi advapi32 uuid)
 target_compile_definitions(deployment PUBLIC FASTPDF_VERSION="${PROJECT_VERSION}" FASTPDF_VERSION_W=L"${PROJECT_VERSION}")
-add_executable(fastpdf WIN32 src/app.cpp src/app.rc src/app.manifest)
+add_executable(fastpdf WIN32 src/app.cpp src/installation_dialog.cpp src/app.rc src/app.manifest)
 add_custom_target(build_metadata
   COMMAND ${CMAKE_COMMAND} "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
     "-DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}" "-DVERSION=${PROJECT_VERSION}"
@@ -37,9 +37,9 @@ target_link_libraries(fastpdf PRIVATE deployment comctl32 comdlg32 shell32 dwmap
 add_executable(pdfprobe src/cli.cpp)
 target_link_libraries(pdfprobe PRIVATE pdf_engine)
 enable_testing()
-add_executable(deployment_tests tests/deployment.cpp src/deployment.cpp src/deployment_protocol.cpp src/app.rc)
+add_executable(deployment_tests tests/deployment.cpp src/deployment.cpp src/deployment_protocol.cpp src/installation_dialog.cpp src/app.rc src/app.manifest)
 target_include_directories(deployment_tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/docs")
-target_link_libraries(deployment_tests PRIVATE pdf_engine winhttp version shell32 advapi32 uuid)
+target_link_libraries(deployment_tests PRIVATE pdf_engine winhttp version shell32 shlwapi advapi32 uuid comctl32 dwmapi)
 target_compile_definitions(deployment_tests PRIVATE FASTPDF_DEPLOYMENT_TEST
   FASTPDF_VERSION="${PROJECT_VERSION}" FASTPDF_VERSION_W=L"${PROJECT_VERSION}")
 add_dependencies(deployment_tests fastpdf)
