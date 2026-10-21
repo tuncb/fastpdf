@@ -148,6 +148,7 @@ struct Context {
     size_t operations = 0;
     int depth = 0;
     bool collect_text = true;
+    bool alpha_only = false;
     bool text_only = false;
     int origin_x = 0, origin_y = 0;
 };
@@ -441,7 +442,7 @@ static Bytes soft_mask(Context& c, const Value& resources) {
     return alpha;
 }
 static void composite(Context& c, Surface& layer, std::string_view mode, float opacity, const Bytes& mask,
-                      int origin_x, int origin_y, bool has_backdrop = false) {
+                      int origin_x, int origin_y, bool has_backdrop = false, View group_alpha = {}) {
     ProfileTimer timer(c.renderer->profiling ? &c.renderer->profile.composite_ms : nullptr);
     Bytes source = pixels(layer);
     // A backdrop group keeps its parent paused from the initial backdrop copy
@@ -464,7 +465,7 @@ static void composite(Context& c, Surface& layer, std::string_view mode, float o
                 BYTE* dst = dest + size_t(int(y) + origin_y - c.origin_y) * stride +
                             size_t(int(x) + origin_x - c.origin_x) * 4;
                 double coverage = opacity * (mask.empty() ? 1 : mask[i / 4] / 255.0);
-                if (has_backdrop) {
+                if (has_backdrop && group_alpha.empty()) {
                     if (coverage == 0 || std::memcmp(dst, source.data() + i, 4) == 0)
                         continue;
                     // For normal group composition, removing the initial backdrop
@@ -475,13 +476,17 @@ static void composite(Context& c, Surface& layer, std::string_view mode, float o
                             std::clamp(dst[k] + coverage * (source[i + k] - dst[k]), 0.0, 255.0) + 0.5);
                     continue;
                 }
-                double sa = source[i + 3] / 255.0 * coverage, da = dst[3] / 255.0;
+                double source_alpha = group_alpha.empty() ? source[i + 3] / 255.0 : group_alpha[i / 4] / 255.0;
+                double sa = source_alpha * coverage, da = dst[3] / 255.0;
                 if (sa == 0)
                     continue;
                 std::array<double, 3> sc{}, dc{};
                 for (int k = 0; k < 3; ++k) {
-                    sc[k] = source[i + 2 - k] / 255.0 * coverage;
+                    sc[k] = source[i + 2 - k] / 255.0;
                     dc[k] = dst[2 - k] / 255.0;
+                    if (has_backdrop)
+                        sc[k] = std::clamp(sc[k] - (1 - source_alpha) * dc[k], 0.0, source_alpha);
+                    sc[k] *= coverage;
                 }
                 std::array<double, 3> su{}, du{};
                 for (int k = 0; k < 3; ++k) {
@@ -507,11 +512,48 @@ static void composite(Context& c, Surface& layer, std::string_view mode, float o
         throw;
     }
 }
+static Bytes group_alpha(Context& c, const std::function<void(Context&)>& draw,
+                         int x, int y, unsigned width, unsigned height) {
+    auto layer = surface(*c.renderer, width, height);
+    Context sub;
+    sub.renderer = c.renderer;
+    sub.document = c.document;
+    sub.canvas = layer.get();
+    sub.output = c.output;
+    sub.g = c.g;
+    sub.g.blend = "Normal";
+    sub.g.softmask = {};
+    sub.depth = c.depth + 1;
+    sub.collect_text = false;
+    sub.alpha_only = true;
+    sub.origin_x = x;
+    sub.origin_y = y;
+    layer->target->BeginDraw();
+    layer->target->Clear(D2D1::ColorF(0, 0));
+    try {
+        for (auto clip : c.clips)
+            push_clip(sub, clip);
+        draw(sub);
+        pop_clips(sub, 0);
+        hr(layer->target->EndDraw(), "Render group alpha");
+    } catch (...) {
+        pop_clips(sub, 0);
+        layer->target->EndDraw();
+        throw;
+    }
+    auto data = pixels(*layer);
+    Bytes alpha(size_t(width) * height);
+    for (size_t i = 0; i < alpha.size(); ++i)
+        alpha[i] = data[i * 4 + 3];
+    return alpha;
+}
 static void paint(Context& c, const Value& resources, const std::function<void(Context&)>& draw,
                   bool force = false, float opacity = 1, Rect bounds = {-1e30, -1e30, 1e30, 1e30},
                   bool has_backdrop = false, bool image_mask = false) {
     bool use_mask = !image_mask && c.g.softmask.kind != Kind::null;
-    if (!force && (c.g.blend == "Normal" || c.g.blend == "Compatible") && !use_mask) {
+    bool normal = c.alpha_only || c.g.blend == "Normal" || c.g.blend == "Compatible";
+    has_backdrop = has_backdrop && !c.alpha_only;
+    if (!force && normal && !use_mask) {
         draw(c);
         return;
     }
@@ -542,6 +584,7 @@ static void paint(Context& c, const Value& resources, const std::function<void(C
     sub.g.softmask = {};
     sub.depth = c.depth + 1;
     sub.collect_text = c.collect_text;
+    sub.alpha_only = c.alpha_only;
     sub.origin_x = x;
     sub.origin_y = y;
     if (has_backdrop)
@@ -566,7 +609,14 @@ static void paint(Context& c, const Value& resources, const std::function<void(C
             sub.g = c.g;
             mask = soft_mask(sub, resources);
         }
-        composite(c, *layer, c.g.blend, opacity, mask, x, y, has_backdrop);
+        // A non-normal group blend needs the group's alpha without its initial
+        // backdrop, then explicit backdrop removal (PDF 32000-1, 11.4.4).
+        // The alpha pass ignores blend colors and does not start nested alpha
+        // passes; soft-mask luminosity calculations still use normal color rendering.
+        Bytes alpha;
+        if (has_backdrop && !normal)
+            alpha = group_alpha(c, draw, x, y, width, height);
+        composite(c, *layer, c.alpha_only ? "Normal" : c.g.blend, opacity, mask, x, y, has_backdrop, alpha);
         if (has_backdrop)
             resume(c);
     } catch (...) {
@@ -1530,6 +1580,7 @@ static ID2D1Brush* make_brush(Context& c, const Value& resources, bool stroke) {
     sub.output = c.output;
     sub.collect_text = false;
     sub.g = c.g;
+    sub.alpha_only = c.alpha_only;
     sub.g.fill_pattern.clear();
     sub.g.stroke_pattern.clear();
     sub.g.blend = "Normal";
@@ -1592,11 +1643,9 @@ static void draw_form(Context& c, const Value& input, const Value& resources, in
     if (group && transparency && !c.text_only) {
         auto& grp = entry(d, form, "Group");
         bool non_isolated = !boolean(get(grp, "I"));
-        bool backdrop = non_isolated && (c.g.blend == "Normal" || c.g.blend == "Compatible");
+        bool backdrop = non_isolated && !c.alpha_only;
         if (boolean(get(grp, "K")))
             warn(d, "Knockout transparency groups are approximated as non-knockout groups");
-        if (non_isolated && !backdrop)
-            warn(d, "Non-isolated groups with a non-normal group blend use an isolated backdrop");
         float alpha = c.g.fill_alpha;
         paint(
             c, resources,

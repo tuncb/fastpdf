@@ -542,6 +542,22 @@ def generate(directory):
     objects[5]=b'<< /ca 0.5 /SMask << /S /Luminosity /G 8 0 R >> >>'
     objects.append(stream(b'0.5 g 20 20 100 100 re f',b'/Type /XObject /Subtype /Form /BBox [20 20 120 120] /Group << /S /Transparency /I true /CS /DeviceGray >>'))
     add('group_masked_backdrop',pdf(objects),pixel=(50,150,(0,0,191)),tolerance=2)
+    form = stream(b"/M gs 1 0 1 rg 20 20 100 100 re f",
+                  b"/Type /XObject /Subtype /Form /BBox [0 0 300 220] /Group << /S /Transparency /I false >> "
+                  b"/Resources << /ExtGState << /M << /BM /Multiply /ca .5 >> >> >>")
+    for name, alpha, expected in [("opaque", 1, (184, 102, 71)), ("opacity", .5, (168, 102, 61))]:
+        objects = base(b".6 .4 .2 rg 0 0 300 220 re f q /O gs /X Do Q",
+                       b"/XObject << /X 6 0 R >> /ExtGState << /O << /BM /Screen /ca " + str(alpha).encode() + b" >> >>")
+        objects.append(form)
+        add(f"group_nonnormal_{name}", pdf(objects), pixels=[(50, 150, expected), (200, 150, (153, 102, 51))], tolerance=3)
+    objects = base(b"/P Do", b"/XObject << /P 7 0 R >>")
+    objects.append(form)
+    objects.append(stream(b"/A gs .6 .4 .2 rg 0 0 300 220 re f q /O gs /X Do Q",
+                   b"/Type /XObject /Subtype /Form /BBox [0 0 300 220] /Group << /S /Transparency /I true >> "
+                   b"/Resources << /XObject << /X 6 0 R >> /ExtGState << /A << /ca .6 >> "
+                   b"/O << /BM /Screen /ca 1 >> >> >>"))
+    add("group_nonnormal_translucent", pdf(objects), pixels=[(50, 150, (205, 112, 140)),
+        (200, 150, (194, 163, 133))], tolerance=3)
     objects=base(b"/GS gs 1 0 0 rg 20 20 100 100 re f",b"/ExtGState << /GS 6 0 R >>")
     objects += [b"<< /SMask << /S /Luminosity /G 7 0 R >> >>",stream(b"0.5 g 0 0 300 220 re f",b"/Type /XObject /Subtype /Form /BBox [0 0 300 220] /Group << /S /Transparency /CS /DeviceGray /I true >>")]
     add("graphics_smask",pdf(objects),pixel=(50,150,(255,128,128)),tolerance=3)
