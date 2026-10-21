@@ -23,6 +23,44 @@ static pdf::Value object(std::string_view source) {
     pdf::Parser p{pdf::view(source)};
     return pdf::parse(p);
 }
+static void png_predictors() {
+    constexpr unsigned filters[] = {2, 0, 1, 2, 3, 4, 2, 0, 4, 1};
+    for (unsigned columns : {1u, 2u, 3u, 15u, 16u, 17u, 31u, 32u, 33u, 257u})
+        for (unsigned colors : {1u, 3u, 4u}) {
+            size_t row = size_t(columns) * colors;
+            pdf::Bytes expected(row * std::size(filters)), encoded;
+            for (size_t i = 0; i < expected.size(); ++i)
+                expected[i] = uint8_t(i * 61 + i / 7);
+            for (size_t y = 0; y < std::size(filters); ++y) {
+                encoded.push_back(uint8_t(filters[y]));
+                for (size_t x = 0; x < row; ++x) {
+                    int left = x >= colors ? expected[y * row + x - colors] : 0;
+                    int above = y ? expected[(y - 1) * row + x] : 0;
+                    int corner = y && x >= colors ? expected[(y - 1) * row + x - colors] : 0;
+                    int predicted = 0;
+                    if (filters[y] == 1)
+                        predicted = left;
+                    else if (filters[y] == 2)
+                        predicted = above;
+                    else if (filters[y] == 3)
+                        predicted = (left + above) / 2;
+                    else if (filters[y] == 4) {
+                        int p = left + above - corner;
+                        std::array<int, 3> values{left, above, corner};
+                        std::array<int, 3> distances{std::abs(p - left), std::abs(p - above),
+                                                     std::abs(p - corner)};
+                        predicted = values[size_t(std::min_element(distances.begin(), distances.end()) -
+                                                  distances.begin())];
+                    }
+                    encoded.push_back(uint8_t(expected[y * row + x] - predicted));
+                }
+            }
+            auto params = object("<< /Predictor 15 /BitsPerComponent 8 /Colors " + std::to_string(colors) +
+                                 " /Columns " + std::to_string(columns) + " >>");
+            test(pdf::predictor(encoded, params) == expected,
+                 "Mixed PNG filters preserve rows across vector and scalar boundaries");
+        }
+}
 int main() {
     using namespace pdf;
     try {
@@ -62,6 +100,20 @@ int main() {
         const uint8_t stored[] = {0x78, 0x01, 0x01, 0x03, 0x00, 0xfc, 0xff,
                                   'a',  'b',  'c',  0x02, 0x4d, 0x01, 0x27};
         test(string(inflate(stored)) == "abc", "Stored DEFLATE block");
+        // Python zlib output covers repeated bytes and overlapping multibyte runs.
+        for (auto [pattern, encoded] : std::initializer_list<std::pair<std::string_view, std::string_view>>{
+                 {"A", "789c2b284a4dcbac701c05a360140c7b505c9a06cced009975031b"},
+                 {"AB", "789c2b284a4dcbac70741a85a370148ec251380a47e15087c5a569c05a1d00789104fa"},
+                 {"ABC", "789c2b284a4dcbac7074721e45a368148da251348a46d1281a45a368140d72545c9a066cbd0300a1630ac1"},
+                 {"ABCDEFG", "789cedc5c10d80201000b0d9548449b8e47e466272e3bb0113b49f3eef8cace3bcdadd87244992244992244992a44deb8bc8fa01dd3a48ed"}}) {
+            std::string expected = "prefix";
+            for (int i = 0; i < 1000; ++i)
+                expected += pattern;
+            expected += "suffix";
+            auto compressed = ascii_hex(view(encoded));
+            test(string(inflate(compressed)) == expected, "Overlapping DEFLATE runs match zlib output");
+            rejects([&] { inflate(compressed, expected.size() - 1); }, "Repeated DEFLATE output budget");
+        }
         rejects([&] { inflate(stored, 2); }, "DEFLATE output budget");
         auto corrupt = Bytes(std::begin(stored), std::end(stored));
         corrupt.back() ^= 1;
@@ -69,6 +121,7 @@ int main() {
         auto params = object("<< /Predictor 15 /Columns 3 /Colors 1 /BitsPerComponent 8 >>");
         test(predictor({1, 10, 10, 10, 2, 1, 2, 3}, params) == Bytes({10, 20, 30, 11, 22, 33}),
              "PNG Sub and Up predictors");
+        png_predictors();
         auto tiff = object("<< /Predictor 2 /Columns 3 /Colors 1 /BitsPerComponent 16 >>");
         test(predictor({0, 255, 0, 1, 0, 1}, tiff) == Bytes({0, 255, 1, 0, 1, 1}), "16-bit TIFF prediction");
         test(rc4(view("Plaintext"), view("Key")) == ascii_hex(view("BBF316E8D940AF0AD3")),

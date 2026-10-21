@@ -429,7 +429,6 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
     } else {
         out->width = width;
         out->height = height;
-        out->pixels.resize(size_t(width) * height * 4);
         unsigned n = stencil ? 1 : unsigned(space.components);
         size_t row = (size_t(width) * n * bits + 7) / 8;
         require(height <= decoded.bytes.size() / row, "Truncated image samples");
@@ -449,7 +448,56 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                 }
             }
         }
-        if (n == 1 && bits <= 8) {
+        const ColorSpace* direct = &space;
+        while (direct->name == "ICCBased" && direct->alternate)
+            direct = direct->alternate.get();
+        bool rgb = n == 3 && bits == 8 && direct->name == "DeviceRGB" && mask.kind != Kind::array;
+        bool half_rgb = rgb && reduction && width > target_width * 2 && height > target_height * 2 &&
+                        !mask.has_stream && !entry(d, image, "SMask").has_stream;
+        if (half_rgb) {
+            out->width = (width + 1) / 2;
+            out->height = (height + 1) / 2;
+            out->reduction = 1;
+        }
+        out->pixels.resize(size_t(out->width) * out->height * 4);
+        if (rgb) {
+            std::array<std::array<uint8_t, 256>, 3> channels{};
+            for (unsigned i = 0; i < 3; ++i)
+                for (unsigned sample = 0; sample < 256; ++sample)
+                    channels[i][sample] = uint8_t(unit(low[i] + (high[i] - low[i]) * sample / 255.0) *
+                                                     255 +
+                                                 0.5f);
+            for (unsigned y = 0; y < out->height; ++y) {
+                if ((y & 127) == 0)
+                    check_cancel(d);
+                uint8_t* destination = out->pixels.data() + size_t(y) * out->width * 4;
+                if (half_rgb) {
+                    // Fuse conversion with the first box-filter level. This
+                    // keeps its rounding without a full-size BGRA allocation.
+                    const uint8_t* row0 = decoded.bytes.data() + size_t(y * 2) * row;
+                    const uint8_t* row1 =
+                        decoded.bytes.data() + size_t(std::min(y * 2 + 1, height - 1)) * row;
+                    for (unsigned x = 0; x < out->width; ++x, destination += 4) {
+                        size_t x0 = size_t(x * 2) * 3, x1 = size_t(std::min(x * 2 + 1, width - 1)) * 3;
+                        for (unsigned c = 0; c < 3; ++c)
+                            destination[2 - c] = uint8_t((unsigned(channels[c][row0[x0 + c]]) +
+                                                          channels[c][row0[x1 + c]] +
+                                                          channels[c][row1[x0 + c]] +
+                                                          channels[c][row1[x1 + c]] + 2) /
+                                                         4);
+                        destination[3] = 255;
+                    }
+                } else {
+                    const uint8_t* source = decoded.bytes.data() + size_t(y) * row;
+                    for (unsigned x = 0; x < width; ++x, source += 3, destination += 4) {
+                        destination[0] = channels[2][source[2]];
+                        destination[1] = channels[1][source[1]];
+                        destination[2] = channels[0][source[0]];
+                        destination[3] = 255;
+                    }
+                }
+            }
+        } else if (n == 1 && bits <= 8) {
             std::array<uint32_t, 256> palette{};
             for (size_t i = 0; i < (size_t(1) << bits); ++i) {
                 double value = low[0] + (high[0] - low[0]) * i / maximum;
@@ -513,12 +561,6 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
     convert_timer.stop();
     width = out->width;
     height = out->height;
-    if (r.profiling) {
-        auto& profile = r.profile.images[profile_index];
-        profile.decoded_width = width;
-        profile.decoded_height = height;
-        profile.reduction = out->reduction;
-    }
     auto& soft = entry(d, image, "SMask");
     const Value* alpha = soft.has_stream ? &soft : mask.has_stream ? &mask : nullptr;
     if (alpha) {
@@ -568,6 +610,18 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                     out->pixels[p + 3] = uint8_t(unsigned(out->pixels[p + 3]) * a / 255);
                 }
             }
+    }
+    if (!r.full_resolution_images && reduction && decoded.image_filter.empty()) {
+        // Keep the same box-filtered pixels used for drawing, after all masks
+        // are applied. Large raw images can then fit in the image cache.
+        ProfileTimer resample_timer(r.profiling ? &r.profile.image_resample_ms : nullptr);
+        out = image_level(d, std::move(out), target_width, target_height);
+    }
+    if (r.profiling) {
+        auto& profile = r.profile.images[profile_index];
+        profile.decoded_width = out->width;
+        profile.decoded_height = out->height;
+        profile.reduction = out->reduction;
     }
     if (image.object && out->pixels.size() <= 64 * 1024 * 1024) {
         size_t cost = out->pixels.size() + out->pixels.size() / 3 + 4096;

@@ -1,4 +1,5 @@
 #include "pdf.h"
+#include <emmintrin.h>
 
 namespace pdf {
 struct Bits {
@@ -192,9 +193,18 @@ Bytes inflate(View input, size_t limit) {
             out.resize(base + n);
             if (distance >= n)
                 std::memcpy(out.data() + base, out.data() + base - distance, n);
-            else
-                for (unsigned j = 0; j < n; ++j)
-                    out[base + j] = out[base + j - distance];
+            else if (distance == 1)
+                std::memset(out.data() + base, out[base - 1], n);
+            else {
+                // Copy one period, then double the initialized prefix. Each
+                // copy has disjoint ranges, including overlapping PDF runs.
+                std::memcpy(out.data() + base, out.data() + base - distance, distance);
+                for (unsigned copied = distance; copied < n;) {
+                    unsigned count = std::min(copied, n - copied);
+                    std::memcpy(out.data() + base + copied, out.data() + base, count);
+                    copied += count;
+                }
+            }
         }
     }
     // PDF streams may contain padding after the zlib end marker. The checksum
@@ -397,23 +407,37 @@ Bytes predictor(Bytes data, const Value& params) {
     require(type >= 10 && type <= 15, "Unsupported stream predictor");
     require(data.size() % (row + 1) == 0, "Truncated PNG predictor row");
     size_t rows = data.size() / (row + 1);
-    Bytes out(rows * row);
     for (size_t y = 0; y < rows; ++y) {
         size_t src = y * (row + 1), dst = y * row;
         unsigned filter = data[src++];
         require(filter <= 4, "Invalid PNG predictor filter");
+        // The input stays ahead of the output, so rows can be decoded in place.
+        if (filter == 0 || (filter == 2 && !y)) {
+            std::memmove(data.data() + dst, data.data() + src, row);
+            continue;
+        }
+        if (filter == 2) {
+            size_t x = 0;
+            for (; x + 16 <= row; x += 16) {
+                auto encoded = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data.data() + src + x));
+                auto previous =
+                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(data.data() + dst + x - row));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(data.data() + dst + x),
+                                 _mm_add_epi8(encoded, previous));
+            }
+            for (; x < row; ++x)
+                data[dst + x] = uint8_t(data[src + x] + data[dst + x - row]);
+            continue;
+        }
         for (size_t x = 0; x < row; ++x) {
-            int a = x >= bpp ? out[dst + x - bpp] : 0, b = y ? out[dst + x - row] : 0,
-                c = y && x >= bpp ? out[dst + x - row - bpp] : 0;
-            int prediction = filter == 0   ? 0
-                             : filter == 1 ? a
-                             : filter == 2 ? b
-                             : filter == 3 ? (a + b) / 2
-                                           : paeth(a, b, c);
-            out[dst + x] = uint8_t(data[src + x] + prediction);
+            int a = x >= bpp ? data[dst + x - bpp] : 0, b = y ? data[dst + x - row] : 0,
+                c = y && x >= bpp ? data[dst + x - row - bpp] : 0;
+            int prediction = filter == 1 ? a : filter == 3 ? (a + b) / 2 : paeth(a, b, c);
+            data[dst + x] = uint8_t(data[src + x] + prediction);
         }
     }
-    return out;
+    data.resize(rows * row);
+    return data;
 }
 DecodeResult decode_stream(Document& d, const Value& input, bool image) {
     const auto& s = resolve(d, input);
