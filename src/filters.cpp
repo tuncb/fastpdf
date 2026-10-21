@@ -27,8 +27,11 @@ struct Huffman {
     std::array<uint8_t, 32768> lengths{};
     unsigned max_bits = 0;
 };
-static Huffman huffman(std::span<const uint8_t> lengths) {
-    Huffman h;
+static std::unique_ptr<Huffman> huffman(std::span<const uint8_t> lengths) {
+    // Each table is 96 KiB. Build it on the heap so exception handling and
+    // nested stream decoders do not exhaust the Windows thread stack.
+    auto table = std::make_unique<Huffman>();
+    Huffman& h = *table;
     unsigned counts[16]{}, next[16]{};
     for (auto n : lengths) {
         require(n <= 15, "Invalid Huffman length");
@@ -61,7 +64,7 @@ static Huffman huffman(std::span<const uint8_t> lengths) {
             h.lengths[i] = uint8_t(n);
         }
     }
-    return h;
+    return table;
 }
 static unsigned symbol(Bits& b, const Huffman& h) {
     fill(b, h.max_bits);
@@ -105,13 +108,13 @@ Bytes inflate(View input, size_t limit) {
                                              1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
     static constexpr unsigned dist_extra[] = {0, 0, 0, 0, 1, 1, 2, 2,  3,  3,  4,  4,  5,  5,  6,
                                               6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
-    static const Huffman fixed_lit = [] {
+    static const auto fixed_lit = [] {
         std::array<uint8_t, 288> l{};
         for (int i = 0; i < 288; ++i)
             l[i] = uint8_t(i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8);
         return huffman(l);
     }();
-    static const Huffman fixed_dist = [] {
+    static const auto fixed_dist = [] {
         std::array<uint8_t, 32> l{};
         l.fill(5);
         return huffman(l);
@@ -130,11 +133,9 @@ Bytes inflate(View input, size_t limit) {
         }
         require(type != 3, "Reserved DEFLATE block type");
         std::unique_ptr<Huffman> lit, dist;
-        const Huffman* lh = &fixed_lit;
-        const Huffman* dh = &fixed_dist;
+        const Huffman* lh = fixed_lit.get();
+        const Huffman* dh = fixed_dist.get();
         if (type == 2) {
-            lit = std::make_unique<Huffman>();
-            dist = std::make_unique<Huffman>();
             unsigned nl = take(b, 5) + 257, nd = take(b, 5) + 1, nc = take(b, 4) + 4;
             require(nl <= 286 && nd <= 32, "Invalid dynamic Huffman counts");
             // RFC 1951 code-length alphabet order.
@@ -143,7 +144,7 @@ Bytes inflate(View input, size_t limit) {
             std::array<uint8_t, 19> cl{};
             for (unsigned i = 0; i < nc; ++i)
                 cl[permutation[i]] = uint8_t(take(b, 3));
-            auto ch = std::make_unique<Huffman>(huffman(cl));
+            auto ch = huffman(cl);
             std::vector<uint8_t> lengths;
             lengths.reserve(nl + nd);
             while (lengths.size() < nl + nd) {
@@ -168,8 +169,8 @@ Bytes inflate(View input, size_t limit) {
                 }
             }
             require(lengths[256] != 0, "Huffman tree is missing end-of-block");
-            *lit = huffman(std::span(lengths).first(nl));
-            *dist = huffman(std::span(lengths).subspan(nl));
+            lit = huffman(std::span(lengths).first(nl));
+            dist = huffman(std::span(lengths).subspan(nl));
             lh = lit.get();
             dh = dist.get();
         }
