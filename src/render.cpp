@@ -165,7 +165,9 @@ static void apply_clip(Context& c, const Clip& clip) {
             D2D1::LayerParameters(D2D1::InfiniteRect(), clip.geometry, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                                   D2D1::Matrix3x2F::Identity(), 1), nullptr);
     else
-        c.canvas->target->PushAxisAlignedClip(clip.bounds, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        // Fractional coverage at each rectangular clip edge leaves seams
+        // when a producer tiles an image with adjacent narrow strips.
+        c.canvas->target->PushAxisAlignedClip(clip.bounds, D2D1_ANTIALIAS_MODE_ALIASED);
 }
 static void push_clip(Context& c, Clip clip) {
     require(c.clips.size() < 256, "Graphics clipping depth limit exceeded");
@@ -855,9 +857,16 @@ static void draw_image(Context& c, const Value& image, const Value& resources,
             }
             set_transform(target, multiply(target.g.ctm, {1, 0, 0, -1, 0, 1}));
             bool interpolate = boolean(get(image, "Interpolate"), true);
+            auto antialias = target.canvas->target->GetAntialiasMode();
+            // Image sampling still interpolates pixels. Axis-aligned outer
+            // edges use pixel centers, so adjacent image tiles meet exactly.
+            if ((target.g.ctm.b == 0 && target.g.ctm.c == 0) ||
+                (target.g.ctm.a == 0 && target.g.ctm.d == 0))
+                target.canvas->target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
             target.canvas->target->DrawBitmap(bitmap, D2D1::RectF(0, 0, 1, 1), target.g.fill_alpha,
                                               interpolate ? D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
                                                           : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+            target.canvas->target->SetAntialiasMode(antialias);
             release(bitmap);
         },
         false, 1, transformed_box(c.g.ctm, {0, 0, 1, 1}), false, image_mask);
@@ -2536,7 +2545,9 @@ RenderedPage render_page(Renderer& r, Document& d, size_t page_index, double sca
     c.g.ctm = m;
     c.text_only = text_only;
     target->target->BeginDraw();
-    target->target->Clear(D2D1::ColorF(D2D1::ColorF::White));
+    // The page is an isolated transparency group. Composite the completed
+    // page onto white only after its internal blend modes have been applied.
+    target->target->Clear(D2D1::ColorF(0, 0));
     try {
         ProfileTimer content_timer(r.profiling ? &r.profile.content_ms : nullptr);
         auto content = page_content(d, page);
@@ -2555,6 +2566,12 @@ RenderedPage render_page(Renderer& r, Document& d, size_t page_index, double sca
         if (!text_only) {
             ProfileTimer readback_timer(r.profiling ? &r.profile.readback_ms : nullptr);
             out.pixels = pixels(*target);
+            for (size_t i = 0; i < out.pixels.size(); i += 4) {
+                unsigned paper = 255 - out.pixels[i + 3];
+                for (unsigned channel = 0; channel < 3; ++channel)
+                    out.pixels[i + channel] = uint8_t(std::min(255u, out.pixels[i + channel] + paper));
+                out.pixels[i + 3] = 255;
+            }
         }
     } catch (...) {
         pop_clips(c, 0);

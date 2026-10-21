@@ -315,6 +315,26 @@ def generate(directory):
     objects = base(b".001 w 20 50.5 m 220 50.5 l S 0 w 20 80.5 m 220 80.5 l S")
     add("visible_thin_strokes", pdf(objects), pixels=[(100, 169, (204, 204, 204)),
                                                      (100, 139, (204, 204, 204))], tolerance=24)
+    strips = b"".join((f"q 20 {20 + i * .625} 100 .625 re W n "
+                       f"100 0 0 .625 20 {20 + i * .625} cm /Im Do Q\n").encode() for i in range(64))
+    objects = base(strips, b"/XObject << /Im 6 0 R >>")
+    objects.append(stream(bytes(16 * 2 * 3), b"/Type /XObject /Subtype /Image /Width 16 /Height 2 "
+                          b"/BitsPerComponent 8 /ColorSpace /DeviceRGB"))
+    add("image_strip_clips", pdf(objects), pixels=[(50, y, (0, 0, 0)) for y in range(165, 195)])
+    objects[2] = objects[2].replace(b"/XObject", b"/ExtGState << /G << /ca .5 >> >> /XObject")
+    objects[4] = stream(b"/G gs " + strips)
+    add("image_strip_opacity", pdf(objects), pixels=[(50, y, (128, 128, 128)) for y in range(165, 195)], tolerance=1)
+    objects[4] = stream(b"q 0 1 -1 0 220 0 cm " + strips + b" Q")
+    add("image_strip_rotation", pdf(objects), pixels=[(x, 170, (0, 0, 0)) for x in range(165, 195)])
+    modes = ["Normal", "Multiply", "Screen", "Overlay", "Darken", "Lighten", "ColorDodge", "ColorBurn",
+             "HardLight", "SoftLight", "Difference", "Exclusion", "Hue", "Saturation", "Color", "Luminosity"]
+    resources = b"/ExtGState << " + b" ".join(f"/G{i} << /BM /{mode} /ca .5 >>".encode()
+                                               for i, mode in enumerate(modes)) + b" >>"
+    content = b"".join(f"q /G{i} gs 1 0 0 rg {20 + i % 4 * 65} {20 + i // 4 * 45} 45 30 re f Q\n".encode()
+                        for i in range(16))
+    add("page_group_blend_modes", pdf(base(content, resources)),
+        pixels=[(35 + i % 4 * 65, 190 - i // 4 * 45, (255, 128, 128)) for i in range(16)] +
+               [(290, 210, (255, 255, 255))], tolerance=1)
     objects = base(b"BT /F1 100 Tf 20 50 Td <01> Tj ET")
     objects[3] = (b"<< /Type /Font /Subtype /TrueType /BaseFont /FastPDFSymbolSubset /FirstChar 1 /LastChar 1 "
                   b"/Widths [1000] /Encoding << /BaseEncoding /WinAnsiEncoding /Differences [1 /A] >> "
