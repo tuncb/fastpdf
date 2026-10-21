@@ -1,6 +1,7 @@
 #include "render.h"
 #include "image_codecs.h"
 #include <icm.h>
+#include <emmintrin.h>
 
 namespace pdf {
 ColorSpace color_space(Document& d, const Value& input, const Value& resources, int depth) {
@@ -134,18 +135,21 @@ static Color device_cmyk(double c, double m, double y, double k) {
         fractions[i] = float(value - low);
         stride *= 17;
     }
-    auto mix = [](Color a, Color b, float t) {
-        return Color{a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1};
+    auto mix = [](__m128 a, __m128 b, float t) {
+        return _mm_add_ps(a, _mm_mul_ps(_mm_sub_ps(b, a), _mm_set1_ps(t)));
     };
-    std::array<Color, 8> pairs{};
+    static_assert(sizeof(Color) == 4 * sizeof(float));
+    __m128 pairs[8];
     for (unsigned i = 0; i < 8; ++i) {
         unsigned at = index + (i & 1) * 17 + ((i >> 1) & 1) * 289 + (i >> 2) * 4913;
-        pairs[i] = mix(table[at], table[at + 1], fractions[0]);
+        pairs[i] = mix(_mm_loadu_ps(&table[at].r), _mm_loadu_ps(&table[at + 1].r), fractions[0]);
     }
     for (unsigned level = 1, count = 4; count; ++level, count /= 2)
         for (unsigned i = 0; i < count; ++i)
             pairs[i] = mix(pairs[2 * i], pairs[2 * i + 1], fractions[level]);
-    return pairs[0];
+    Color result;
+    _mm_storeu_ps(&result.r, pairs[0]);
+    return result;
 }
 static Color xyz(double x, double y, double z) {
     auto gamma = [](double v) {
@@ -467,7 +471,7 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                 }
             } else
                 for (size_t i = 0, p = 0; i < raw.samples.size(); i += raw.components, p += 4) {
-                    std::array<double, 32> values{};
+                    std::array<double, 32> values;
                     unsigned channel = 0;
                     double a = alpha >= 0 ? raw.samples[i + size_t(alpha)] / 255.0 : 1;
                     for (unsigned c = 0; c < raw.components; ++c)
@@ -667,6 +671,38 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                     }
                 }
             }
+        } else if (n == 3 && bits == 8 && direct->name == "CalRGB") {
+            auto& params = resolve(d, at(direct->definition, 1));
+            auto& gamma = entry(d, params, "Gamma");
+            auto& matrix = entry(d, params, "Matrix");
+            std::array<std::array<double, 256>, 3> channels{};
+            std::array<double, 9> transform{1, 0, 0, 0, 1, 0, 0, 0, 1};
+            if (matrix.array.size() == 9)
+                for (unsigned i = 0; i < 9; ++i)
+                    transform[i] = num(at(matrix, i));
+            for (unsigned i = 0; i < 3; ++i)
+                for (unsigned sample = 0; sample < 256; ++sample)
+                    channels[i][sample] = std::pow(std::max(0.0, low[i] + (high[i] - low[i]) * sample / maximum),
+                                                   num(at(gamma, i), 1));
+            for (unsigned y = 0; y < height; ++y) {
+                if ((y & 127) == 0)
+                    check_cancel(d);
+                const uint8_t* source = decoded.bytes.data() + size_t(y) * row;
+                uint8_t* destination = out->pixels.data() + size_t(y) * width * 4;
+                for (unsigned x = 0; x < width; ++x, source += 3, destination += 4) {
+                    double a = channels[0][source[0]], b = channels[1][source[1]], c = channels[2][source[2]];
+                    auto converted = xyz(a * transform[0] + b * transform[3] + c * transform[6],
+                                         a * transform[1] + b * transform[4] + c * transform[7],
+                                         a * transform[2] + b * transform[5] + c * transform[8]);
+                    bool transparent = mask.kind == Kind::array;
+                    for (unsigned i = 0; transparent && i < 3; ++i)
+                        transparent = source[i] >= num(at(mask, i * 2)) && source[i] <= num(at(mask, i * 2 + 1));
+                    destination[0] = transparent ? 0 : uint8_t(unit(converted.b) * 255 + 0.5f);
+                    destination[1] = transparent ? 0 : uint8_t(unit(converted.g) * 255 + 0.5f);
+                    destination[2] = transparent ? 0 : uint8_t(unit(converted.r) * 255 + 0.5f);
+                    destination[3] = transparent ? 0 : 255;
+                }
+            }
         } else if (n == 1 && bits <= 8) {
             std::array<uint32_t, 256> palette{};
             for (size_t i = 0; i < (size_t(1) << bits); ++i) {
@@ -697,7 +733,7 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                     check_cancel(d);
                 size_t bit = size_t(y) * row * 8;
                 for (unsigned x = 0; x < width; ++x) {
-                    std::array<double, 32> components{};
+                    std::array<double, 32> components;
                     bool transparent = mask.kind == Kind::array;
                     for (unsigned i = 0; i < n; ++i) {
                         unsigned sample = 0;

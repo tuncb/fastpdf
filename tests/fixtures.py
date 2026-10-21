@@ -491,6 +491,13 @@ def generate(directory):
         objects = base(b"q 100 0 0 100 20 20 cm /Im Do Q", b"/XObject << /Im 6 0 R >>")
         objects.append(stream(content, image_attrs, name.endswith("flate")))
         add(name, pdf(objects), pixel=(40, 120, (255, 0, 0)))
+    calibrated = (b"[/CalRGB << /WhitePoint [.95047 1 1.08883] /Gamma [2.2 1.8 2.4] "
+                  b"/Matrix [.4124564 .2126729 .0193339 .3575761 .7151522 .1191920 .1804375 .0721750 .9503041] >>]")
+    objects = base(b"q 100 0 0 100 20 20 cm /Im Do Q", b"/XObject << /Im 6 0 R >>")
+    objects.append(stream(raw, image_attrs.replace(b"/DeviceRGB", calibrated) +
+                          b" /Decode [1 0 0 1 .2 .8] /Mask [255 255 0 0 0 0]"))
+    add("image_calrgb_decode", pdf(objects), pixels=[(40, 120, (255, 255, 255)),
+        (100, 120, (255, 255, 40)), (40, 180, (255, 0, 201)), (100, 180, (0, 255, 201))], tolerance=2)
     objects = base(b"q 100 0 0 100 20 20 cm /Im Do Q", b"/XObject << /Im 6 0 R >>")
     objects.append(stream(zlib.compress(b"\0"+raw[:6]+b"\0"+raw[6:]), image_attrs+b" /Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors 3 /Columns 2 >>"))
     add("image_predictor", pdf(objects), pixel=(40, 120, (255, 0, 0)))

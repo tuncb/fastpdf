@@ -78,8 +78,23 @@ static unsigned symbol(Bits& b, const Huffman& h) {
 static uint32_t adler32(View data) {
     uint32_t a = 1, b = 0;
     size_t i = 0;
+    const auto zero = _mm_setzero_si128();
+    const auto low_weights = _mm_setr_epi16(16, 15, 14, 13, 12, 11, 10, 9);
+    const auto high_weights = _mm_setr_epi16(8, 7, 6, 5, 4, 3, 2, 1);
     while (i < data.size()) {
         size_t end = std::min(data.size(), i + 5552);
+        for (; end - i >= 16; i += 16) {
+            auto bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data.data() + i));
+            auto sums = _mm_sad_epu8(bytes, zero);
+            auto weighted = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi8(bytes, zero), low_weights),
+                                          _mm_madd_epi16(_mm_unpackhi_epi8(bytes, zero), high_weights));
+            weighted = _mm_add_epi32(weighted, _mm_srli_si128(weighted, 8));
+            weighted = _mm_add_epi32(weighted, _mm_srli_si128(weighted, 4));
+            // Sixteen scalar Adler steps: b gains 16*a plus the byte sum
+            // weighted from 16 down to 1. The 5552-byte bound prevents overflow.
+            b += 16 * a + unsigned(_mm_cvtsi128_si32(weighted));
+            a += unsigned(_mm_cvtsi128_si32(sums)) + unsigned(_mm_cvtsi128_si32(_mm_srli_si128(sums, 8)));
+        }
         for (; i < end; ++i) {
             a += data[i];
             b += a;

@@ -80,6 +80,28 @@ static void named_destinations() {
     pdf::close(doc);
     test(doc.named_destinations.empty() && !doc.destinations_loaded, "Close clears destination pointers");
 }
+static void flate_checksums() {
+    // Independent checksums from Python zlib, across SIMD, modulus, and
+    // stored-block boundaries. Solid bytes exercise the largest accumulators.
+    struct Case { unsigned size, checksum; bool solid = false; };
+    const Case cases[] = {{15, 0x25850709}, {16, 0x2c90070b}, {17, 0x33ae071e},
+                          {5551, 0x4930c9d9}, {5552, 0x140dcace}, {5553, 0xdee1cad4},
+                          {11104, 0x1efa9676}, {65535, 0x69de6cea},
+                          {5552, 0xf18f9b8c, true}, {65535, 0x68a50df3, true}};
+    for (const auto& item : cases) {
+        pdf::Bytes expected(item.size);
+        for (unsigned i = 0; i < item.size; ++i)
+            expected[i] = item.solid ? 255 : uint8_t(i * 17 + i / 5);
+        pdf::Bytes encoded{0x78, 0x01, 0x01, uint8_t(item.size), uint8_t(item.size >> 8),
+                           uint8_t(~item.size), uint8_t(~item.size >> 8)};
+        encoded.insert(encoded.end(), expected.begin(), expected.end());
+        for (int shift = 24; shift >= 0; shift -= 8)
+            encoded.push_back(uint8_t(item.checksum >> shift));
+        test(pdf::inflate(encoded) == expected, "DEFLATE checksum vector and modulus boundaries");
+        encoded.back() ^= 1;
+        rejects([&] { pdf::inflate(encoded); }, "Reject a damaged checksum after vector processing");
+    }
+}
 int main() {
     using namespace pdf;
     try {
@@ -112,6 +134,7 @@ int main() {
                 byte = uint8_t((byte << 1) | mq_bit(mq, context));
         test(mq_result == mq_expected, "ITU-T T.88 H.2 arithmetic known answer");
         const uint8_t empty[] = {0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01};
+        flate_checksums();
         test(inflate(empty).empty(), "Empty DEFLATE stream");
         Bytes padded_zlib(std::begin(empty), std::end(empty));
         padded_zlib.insert(padded_zlib.end(), 8, 0);
