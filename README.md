@@ -85,10 +85,20 @@ background services, or tray icons.
 - Find: Ctrl+F; Enter searches; F3 starts the next search from the following page.
 - Selection: drag over text, then Ctrl+C. Ctrl+A selects the current page's extracted text.
 - Pan: middle-button drag. Scroll: mouse wheel, arrows, Space, or scrollbars.
-- Bookmarks: B or Outline. Links support document destinations and HTTP, HTTPS, and mail links.
+- Bookmarks: B or the bookmark icon. Links support document destinations and HTTP, HTTPS, and mail links.
 - Export the current page: Ctrl+S. Print: Ctrl+P.
 - Document information and compatibility notes: F1 or the File menu.
 - Installation and manual updates: Help menu.
+
+The compact toolbar groups file, page, zoom, and view controls into small icons. Hover over an icon for
+its name and shortcut. Enter a page number or zoom percentage (5–800%) in the toolbar and press Enter;
+Escape cancels the edit. F6 focuses the toolbar, arrow keys move between its buttons, and Tab moves
+between the toolbar, page and zoom fields, search, and page list. The main menus include PNG export,
+document information, and any actions hidden when the window is narrow. Document controls are disabled
+until a PDF is open.
+
+The reader uses neutral dark surfaces, Segoe UI text, and blue keyboard-focus outlines. The page list
+keeps focus while you navigate with the arrow keys; Escape returns focus to the document.
 
 The UI renders in a worker thread, cancels obsolete render/search requests, caches page bitmaps, and prefetches adjacent pages when idle. Search reads text without rasterizing the page's images and graphics. The current UI displays one page at a time.
 
