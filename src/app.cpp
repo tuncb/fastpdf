@@ -86,7 +86,7 @@ enum Command {
     cmd_print,
     cmd_info,
     cmd_goto,
-    cmd_licenses,
+    cmd_about,
     cmd_install,
     cmd_updates,
     cmd_cancel_update,
@@ -165,6 +165,7 @@ static void paint_toolbar_button(App& a, HDC dc, RECT rect, int id, UINT state);
 static void command(App& a, int id);
 static void paint_input_frame(App& a, HDC dc, HWND parent, HWND input);
 static void paint_sidebar_item(App& a, HDC dc, RECT rect, int index, bool selected, bool focused);
+static void label(HDC dc, RECT rect, std::wstring_view text, COLORREF color, HFONT font, UINT flags);
 static std::wstring lower(std::wstring s) {
     for (auto& c : s)
         c = wchar_t(std::towlower(c));
@@ -616,9 +617,50 @@ static INT_PTR CALLBACK password_dialog(HWND window, UINT message, WPARAM wp, LP
     }
     return FALSE;
 }
+static void theme_dialog(HWND window, LPARAM context) {
+    SetWindowLongPtrW(window, DWLP_USER, context);
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
+    DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &ui::chrome, sizeof(ui::chrome));
+    DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR, &ui::text, sizeof(ui::text));
+}
+static INT_PTR dialog_theme_message(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    const auto app = reinterpret_cast<App*>(GetWindowLongPtrW(window, DWLP_USER));
+    if (!app)
+        return FALSE;
+    if (message == WM_CTLCOLORDLG || message == WM_CTLCOLORSTATIC || message == WM_CTLCOLOREDIT) {
+        SetBkColor(HDC(wp), ui::chrome);
+        SetTextColor(HDC(wp), GetDlgCtrlID(HWND(lp)) == IDC_REPOSITORY ? ui::link : ui::text);
+        return reinterpret_cast<INT_PTR>(app->chrome_background);
+    }
+    if (message == WM_NOTIFY) {
+        const auto header = reinterpret_cast<const NMHDR*>(lp);
+        if (header->code == NM_CUSTOMDRAW && (header->idFrom == IDOK || header->idFrom == IDC_NOTICES)) {
+            const auto draw = reinterpret_cast<const NMCUSTOMDRAW*>(lp);
+            if (draw->dwDrawStage == CDDS_PREPAINT) {
+                const bool focused = (draw->uItemState & CDIS_FOCUS) != 0;
+                const auto fill = (draw->uItemState & CDIS_SELECTED) ? ui::selected
+                                  : (draw->uItemState & CDIS_HOT) ? ui::hover : ui::surface;
+                ui::control(app->painter, draw->hdc, draw->rc, GetDpiForWindow(window), ui::chrome, fill,
+                            focused ? ui::focus : ui::border, 1);
+                wchar_t text[128]{};
+                GetWindowTextW(header->hwndFrom, text, int(std::size(text)));
+                UINT flags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
+                if (SendMessageW(window, WM_QUERYUISTATE, 0, 0) & UISF_HIDEACCEL)
+                    flags |= DT_HIDEPREFIX;
+                label(draw->hdc, draw->rc, text, ui::text,
+                      HFONT(SendMessageW(header->hwndFrom, WM_GETFONT, 0, 0)), flags);
+                SetWindowLongPtrW(window, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
 static INT_PTR CALLBACK licenses_dialog(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     if (message == WM_INITDIALOG) {
-        const auto instance = reinterpret_cast<HINSTANCE>(lp);
+        theme_dialog(window, lp);
+        const auto instance = reinterpret_cast<App*>(lp)->instance;
         std::wstring notices;
         for (int id : {IDR_FONT_LICENSE, IDR_UNICODE_LICENSE}) {
             const auto resource = FindResourceW(instance, MAKEINTRESOURCEW(id), RT_RCDATA);
@@ -643,7 +685,41 @@ static INT_PTR CALLBACK licenses_dialog(HWND window, UINT message, WPARAM wp, LP
         EndDialog(window, LOWORD(wp));
         return TRUE;
     }
-    return FALSE;
+    return dialog_theme_message(window, message, wp, lp);
+}
+static INT_PTR CALLBACK about_dialog(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    if (message == WM_INITDIALOG) {
+        theme_dialog(window, lp);
+        SetDlgItemTextW(window, IDC_ABOUT_VERSION, L"FastPDF " FASTPDF_VERSION_W);
+        LITEM link{};
+        link.mask = LIF_ITEMINDEX | LIF_STATE;
+        link.state = link.stateMask = LIS_DEFAULTCOLORS;
+        SendDlgItemMessageW(window, IDC_REPOSITORY, LM_SETITEM, 0, reinterpret_cast<LPARAM>(&link));
+        SetFocus(GetDlgItem(window, IDOK));
+        return FALSE;
+    }
+    if (message == WM_NOTIFY) {
+        const auto notification = reinterpret_cast<const NMHDR*>(lp);
+        if (notification->idFrom == IDC_REPOSITORY &&
+            (notification->code == NM_CLICK || notification->code == NM_RETURN)) {
+            ShellExecuteW(window, L"open", L"https://github.com/tuncb/fastpdf", nullptr, nullptr,
+                          SW_SHOWNORMAL);
+            return TRUE;
+        }
+    }
+    if (message == WM_COMMAND) {
+        if (LOWORD(wp) == IDC_NOTICES) {
+            const auto app = reinterpret_cast<App*>(GetWindowLongPtrW(window, DWLP_USER));
+            DialogBoxParamW(app->instance, MAKEINTRESOURCEW(IDD_LICENSES), window, licenses_dialog,
+                            reinterpret_cast<LPARAM>(app));
+            return TRUE;
+        }
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+            EndDialog(window, LOWORD(wp));
+            return TRUE;
+        }
+    }
+    return dialog_theme_message(window, message, wp, lp);
 }
 static INT_PTR CALLBACK goto_dialog(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     if (message == WM_INITDIALOG) {
@@ -960,9 +1036,9 @@ static void command(App& a, int id) {
             GlobalFree(dialog.hDevMode);
         if (dialog.hDevNames)
             GlobalFree(dialog.hDevNames);
-    } else if (id == cmd_licenses) {
-        DialogBoxParamW(a.instance, MAKEINTRESOURCEW(IDD_LICENSES), a.window, licenses_dialog,
-                        reinterpret_cast<LPARAM>(a.instance));
+    } else if (id == cmd_about) {
+        DialogBoxParamW(a.instance, MAKEINTRESOURCEW(IDD_ABOUT), a.window, about_dialog,
+                        reinterpret_cast<LPARAM>(&a));
     } else if (id == cmd_info) {
         std::wstring info =
             L"FastPDF " FASTPDF_VERSION_W L"\nNative C++ reader with an owned PDF engine.\n\n";
@@ -2080,7 +2156,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             else if (wp == VK_ESCAPE && a.find_open)
                 command(a, cmd_search);
             else if (wp == VK_F1)
-                command(a, cmd_info);
+                command(a, cmd_about);
             return 0;
         }
         case worker_message:
@@ -2148,7 +2224,7 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
             deployment::start_uninstall();
         return 0;
     }
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_LINK_CLASS};
     InitCommonControlsEx(&controls);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     App app;
@@ -2207,8 +2283,7 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
     AppendMenuW(view, MF_STRING, cmd_rotate, L"&Rotate\tR");
     AppendMenuW(view, MF_STRING, cmd_sidebar, L"Page &list");
     AppendMenuW(view, MF_STRING, cmd_bookmarks, L"&Bookmarks\tB");
-    AppendMenuW(help, MF_STRING, cmd_info, L"&About and shortcuts\tF1");
-    AppendMenuW(help, MF_STRING, cmd_licenses, L"Third-party &notices…");
+    AppendMenuW(help, MF_STRING, cmd_about, L"&About…\tF1");
     AppendMenuW(help, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(help, MF_STRING, cmd_install, L"&Installation…");
     AppendMenuW(help, MF_STRING, cmd_updates, L"Check for &updates…");

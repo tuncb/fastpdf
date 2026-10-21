@@ -37,7 +37,7 @@ Packaging requires Python 3.10 or newer. Download Windows x64 builds from
 `fastpdf.exe` and `SHA256SUMS.txt`. Download and run `fastpdf.exe` directly;
 there is no installer, extraction step, or companion file required. The checksum
 file is optional and lets you verify the download. Third-party notices are embedded
-in the executable and available under **Help → Third-party notices**.
+in the executable and available from **Help → About… → Third-party notices…**.
 The local release files are written to `artifacts/release/`.
 See [CHANGELOG.md](CHANGELOG.md) for release notes and [AGENTS.md](AGENTS.md) for
 the versioning and tag-based release process.

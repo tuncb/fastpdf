@@ -13,6 +13,7 @@ inline constexpr COLORREF text = RGB(237, 237, 237);
 inline constexpr COLORREF muted = RGB(163, 163, 163);
 inline constexpr COLORREF disabled = RGB(100, 100, 100);
 inline constexpr COLORREF focus = RGB(52, 107, 241);
+inline constexpr COLORREF link = RGB(114, 165, 255);
 inline constexpr COLORREF shadow = RGB(12, 12, 12);
 inline constexpr int radius = 6, sidebar_width = 160, sidebar_header = 32, row_height = 32;
 
