@@ -347,6 +347,19 @@ def generate(directory):
     objects.append(b"<< /Differences [67 /A] >>")
     add("cff_native_differences", pdf(objects), pixels=[(22, 110, (51, 51, 51)),
                                                        (23, 110, (255, 255, 255)), (35, 110, (0, 0, 0))], tolerance=16)
+    cmyk_jpeg = (Path(__file__).parent / "data" / "cmyk-panels.jpg").read_bytes()
+    # The JPEG has four constant CMYK panels. Its original JPEG samples have
+    # opposite polarity from WIC's normalized CMYK output.
+    for inverse in (False, True):
+        objects = base(b"q 256 0 0 64 20 100 cm /I Do Q", resources=b"/XObject << /I 6 0 R >>")
+        attributes = (b"/Type /XObject /Subtype /Image /Width 64 /Height 16 "
+                      b"/BitsPerComponent 8 /ColorSpace /DeviceCMYK /Filter /DCTDecode")
+        if inverse:
+            attributes += b" /Decode [1 0 1 0 1 0 1 0]"
+        objects.append(stream(cmyk_jpeg, attributes))
+        colors = [(255, 255, 255), (0, 255, 255), (255, 0, 0), (0, 0, 0)] if inverse else [(0, 0, 0)] * 4
+        add(f"jpeg_cmyk_{inverse}", pdf(objects), pixels=[(52 + 64*i, 90, c) for i, c in enumerate(colors)])
+
     gray_jpeg = (Path(__file__).parent / "data" / "gray-tints.jpg").read_bytes()
     for inverse in [False, True]:
         objects = base(b"q 160 0 0 80 20 20 cm /Im Do Q", b"/XObject << /Im 6 0 R >>")

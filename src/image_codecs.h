@@ -35,6 +35,7 @@ struct BilevelImage {
     Bytes pixels;
 }; // 0 white, 1 black
 BilevelImage decode_mmr(Renderer& renderer, View data, unsigned width, unsigned height);
+BilevelImage decode_mmr_aligned(Document& document, View data, unsigned width, unsigned height);
 BilevelImage decode_jbig2(Renderer& renderer, Document& document, View data, View globals, unsigned width,
                           unsigned height);
 } // namespace pdf

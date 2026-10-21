@@ -166,7 +166,7 @@ static Bytes fax_tiff(View bytes, unsigned width, unsigned height, const Value& 
     return out;
 }
 static Image wic_decode(Renderer& r, View data, unsigned reduction = 0, unsigned expected_width = 0,
-                        unsigned expected_height = 0) {
+                        unsigned expected_height = 0, bool cmyk = false) {
     IWICStream* stream = nullptr;
     IWICBitmapDecoder* decoder = nullptr;
     IWICBitmapFrameDecode* frame = nullptr;
@@ -200,7 +200,8 @@ static Image wic_decode(Renderer& r, View data, unsigned reduction = 0, unsigned
             source = scaler;
         }
         hr(r.wic->CreateFormatConverter(&converter), "Create image converter");
-        hr(converter->Initialize(source, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+        hr(converter->Initialize(source, cmyk ? GUID_WICPixelFormat32bppCMYK : GUID_WICPixelFormat32bppPBGRA,
+                                 WICBitmapDitherTypeNone, nullptr, 0,
                                  WICBitmapPaletteTypeCustom),
            "Convert image pixels");
         out.pixels.resize(size_t(out.width) * out.height * 4);
@@ -322,6 +323,8 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
         convert_timer.stop();
         ProfileTimer codec_timer(r.profiling ? &r.profile.image_codec_ms : nullptr);
         bool fax = decoded.image_filter == "CCITTFaxDecode" || decoded.image_filter == "CCF";
+        bool cmyk_jpeg = (decoded.image_filter == "DCTDecode" || decoded.image_filter == "DCT") &&
+                         space.components == 4 && !stencil;
         Bytes tiff;
         bool jpx = decoded.image_filter == "JPXDecode";
         if (jpx) {
@@ -395,11 +398,22 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                 out->pixels[i * 4] = out->pixels[i * 4 + 1] = out->pixels[i * 4 + 2] = value;
                 out->pixels[i * 4 + 3] = 255;
             }
+        } else if (fax && integer(get(decoded.params, "K")) < 0 &&
+                   boolean(get(decoded.params, "EncodedByteAlign"))) {
+            auto raw = decode_mmr_aligned(d, decoded.bytes, width, height);
+            out->width = width;
+            out->height = height;
+            out->pixels.resize(size_t(width) * height * 4);
+            for (size_t i = 0; i < raw.pixels.size(); ++i) {
+                uint8_t value = raw.pixels[i] ? 0 : 255;
+                out->pixels[i * 4] = out->pixels[i * 4 + 1] = out->pixels[i * 4 + 2] = value;
+                out->pixels[i * 4 + 3] = 255;
+            }
         } else if (fax) {
             tiff = fax_tiff(decoded.bytes, width, height, decoded.params);
             *out = wic_decode(r, tiff);
         } else
-            *out = wic_decode(r, decoded.bytes, reduction, width, height);
+            *out = wic_decode(r, decoded.bytes, reduction, width, height, cmyk_jpeg);
         codec_timer.stop();
         ProfileTimer postprocess_timer(r.profiling ? &r.profile.image_convert_ms : nullptr);
         require(out->reduction || (out->width == width && out->height == height),
@@ -426,9 +440,34 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                              (uint32_t(unit(c.a) * 255 + 0.5f) << 24);
             }
         }
-        bool transform_samples = gray_jpeg || invert || stencil ||
+        std::array<std::array<double, 256>, 4> cmyk_samples{};
+        if (cmyk_jpeg)
+            for (unsigned channel = 0; channel < 4; ++channel) {
+                double low = num(at(decode, 2 * channel)), high = num(at(decode, 2 * channel + 1), 1);
+                for (unsigned sample = 0; sample < 256; ++sample)
+                    cmyk_samples[channel][sample] = low + (high - low) * sample / 255.0;
+            }
+        bool transform_samples = cmyk_jpeg || gray_jpeg || invert || stencil ||
                                  (!jpx && (decode.array.size() == 2 || decode.array.size() == 6));
         for (size_t p = 0; transform_samples && p < out->pixels.size(); p += 4) {
+            if (cmyk_jpeg) {
+                std::array<double, 4> samples{};
+                bool transparent = mask.kind == Kind::array;
+                for (unsigned channel = 0; channel < 4; ++channel) {
+                    // WIC normalizes four-channel JPEG samples to CMYK.
+                    // PDF Decode applies to the original, inverted samples.
+                    auto sample = uint8_t(255 - out->pixels[p + channel]);
+                    samples[channel] = cmyk_samples[channel][sample];
+                    transparent = transparent && sample >= num(at(mask, 2 * channel)) &&
+                                  sample <= num(at(mask, 2 * channel + 1));
+                }
+                auto converted = color(d, space, samples);
+                out->pixels[p] = transparent ? 0 : uint8_t(unit(converted.b) * 255 + 0.5f);
+                out->pixels[p + 1] = transparent ? 0 : uint8_t(unit(converted.g) * 255 + 0.5f);
+                out->pixels[p + 2] = transparent ? 0 : uint8_t(unit(converted.r) * 255 + 0.5f);
+                out->pixels[p + 3] = transparent ? 0 : 255;
+                continue;
+            }
             if (gray_jpeg) {
                 uint32_t pixel = palette[out->pixels[p]];
                 std::memcpy(out->pixels.data() + p, &pixel, 4);

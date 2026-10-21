@@ -4,18 +4,21 @@
 #include <iostream>
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc == 6 && std::wstring_view(argv[1]) == L"--jbig2") {
+    if (argc == 6 && (std::wstring_view(argv[1]) == L"--jbig2" ||
+                     std::wstring_view(argv[1]) == L"--mmr-aligned")) {
         pdf::Document document;
         pdf::Renderer renderer;
         pdf::Mapping input;
         try {
             pdf::map_file(input, argv[2]);
-            auto decoded = pdf::decode_jbig2(renderer, document, input.bytes, {},
-                                             unsigned(std::stoul(argv[4])), unsigned(std::stoul(argv[5])));
+            auto width = unsigned(std::stoul(argv[4])), height = unsigned(std::stoul(argv[5]));
+            auto decoded = std::wstring_view(argv[1]) == L"--mmr-aligned"
+                               ? pdf::decode_mmr_aligned(document, input.bytes, width, height)
+                               : pdf::decode_jbig2(renderer, document, input.bytes, {}, width, height);
             std::ofstream output(argv[3], std::ios::binary);
             output.write(reinterpret_cast<const char*>(decoded.pixels.data()),
                          std::streamsize(decoded.pixels.size()));
-            pdf::require(bool(output), "Cannot write JBIG2 samples");
+            pdf::require(bool(output), "Cannot write bilevel samples");
             pdf::unmap_file(input);
             return 0;
         } catch (const std::exception& error) {

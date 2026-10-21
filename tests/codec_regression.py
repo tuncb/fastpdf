@@ -1,6 +1,7 @@
 """Check the owned codec against precomputed, independently decoded pixel fixtures."""
 from pathlib import Path
 import json
+import base64
 import hashlib
 import struct
 import subprocess
@@ -59,3 +60,24 @@ for case in cases:
     assert len(actual) == case['width'] * case['height'], case
     assert hashlib.sha256(actual).hexdigest() == case['sha256'], case
 print(f"{len(cases)} JBIG2 arithmetic pixel regressions passed")
+
+# Generated bit streams use every T.6 mode and runs longer than 2560 pixels.
+# Expected pixels were checked independently with MuPDF before recording them.
+cases = json.loads((root / 'fax-aligned.json').read_text())
+for case in cases:
+    source = output / 'aligned.fax'
+    target = output / 'aligned.raw'
+    source.write_bytes(base64.b64decode(case['data']))
+    result = subprocess.run([str(executable), '--mmr-aligned', str(source), str(target),
+                             str(case['width']), str(case['height'])], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, (case['width'], result.stderr)
+    actual = target.read_bytes()
+    assert len(actual) == case['width'] * case['height'], case['width']
+    assert hashlib.sha256(actual).hexdigest() == case['sha256'], case['width']
+for data, width, height in [(b'', 1, 1), (b'\0', 17, 1), (b'\x80', 17, 2),
+                             (b'\x20\x00\x00', 1, 1), (b'\x80', 0xffffffff, 0xffffffff)]:
+    source.write_bytes(data)
+    result = subprocess.run([str(executable), '--mmr-aligned', str(source), str(target), str(width), str(height)],
+                             capture_output=True, text=True, timeout=10)
+    assert result.returncode == 1, (data, width, height, result.stderr)
+print(f"{len(cases)} aligned fax pixel regressions and 5 rejection checks passed")
