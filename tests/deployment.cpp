@@ -239,7 +239,7 @@ int wmain(int argc, wchar_t** argv) {
         fs::create_directories(scratch);
         installation_dialog_tests();
         test(parse_version("v1.20.3") > parse_version("1.9.99"), "Numeric version ordering");
-        test(parse_version("0.3.0") == Version{0, 3, 0}, "Parse current version");
+        test(parse_version("0.2.0") == Version{0, 2, 0}, "Parse current version");
         for (auto text : {"", "1.2", "1.2.3.4", "01.2.3", "1.2.3-beta", "-1.2.3", "65536.0.0", "v.2.3"})
             rejects([&] { parse_version(text); }, "Reject malformed version");
         const std::string json =

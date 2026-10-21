@@ -2,7 +2,7 @@
 
 Notable changes by release tag, newest first.
 
-## v0.3.0
+## v0.2.0
 
 - Blue lightning F app icon for the window, taskbar, executable, and Start menu shortcut.
 - Compact dark toolbar with editable page and zoom fields, clearer control states, and improved sidebar navigation.
@@ -13,9 +13,6 @@ Notable changes by release tag, newest first.
 - Check for updates manually from Help. Downloads are verified before installation, with options to restart now or install when the reader closes. No automatic checks, startup app, or tray icon are added.
 - Reopen the current PDF at the same page, zoom mode, and rotation after an update. Passwords are not saved; protected documents may ask again.
 - Continue using the single executable portably without installing it.
-
-## v0.2.0
-
 - Download and run `fastpdf.exe` directly. Releases now contain only the standalone Windows x64 reader and `SHA256SUMS.txt`, replacing the ZIP bundle.
 - View bundled data licenses in Help → Third-party notices without separate documentation files.
 - The `pdfprobe` command-line diagnostic tool remains available in source builds and is no longer included in release downloads.
