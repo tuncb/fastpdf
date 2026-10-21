@@ -2,9 +2,9 @@
 
 A native Windows PDF reader written in C++20, with a PDF engine implemented in this repository. The code uses structs and free functions; there are no application classes with private or protected state.
 
-The application opens local PDFs, renders pages, navigates outlines and links, searches and copies text, rotates and zooms pages, exports PNGs, and prints. Password-protected documents use the standard Windows password dialog supplied by the application.
+The application opens local PDFs, renders pages, navigates outlines and links, searches and copies text, rotates and zooms pages, and prints. Password-protected documents use the standard Windows password dialog supplied by the application.
 
-**This is a working initial implementation, not a claim of universal PDF conformance.** The engine covers a substantial part of PDF 1.7 and several later features. The remaining compatibility limits are recorded in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). In particular, dynamic XFA documents and some advanced rendering and image-codec features still need work. Render warnings are available under Document information and through the probe's JSON output.
+**This is a working initial implementation, not a claim of universal PDF conformance.** The engine covers a substantial part of PDF 1.7 and several later features. The remaining compatibility limits are recorded in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). In particular, dynamic XFA documents and some advanced rendering and image-codec features still need work. Render warnings are available through the probe's JSON output.
 
 ## Build and run
 
@@ -93,15 +93,16 @@ background services, or tray icons.
 - Selection: drag over text, then Ctrl+C. Ctrl+A selects the current page's extracted text.
 - Pan: middle-button drag. Scroll: mouse wheel, arrows, Space, or scrollbars.
 - Bookmarks: B or the bookmark icon. Links support document destinations and HTTP, HTTPS, and mail links.
-- Export the current page: Ctrl+S. Print: Ctrl+P.
-- Document information and compatibility notes: F1 or the File menu.
+- Print: Ctrl+P.
+- Exit: Alt+F4 or File → Exit.
+- About: F1 or the Help menu.
 - Installation and manual updates: Help menu.
 
 The compact toolbar groups file, page, zoom, and view controls into small icons. Hover over an icon for
 its name and shortcut. Enter a page number or zoom percentage (5–800%) in the toolbar and press Enter;
 Escape cancels the edit. F6 focuses the toolbar, arrow keys move between its buttons, and Tab moves
-between the toolbar, page and zoom fields, search, and page list. The main menus include PNG export,
-document information, and any actions hidden when the window is narrow. Document controls are disabled
+between the toolbar, page and zoom fields, search, and page list. The main menus include
+any actions hidden when the window is narrow. Document controls are disabled
 until a PDF is open.
 
 The reader uses neutral dark surfaces, Segoe UI text, and blue keyboard-focus outlines. The page list

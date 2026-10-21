@@ -21,7 +21,7 @@ constexpr UINT worker_message = WM_APP + 1;
 constexpr int id_sidebar = 200, id_search = 201, id_toolbar = 202, id_page = 203, id_zoom = 204;
 constexpr int page_slot = 100, zoom_slot = 101, toolbar_height = 36;
 constexpr const wchar_t* menu_titles[] = {L"&File", L"&View", L"&Help"};
-enum class Job { open, render, search, export_png, print };
+enum class Job { open, render, search, print };
 enum class Fit { page, width, custom };
 struct PageInfo {
     double width = 612, height = 792;
@@ -83,15 +83,14 @@ enum Command {
     cmd_sidebar,
     cmd_bookmarks,
     cmd_search,
-    cmd_export,
-    cmd_print,
-    cmd_info,
-    cmd_goto,
+    cmd_print = 13,
+    cmd_goto = 15,
     cmd_about,
     cmd_install,
     cmd_updates,
     cmd_cancel_update,
-    cmd_portable
+    cmd_portable,
+    cmd_exit
 };
 struct UpdateResult {
     deployment::Release release;
@@ -224,7 +223,7 @@ static void worker_run(Worker& w) {
                 request = std::move(w.jobs.front());
                 w.jobs.pop_front();
                 w.cancel = false;
-                w.io_active = request.kind == Job::print || request.kind == Job::export_png;
+                w.io_active = request.kind == Job::print;
             }
             Result result;
             result.kind = request.kind;
@@ -269,10 +268,6 @@ static void worker_run(Worker& w) {
                         }
                         if (result.page < 0)
                             result.message = L"No matches for “" + request.query + L"”";
-                    } else if (request.kind == Job::export_png) {
-                        auto image = render(request.page, request.scale, request.rotation);
-                        save_png(renderer, *image, request.path);
-                        result.message = L"Saved " + request.path;
                     } else if (request.kind == Job::print) {
                         HDC dc = request.print->dc;
                         DOCINFOW info{sizeof(info)};
@@ -928,9 +923,11 @@ static void cancel_update(App& a) {
     a.update_status = a.update_job.valid() ? L"Canceling update…" : L"Update canceled.";
 }
 static void command(App& a, int id) {
-    if (a.pages.empty() && id >= cmd_prev && id <= cmd_goto && id != cmd_info)
+    if (a.pages.empty() && id >= cmd_prev && id <= cmd_goto)
         return;
-    if (id == cmd_install)
+    if (id == cmd_exit)
+        PostMessageW(a.window, WM_CLOSE, 0, 0);
+    else if (id == cmd_install)
         installation_dialog(a);
     else if (id == cmd_portable) {
         a.portable_choice = true;
@@ -986,27 +983,7 @@ static void command(App& a, int id) {
         request_render(a);
     } else if (id == cmd_goto && !a.pages.empty())
         DialogBoxParamW(a.instance, MAKEINTRESOURCEW(IDD_GOTO), a.window, goto_dialog, LPARAM(&a));
-    else if (id == cmd_export && !a.pages.empty()) {
-        wchar_t name[32768] = L"page.png";
-        OPENFILENAMEW dialog{sizeof(dialog)};
-        dialog.hwndOwner = a.window;
-        dialog.lpstrFilter = L"PNG image\0*.png\0";
-        dialog.lpstrFile = name;
-        dialog.nMaxFile = 32768;
-        dialog.lpstrDefExt = L"png";
-        dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        if (GetSaveFileNameW(&dialog)) {
-            Request request;
-            request.kind = Job::export_png;
-            request.page = a.page;
-            request.rotation = a.rotation;
-            request.scale = std::max(2.0, a.scale);
-            request.path = name;
-            enqueue(a, std::move(request));
-            a.status = L"Exporting page…";
-            a.busy = true;
-        }
-    } else if (id == cmd_print && !a.pages.empty()) {
+    else if (id == cmd_print && !a.pages.empty()) {
         PRINTDLGW dialog{sizeof(dialog)};
         dialog.hwndOwner = a.window;
         dialog.Flags = PD_RETURNDC | PD_USEDEVMODECOPIESANDCOLLATE | PD_NOSELECTION;
@@ -1033,21 +1010,6 @@ static void command(App& a, int id) {
     } else if (id == cmd_about) {
         DialogBoxParamW(a.instance, MAKEINTRESOURCEW(IDD_ABOUT), a.window, about_dialog,
                         reinterpret_cast<LPARAM>(&a));
-    } else if (id == cmd_info) {
-        std::wstring info =
-            L"FastPDF " FASTPDF_VERSION_W L"\nNative C++ reader with an owned PDF engine.\n\n";
-        if (!a.pages.empty())
-            info += std::to_wstring(a.pages.size()) + L" pages\n" + a.path + L"\n\n";
-        if (a.bitmap && !a.bitmap->warnings.empty()) {
-            info += L"Compatibility notes:\n";
-            for (auto& warning : a.bitmap->warnings)
-                info += L"• " + utf8(warning) + L"\n";
-        } else
-            info += L"No compatibility warnings have been reported for this page.\n";
-        info += L"\nCtrl+O  Open     Ctrl+F  Find     Ctrl+G  Go to page\nCtrl+C  Copy text     Ctrl+P  "
-                L"Print     R  Rotate\nCtrl+wheel  Zoom     Middle drag  Pan\nF  Fit page     W  Fit width   "
-                L"  B  Bookmarks\nF6  Focus toolbar     Tab  Move between controls";
-        MessageBoxW(a.window, info.c_str(), L"FastPDF — document information", MB_OK | MB_ICONINFORMATION);
     }
     sync_toolbar(a);
     InvalidateRect(a.window, nullptr, FALSE);
@@ -1338,8 +1300,6 @@ static void paint_app(App& a, HDC dc) {
     if (!a.pages.empty()) {
         std::wstring details =
             L"Page " + std::to_wstring(a.page + 1) + L" of " + std::to_wstring(a.pages.size());
-        if (a.bitmap && !a.bitmap->warnings.empty())
-            details += L"   ·   " + std::to_wstring(a.bitmap->warnings.size()) + L" notes";
         label(dc, {r.right - px(a, 240), status.top, r.right - px(a, 14), status.bottom}, details, ui::muted,
               a.small_font, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     }
@@ -1449,8 +1409,6 @@ static void receive(App& a) {
             a.bitmap = std::move(result.bitmap);
             a.bitmap_scale = result.scale;
             a.status = std::filesystem::path(a.path).filename().wstring();
-            if (a.bitmap && !a.bitmap->warnings.empty())
-                a.status += L"  —  See Document information for compatibility notes";
             if (a.smoke) {
                 try {
                     screenshot(a);
@@ -2025,10 +1983,6 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         case WM_LBUTTONDOWN: {
             POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             auto vp = viewport(a);
-            if (p.y >= client(a).bottom - px(a, 30)) {
-                command(a, cmd_info);
-                return 0;
-            }
             if (PtInRect(&vp, p) && a.bitmap) {
                 SetFocus(window);
                 a.dragging = true;
@@ -2098,9 +2052,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         case WM_CONTEXTMENU: {
             HMENU menu = CreatePopupMenu();
             AppendMenuW(menu, MF_STRING, 1000, L"Copy page or selected text\tCtrl+C");
-            AppendMenuW(menu, MF_STRING, cmd_export, L"Save page as PNG…");
             AppendMenuW(menu, MF_STRING, cmd_print, L"Print…\tCtrl+P");
-            AppendMenuW(menu, MF_STRING, cmd_info, L"Document information");
             POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             if (p.x == -1)
                 GetCursorPos(&p);
@@ -2133,9 +2085,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             else if (ctrl && wp == 'A') {
                 a.selected_all = true;
                 InvalidateRect(window, nullptr, FALSE);
-            } else if (ctrl && wp == 'S')
-                command(a, cmd_export);
-            else if (wp == VK_ADD || wp == VK_OEM_PLUS)
+            } else if (wp == VK_ADD || wp == VK_OEM_PLUS)
                 command(a, cmd_zoom_in);
             else if (wp == VK_SUBTRACT || wp == VK_OEM_MINUS)
                 command(a, cmd_zoom_out);
@@ -2286,9 +2236,9 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
     RegisterClassExW(&wc);
     HMENU menu = CreateMenu(), file = CreatePopupMenu(), view = CreatePopupMenu(), help = CreatePopupMenu();
     AppendMenuW(file, MF_STRING, cmd_open, L"&Open…\tCtrl+O");
-    AppendMenuW(file, MF_STRING, cmd_export, L"Save page as &PNG…\tCtrl+S");
     AppendMenuW(file, MF_STRING, cmd_print, L"&Print…\tCtrl+P");
-    AppendMenuW(file, MF_STRING, cmd_info, L"Document &information");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(file, MF_STRING, cmd_exit, L"E&xit\tAlt+F4");
     AppendMenuW(view, MF_STRING, cmd_search, L"&Find…\tCtrl+F");
     AppendMenuW(view, MF_STRING, cmd_goto, L"&Go to page…\tCtrl+G");
     AppendMenuW(view, MF_STRING, cmd_fit, L"Fit &page\tF");

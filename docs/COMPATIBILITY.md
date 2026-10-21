@@ -1,6 +1,6 @@
 # Compatibility status
 
-This file describes implemented behavior and known gaps. Opening a file successfully does not prove that every mark on every page is correct. The reader reports detected rendering gaps through Document information; `pdfprobe --all --strict` turns recorded compatibility warnings into a nonzero exit code.
+This file describes implemented behavior and known gaps. Opening a file successfully does not prove that every mark on every page is correct. `pdfprobe` reports detected rendering gaps in its JSON output; `pdfprobe --all --strict` turns recorded compatibility warnings into a nonzero exit code.
 
 ## Implemented
 
