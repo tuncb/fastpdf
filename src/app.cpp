@@ -121,6 +121,7 @@ struct App {
     HWND toolbar = nullptr, page_edit = nullptr, zoom_edit = nullptr;
     HWND welcome_install = nullptr, welcome_portable = nullptr;
     HINSTANCE instance = nullptr;
+    HICON icon = nullptr, small_icon = nullptr;
     HFONT font = nullptr, title_font = nullptr, small_font = nullptr, selected_font = nullptr;
     HBRUSH edit_background = nullptr, chrome_background = nullptr;
     ui::Painter painter;
@@ -1603,6 +1604,20 @@ static void create_toolbar(App& a) {
         SendMessageW(tips, TTM_ADDTOOLW, 0, LPARAM(&tool));
     }
 }
+static void window_icons(App& a) {
+    for (auto [kind, current] : {std::pair{ICON_BIG, &a.icon}, std::pair{ICON_SMALL, &a.small_icon}}) {
+        const bool large = kind == ICON_BIG;
+        auto icon = static_cast<HICON>(LoadImageW(
+            a.instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+            GetSystemMetricsForDpi(large ? SM_CXICON : SM_CXSMICON, a.dpi),
+            GetSystemMetricsForDpi(large ? SM_CYICON : SM_CYSMICON, a.dpi), LR_DEFAULTCOLOR));
+        require(icon != nullptr, "Cannot load application icon");
+        SendMessageW(a.window, WM_SETICON, WPARAM(kind), LPARAM(icon));
+        if (*current)
+            DestroyIcon(*current);
+        *current = icon;
+    }
+}
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     auto* ptr = reinterpret_cast<App*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (message == WM_NCCREATE) {
@@ -1621,6 +1636,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &ui::chrome, sizeof(ui::chrome));
             DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR, &ui::text, sizeof(ui::text));
             a.dpi = GetDpiForWindow(window);
+            window_icons(a);
             a.sidebar = CreateWindowExW(0, L"LISTBOX", L"Pages",
                                         WS_CHILD | WS_VSCROLL | LBS_NOTIFY | LBS_NODATA | LBS_OWNERDRAWFIXED |
                                             LBS_NOINTEGRALHEIGHT,
@@ -1695,6 +1711,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             return 0;
         case WM_DPICHANGED: {
             a.dpi = HIWORD(wp);
+            window_icons(a);
             fonts(a);
             auto r = reinterpret_cast<RECT*>(lp);
             SetWindowPos(window, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
@@ -1975,6 +1992,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                 DeleteObject(a.edit_background);
             if (a.chrome_background)
                 DeleteObject(a.chrome_background);
+            for (auto icon : {a.icon, a.small_icon})
+                if (icon)
+                    DestroyIcon(icon);
             ui::close(a.painter);
             PostQuitMessage(a.exit_code);
             return 0;
@@ -2053,7 +2073,7 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
     wc.lpfnWndProc = window_proc;
     wc.hInstance = instance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP));
     wc.lpszClassName = L"FastPDF.Window";
     RegisterClassExW(&wc);
     HMENU menu = CreateMenu(), file = CreatePopupMenu(), view = CreatePopupMenu(), help = CreatePopupMenu();

@@ -1,4 +1,5 @@
 #pragma once
+#define IDI_APP 1
 #define IDD_PASSWORD 101
 #define IDC_PASSWORD 1001
 #define IDC_PASSWORD_NOTE 1002
