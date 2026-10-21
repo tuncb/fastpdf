@@ -325,8 +325,9 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
         Bytes tiff;
         bool jpx = decoded.image_filter == "JPXDecode";
         if (jpx) {
+            bool indexed = space.name == "Indexed" || space.name == "I";
             auto raw = decode_jpx(d, decoded.bytes,
-                                  {r.image_workers, r.profiling ? &r.profile.jpx : nullptr, reduction});
+                                  {r.image_workers, r.profiling ? &r.profile.jpx : nullptr, reduction, indexed});
             require(raw.source_width == width && raw.source_height == height,
                     "Image codec dimensions disagree with the PDF dictionary");
             out->reduction = raw.reduction;
@@ -369,7 +370,7 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                     double a = alpha >= 0 ? raw.samples[i + size_t(alpha)] / 255.0 : 1;
                     for (unsigned c = 0; c < raw.components; ++c)
                         if (int(c) != alpha) {
-                            double value = raw.samples[i + c] / 255.0;
+                            double value = indexed ? raw.samples[i + c] : raw.samples[i + c] / 255.0;
                             if ((embedded_alpha == 2 || raw.premultiplied) && a > 0)
                                 value /= a;
                             values[channel++] = value;
@@ -405,7 +406,32 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                 "Image codec dimensions disagree with the PDF dictionary");
         out->stencil = stencil;
         bool invert = fax && boolean(get(decoded.params, "BlackIs1"));
+        bool gray_jpeg = (decoded.image_filter == "DCTDecode" || decoded.image_filter == "DCT") &&
+                         space.components == 1 && !stencil;
+        std::array<uint32_t, 256> palette{};
+        if (gray_jpeg) {
+            // WIC expands a one-component JPEG to equal RGB channels. These
+            // bytes are still PDF samples: apply Decode and the PDF color space
+            // before drawing. A Separation sample is a tint, not display gray.
+            double lo = num(at(decode, 0));
+            double hi = num(at(decode, 1), space.name == "Indexed" || space.name == "I" ? 255 : 1);
+            for (size_t i = 0; i < palette.size(); ++i) {
+                double sample = lo + (hi - lo) * i / 255.0;
+                auto c = color(d, space, std::span(&sample, 1));
+                if (mask.kind == Kind::array && i >= num(at(mask, 0)) && i <= num(at(mask, 1)))
+                    c.a = 0;
+                palette[i] = uint32_t(unit(c.b * c.a) * 255 + 0.5f) |
+                             (uint32_t(unit(c.g * c.a) * 255 + 0.5f) << 8) |
+                             (uint32_t(unit(c.r * c.a) * 255 + 0.5f) << 16) |
+                             (uint32_t(unit(c.a) * 255 + 0.5f) << 24);
+            }
+        }
         for (size_t p = 0; p < out->pixels.size(); p += 4) {
+            if (gray_jpeg) {
+                uint32_t pixel = palette[out->pixels[p]];
+                std::memcpy(out->pixels.data() + p, &pixel, 4);
+                continue;
+            }
             if (invert)
                 for (int c = 0; c < 3; ++c)
                     out->pixels[p + c] = uint8_t(255 - out->pixels[p + c]);

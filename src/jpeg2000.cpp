@@ -934,7 +934,8 @@ static JpxImage codestream(Document& document, View bytes, JpxOptions options) {
                     // need the same bias to normalize their display range to 0..255.
                     double value = values[i] + (1u << (component.precision - 1));
                     double maximum = (1u << component.precision) - 1;
-                    image.samples[index + i] = uint8_t(std::clamp(value * 255 / maximum + 0.5, 0.0, 255.0));
+                    image.samples[index + i] = uint8_t(std::clamp(
+                        (options.indexed ? value : value * 255 / maximum) + 0.5, 0.0, 255.0));
                 }
             }
         });
@@ -958,6 +959,10 @@ static JpxImage codestream(Document& document, View bytes, JpxOptions options) {
 } // namespace jpx
 
 JpxImage decode_jpx(Document& doc, View data, JpxOptions options) {
+    // Palette indices must remain integer samples. Wavelet reduction can mix
+    // indices before the PDF palette is applied, which produces wrong colors.
+    if (options.indexed)
+        options.reduction = 0;
     if (data.size() >= 2 && data[0] == 255 && data[1] == 0x4f)
         return jpx::codestream(doc, data, options);
     View codestream;
@@ -983,7 +988,7 @@ JpxImage decode_jpx(Document& doc, View data, JpxOptions options) {
                 codestream = body;
             else if (type == 0x6a703268)
                 inspect(body, depth + 1);
-            else if (type == 0x63646566) {
+            else if (type == 0x63646566 && !options.indexed) {
                 jpx::Reader definition{body};
                 unsigned count = jpx::read(definition, 2);
                 for (unsigned i = 0; i < count; ++i) {
@@ -997,7 +1002,7 @@ JpxImage decode_jpx(Document& doc, View data, JpxOptions options) {
             } else if (type == 0x636f6c72 && body.size() >= 7 && body[0] == 1) {
                 jpx::Reader color{body, 3};
                 enumerated_color = jpx::read(color, 4);
-            } else if (type == 0x70636c72 || type == 0x636d6170)
+            } else if ((type == 0x70636c72 || type == 0x636d6170) && !options.indexed)
                 fail("JPEG 2000 palette/channel mappings are not supported");
             r.pos = start + size_t(length);
         }
@@ -1008,7 +1013,7 @@ JpxImage decode_jpx(Document& doc, View data, JpxOptions options) {
     require(alpha < 0 || unsigned(alpha) < image.components, "Invalid JPEG 2000 alpha channel");
     image.alpha = alpha;
     image.premultiplied = premultiplied;
-    if (enumerated_color == 18 && image.components >= 3)
+    if (!options.indexed && enumerated_color == 18 && image.components >= 3)
         for (size_t i = 0; i < image.samples.size(); i += image.components) {
             double y = image.samples[i], cb = image.samples[i + 1] - 128.0, cr = image.samples[i + 2] - 128.0;
             image.samples[i] = uint8_t(std::clamp(y + 1.402 * cr, 0.0, 255.0));

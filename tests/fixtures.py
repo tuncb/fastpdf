@@ -307,6 +307,48 @@ def generate(directory):
         (root / f"{name}.pdf").write_bytes(data)
         cases[name] = expected
     add("plain", pdf(base()), text="FastPDF hello world", pixel=(50, 150, (255, 0, 0)))
+    inline_mask = b"BI /W 8 /H 8 /IM true /BPC 1 ID " + b"\x00" * 8 + b" EI"
+    inverse_mask = inline_mask.replace(b"/BPC 1", b"/BPC 1 /D [1 0]")
+    content = (b"q 1 0 0 rg 40 0 0 40 20 20 cm " + inline_mask + b" Q\n" +
+               b"q 0 0 1 rg 40 0 0 40 80 20 cm " + inline_mask + b" Q\n" +
+               b"q 1 0 0 rg 40 0 0 40 140 20 cm " + inverse_mask + b" Q\n")
+    add("inline_stencil_reuse", pdf(base(content)),
+        pixels=[(40, 180, (255, 0, 0)), (100, 180, (0, 0, 255)), (160, 180, (255, 255, 255))])
+    gray_jpeg = (Path(__file__).parent / "data" / "gray-tints.jpg").read_bytes()
+    for inverse in [False, True]:
+        objects = base(b"q 160 0 0 80 20 20 cm /Im Do Q", b"/XObject << /Im 6 0 R >>")
+        attributes = (b"/Type /XObject /Subtype /Image /Width 32 /Height 16 /BitsPerComponent 8 "
+                      b"/Filter /DCTDecode /ColorSpace [/Separation /Spot /DeviceRGB "
+                      b"<< /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [0 0 1] /N 1 >>]")
+        if inverse:
+            attributes += b" /Decode [1 0]"
+        objects.append(stream(gray_jpeg, attributes))
+        left, right = ((0, 0, 255), (255, 255, 255)) if inverse else ((255, 255, 255), (0, 0, 255))
+        add(f"jpeg_spot_{inverse}", pdf(objects), pixels=[(50, 150, left), (150, 150, right)])
+    jpx_root = Path(__file__).parent / "data"
+    jpx = (jpx_root / "L-lossless.jp2").read_bytes()
+    raw = (jpx_root / "L-lossless.raw").read_bytes()
+    def jp2_box(kind, data):
+        return struct.pack(">I4s", len(data) + 8, kind) + data
+    # The PDF palette takes precedence over the embedded JP2 palette.
+    embedded_palette = jp2_box(b"pclr", struct.pack(">HB", 256, 3) + b"\x07\x07\x07" + b"\x00\x00\xff" * 256)
+    channel_map = jp2_box(b"cmap", b"".join(struct.pack(">HBB", 0, 1, i) for i in range(3)))
+    position, mapped_jpx = 0, bytearray()
+    while position < len(jpx):
+        length, kind = struct.unpack_from(">I4s", jpx, position)
+        body = jpx[position + 8:position + length]
+        if kind == b"jp2h":
+            body += embedded_palette + channel_map
+        mapped_jpx += jp2_box(kind, body)
+        position += length
+    palette = bytes(c for i in range(256) for c in (i, 255 - i, 0))
+    for label, data in [("plain", jpx), ("mapped", mapped_jpx)]:
+        objects = base(b"q 37 0 0 29 0 0 cm /Im Do Q", b"/XObject << /Im 6 0 R >>")
+        objects[2] = objects[2].replace(b"300 220", b"37 29")
+        objects.append(stream(data, b"/Type /XObject /Subtype /Image /Width 37 /Height 29 /Interpolate false "
+                              b"/Filter /JPXDecode /ColorSpace [/Indexed /DeviceRGB 255 <" + palette.hex().encode() + b">]"))
+        pixels = [(x, y, (raw[y * 37 + x], 255 - raw[y * 37 + x], 0)) for x, y in [(5, 5), (20, 10), (30, 20)]]
+        add(f"jpx_indexed_{label}", pdf(objects), size=(37, 29), pixels=pixels)
     rng = random.Random(181)
     noise = b"%" + bytes(rng.randrange(33, 126) for _ in range(24000)) + b"\n"
     for level in [0, 1, 6, 9]:

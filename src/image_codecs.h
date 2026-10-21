@@ -26,6 +26,7 @@ struct JpxOptions {
     unsigned workers = 0;
     JpxProfile* profile = nullptr;
     unsigned reduction = 0;
+    bool indexed = false;
 };
 JpxImage decode_jpx(Document& document, View data, JpxOptions options = {});
 struct Renderer;
