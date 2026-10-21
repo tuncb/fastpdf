@@ -73,8 +73,11 @@ def render_file(args, item, folder):
         progress = folder / f"progress-{first:06d}.jsonl"
         command = [str(args.exe.resolve()), item["path"], "--page", str(first),
                    "--last-page", str(last), "--scale", str(args.scale), "--timings",
-                   "--continue-on-error", "--progress", str(progress),
-                   "--render-dir", str(folder / "pages"), "--render-format", "bmp"]
+                   "--continue-on-error", "--progress", str(progress)]
+        if args.hash_only:
+            command.append("--pixel-hash")
+        else:
+            command.extend(["--render-dir", str(folder / "pages"), "--render-format", "bmp"])
         if args.profile:
             command.append("--profile")
         begin = time.perf_counter()
@@ -134,8 +137,9 @@ def compare_file(args, item, folder, pymupdf):
             for index in range(len(document)):
                 row = {"page": index + 1}
                 actual_path = folder / "pages" / f"page-{index + 1:06d}.png"
-                if not actual_path.exists():
-                    actual_path = actual_path.with_suffix(".bmp")
+                bitmap_path = actual_path.with_suffix(".bmp")
+                if bitmap_path.exists():
+                    actual_path = bitmap_path
                 try:
                     if not actual_path.exists():
                         raise RuntimeError("FastPDF image is missing")
@@ -143,23 +147,34 @@ def compare_file(args, item, folder, pymupdf):
                     cached_path = reference_path
                     if not cached_path.exists() and args.reuse_reference:
                         cached_path = args.reuse_reference / item["id"] / "reference" / reference_path.name
+                    reference = None
+                    replace_reference = False
                     if cached_path.exists():
-                        with Image.open(cached_path) as cached:
-                            reference = cached.convert("RGB")
-                    else:
+                        try:
+                            with Image.open(cached_path) as cached:
+                                reference = cached.convert("RGB")
+                        except OSError:
+                            replace_reference = cached_path == reference_path
+                    if reference is None:
                         pixmap = document[index].get_pixmap(matrix=pymupdf.Matrix(args.scale, args.scale), colorspace=pymupdf.csRGB, alpha=False)
                         reference = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
                     with Image.open(actual_path) as actual:
                         row.update(compare_page(actual, reference))
+                        row["pixel_sha256"] = hashlib.sha256(
+                            actual.convert("RGBA").tobytes("raw", "BGRA")).hexdigest()
                         # Store compact evidence after the measured process exits.
                         # WIC's PNG encoder otherwise dominates corpus wall time.
                         if actual_path.suffix == ".bmp":
-                            actual.save(actual_path.with_suffix(".png"), compress_level=1)
+                            temporary = actual_path.with_suffix(".png.tmp")
+                            actual.save(temporary, format="PNG", compress_level=1)
+                            temporary.replace(actual_path.with_suffix(".png"))
                     if actual_path.suffix == ".bmp":
                         actual_path.unlink()
-                    if (row["flag"] or args.cache_reference) and not reference_path.exists():
+                    if (row["flag"] or args.cache_reference) and (replace_reference or not reference_path.exists()):
                         reference_path.parent.mkdir(exist_ok=True)
-                        reference.save(reference_path, compress_level=1)
+                        temporary = reference_path.with_suffix(".png.tmp")
+                        reference.save(temporary, format="PNG", compress_level=1)
+                        temporary.replace(reference_path)
                 except Exception as error:
                     row.update(error=str(error), flag=True)
                 results.append(row)
@@ -195,11 +210,14 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--skip-reference", action="store_true")
+    parser.add_argument("--hash-only", action="store_true", help="Save pixel hashes instead of images; requires --skip-reference")
     parser.add_argument("--compare-only", action="store_true")
     parser.add_argument("--workers", type=int, default=4, help="Reference workers; timing is always serial")
     parser.add_argument("--cache-reference", action="store_true", help="Keep every reference image for later checks")
     parser.add_argument("--reuse-reference", type=Path, help="Reuse reference images from a matching prior run")
     args = parser.parse_args()
+    if args.hash_only and (not args.skip_reference or args.compare_only):
+        raise SystemExit("--hash-only requires --skip-reference and cannot be used with --compare-only")
     if args.reference_path:
         sys.path.insert(0, str(args.reference_path.resolve()))
     import pymupdf
@@ -214,7 +232,8 @@ def main():
     metadata_path = args.output / "run.json"
     identity = {"exe_sha256": hashlib.sha256(args.exe.read_bytes()).hexdigest(),
                 "inventory_sha256": hashlib.sha256(args.inventory.read_bytes()).hexdigest(),
-                "scale": args.scale, "reference": pymupdf.VersionBind, "profile": args.profile}
+                "scale": args.scale, "reference": pymupdf.VersionBind, "profile": args.profile,
+                "hash_only": args.hash_only}
     previous = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else None
     if previous:
         for key, value in identity.items():
