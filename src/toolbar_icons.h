@@ -1,6 +1,6 @@
 #pragma once
 
-// Small, scalable monochrome icons drawn with Windows GDI; no bitmap assets or icon font dependency.
+// Scalable outlines, also drawn into the supersampled UI surface for smooth small icons.
 enum class ToolbarIcon {
     open,
     print,
@@ -33,7 +33,9 @@ static void draw_toolbar_icon(HDC dc, RECT rect, ToolbarIcon icon, COLORREF colo
         auto a = point(x, y), b = point(right, bottom);
         Rectangle(dc, a.x, a.y, b.x, b.y);
     };
-    HPEN pen = CreatePen(PS_SOLID, std::max(1, MulDiv(1, int(dpi), 96)), color);
+    LOGBRUSH brush{BS_SOLID, color, 0};
+    HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
+                            DWORD(std::max(1, MulDiv(3, int(dpi), 192))), &brush, 0, nullptr);
     auto old_pen = SelectObject(dc, pen);
     auto old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
     switch (icon) {

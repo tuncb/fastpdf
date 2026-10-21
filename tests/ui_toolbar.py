@@ -34,6 +34,22 @@ TB_ISBUTTONENABLED, TB_ISBUTTONCHECKED = 0x400 + 9, 0x400 + 10
 TB_ISBUTTONHIDDEN = 0x400 + 12
 
 
+class GUIThreadInfo(c.Structure):
+    _fields_ = [("size", w.DWORD), ("flags", w.DWORD), ("active", w.HWND),
+                ("focus", w.HWND), ("capture", w.HWND), ("menu", w.HWND),
+                ("move", w.HWND), ("caret", w.HWND), ("caret_rect", w.RECT)]
+
+
+user.GetGUIThreadInfo.argtypes = [w.DWORD, c.POINTER(GUIThreadInfo)]
+
+
+def focused(window):
+    info = GUIThreadInfo()
+    info.size = c.sizeof(info)
+    assert user.GetGUIThreadInfo(user.GetWindowThreadProcessId(window, None), c.byref(info))
+    return info.focus
+
+
 def wait_for(predicate, description, timeout=10):
     until = time.monotonic() + timeout
     while time.monotonic() < until:
@@ -147,6 +163,20 @@ def run(executable, output):
             user.SendMessageW(window, WM_COMMAND, 9, 0)
             assert user.SendMessageW(toolbar, TB_ISBUTTONCHECKED, 9, 0)
             assert not user.SendMessageW(toolbar, TB_ISBUTTONCHECKED, 10, 0)
+
+            # Selecting a page must keep focus in the list for repeated arrow navigation.
+            sidebar = user.GetDlgItem(window, 200)
+            point = (10 << 16) | 20
+            user.SendMessageW(sidebar, 0x201, 1, point)  # WM_LBUTTONDOWN
+            user.SendMessageW(sidebar, 0x202, 0, point)  # WM_LBUTTONUP
+            assert focused(window) == sidebar, "Page selection stole sidebar focus"
+            for expected in ("2", "3"):
+                user.SendMessageW(sidebar, WM_KEYDOWN, 0x28, 0)
+                assert text(page) == expected, "Sidebar arrow navigation failed"
+                assert focused(window) == sidebar, "Arrow navigation stole sidebar focus"
+            user.SendMessageW(sidebar, WM_KEYDOWN, 27, 0)
+            assert focused(window) == window, "Escape did not return to the document"
+
             user.SendMessageW(window, WM_COMMAND, 9, 0)
             assert not user.SendMessageW(toolbar, TB_ISBUTTONCHECKED, 9, 0)
             user.SendMessageW(window, WM_COMMAND, 11, 0)

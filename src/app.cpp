@@ -10,7 +10,7 @@
 #include <mutex>
 #include <thread>
 #include <cwctype>
-#include "toolbar_icons.h"
+#include "ui_style.h"
 
 using namespace pdf;
 constexpr UINT worker_message = WM_APP + 1;
@@ -106,8 +106,11 @@ struct App {
     HWND window = nullptr, sidebar = nullptr, search = nullptr;
     HWND toolbar = nullptr, page_edit = nullptr, zoom_edit = nullptr;
     HINSTANCE instance = nullptr;
-    HFONT font = nullptr, title_font = nullptr, small_font = nullptr;
-    HBRUSH edit_background = nullptr;
+    HFONT font = nullptr, title_font = nullptr, small_font = nullptr, selected_font = nullptr;
+    HBRUSH edit_background = nullptr, chrome_background = nullptr;
+    ui::Painter painter;
+    HWND input_hover = nullptr;
+    int sidebar_hover = -1;
     Worker worker;
     UINT dpi = 96;
     uint64_t document = 0, ticket = 0, render_ticket = 0, search_ticket = 0;
@@ -133,6 +136,8 @@ static void create_toolbar(App& a);
 static void paint_toolbar(App& a, HDC dc);
 static void paint_toolbar_button(App& a, HDC dc, RECT rect, int id, UINT state);
 static void command(App& a, int id);
+static void paint_input_frame(App& a, HDC dc, HWND parent, HWND input);
+static void paint_sidebar_item(App& a, HDC dc, RECT rect, int index, bool selected, bool focused);
 static std::wstring lower(std::wstring s) {
     for (auto& c : s)
         c = wchar_t(std::towlower(c));
@@ -359,7 +364,7 @@ static RECT viewport(App& a) {
     RECT r = client(a);
     r.top = px(a, toolbar_height + (a.find_open ? 40 : 0));
     r.bottom -= px(a, 30);
-    r.left = a.show_sidebar && !a.pages.empty() ? px(a, 220) : 0;
+    r.left = a.show_sidebar && !a.pages.empty() ? px(a, ui::sidebar_width) : 0;
     return r;
 }
 static std::pair<double, double> dimensions(App& a) {
@@ -425,11 +430,11 @@ static void request_render(App& a, bool reset_scroll = false) {
     InvalidateRect(a.window, nullptr, FALSE);
 }
 static void fonts(App& a) {
-    for (auto f : {a.font, a.title_font, a.small_font})
+    for (auto f : {a.font, a.title_font, a.small_font, a.selected_font})
         if (f)
             DeleteObject(f);
     a.font =
-        CreateFontW(-px(a, 14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+        CreateFontW(-px(a, 13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     a.title_font =
         CreateFontW(-px(a, 28), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
@@ -437,25 +442,31 @@ static void fonts(App& a) {
     a.small_font =
         CreateFontW(-px(a, 12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    a.selected_font =
+        CreateFontW(-px(a, 13), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     SendMessageW(a.sidebar, WM_SETFONT, WPARAM(a.font), TRUE);
-    SendMessageW(a.sidebar, LB_SETITEMHEIGHT, 0, px(a, 40));
-    SendMessageW(a.search, WM_SETFONT, WPARAM(a.font), TRUE);
+    SendMessageW(a.sidebar, LB_SETITEMHEIGHT, 0, px(a, ui::row_height));
+    SendMessageW(a.search, WM_SETFONT, WPARAM(a.small_font), TRUE);
     for (auto control : {a.toolbar, a.page_edit, a.zoom_edit})
         SendMessageW(control, WM_SETFONT, WPARAM(a.small_font), TRUE);
 }
 static void layout(App& a) {
     auto r = client(a);
     int top = px(a, toolbar_height + (a.find_open ? 40 : 0));
-    MoveWindow(a.sidebar, 0, top, px(a, 220), std::max<LONG>(0, r.bottom - top - px(a, 30)), TRUE);
+    int list_top = top + px(a, ui::sidebar_header);
+    MoveWindow(a.sidebar, 0, list_top, px(a, ui::sidebar_width) - 1,
+               std::max<LONG>(0, r.bottom - list_top - px(a, 30)), TRUE);
     ShowWindow(a.sidebar, a.show_sidebar && !a.pages.empty() ? SW_SHOW : SW_HIDE);
-    MoveWindow(a.search, px(a, 18), px(a, toolbar_height + 6),
-               std::max<LONG>(80, std::min<LONG>(px(a, 420), r.right - px(a, 140))), px(a, 26), TRUE);
+    MoveWindow(a.search, px(a, 18), px(a, toolbar_height + 11),
+               std::max<LONG>(80, std::min<LONG>(px(a, 420), r.right - px(a, 140))), px(a, 18), TRUE);
     ShowWindow(a.search, a.find_open ? SW_SHOW : SW_HIDE);
     update_scroll(a);
     layout_toolbar(a);
     sync_toolbar(a);
 }
 static void update_sidebar(App& a) {
+    a.sidebar_hover = -1;
     SendMessageW(a.sidebar, LB_SETCOUNT, WPARAM(a.bookmarks ? a.outline.size() : a.pages.size()), 0);
     if (!a.bookmarks)
         SendMessageW(a.sidebar, LB_SETCURSEL, WPARAM(a.page), 0);
@@ -790,8 +801,8 @@ static void layout_toolbar(App& a) {
     SendMessageW(a.toolbar, TB_GETRECT, page_slot, LPARAM(&page));
     SendMessageW(a.toolbar, TB_GETRECT, zoom_slot, LPARAM(&zoom));
     // Edit controls are toolbar children, so the native control clips and paints them correctly.
-    MoveWindow(a.page_edit, page.left + px(a, 2), px(a, 6), px(a, 48), px(a, 24), TRUE);
-    MoveWindow(a.zoom_edit, zoom.left + px(a, 2), px(a, 6), px(a, 56), px(a, 24), TRUE);
+    MoveWindow(a.page_edit, page.left + px(a, 5), px(a, 9), px(a, 42), px(a, 18), TRUE);
+    MoveWindow(a.zoom_edit, zoom.left + px(a, 5), px(a, 9), px(a, 50), px(a, 18), TRUE);
 }
 
 static void paint_toolbar_button(App& a, HDC dc, RECT rect, int id, UINT state) {
@@ -800,25 +811,52 @@ static void paint_toolbar_button(App& a, HDC dc, RECT rect, int id, UINT state) 
     bool hot = (state & CDIS_HOT) != 0;
     rect.top = px(a, 4);
     rect.bottom = px(a, 32);
-    if (active || hot) {
-        InflateRect(&rect, -px(a, 1), 0);
-        fill_rect(dc, rect, active ? RGB(53, 70, 87) : RGB(51, 57, 66));
-    }
+    InflateRect(&rect, -px(a, 1), 0);
     for (const auto& tool : toolbar_tools)
         if (tool.command == id) {
-            draw_toolbar_icon(dc, rect, tool.icon, enabled ? RGB(226, 230, 237) : RGB(89, 96, 107), a.dpi);
+            COLORREF background = active ? ui::selected : hot && enabled ? ui::hover : ui::chrome;
+            COLORREF color = !enabled ? ui::disabled : active || hot ? ui::text : ui::muted;
+            ui::control(a.painter, dc, rect, a.dpi, ui::chrome, background, ui::focus,
+                        (state & CDIS_FOCUS) ? 2 : 0, tool.icon, color);
             break;
         }
-    if (state & CDIS_FOCUS) {
-        InflateRect(&rect, -1, -1);
-        DrawFocusRect(dc, &rect);
-    }
+}
+
+static void paint_input_frame(App& a, HDC dc, HWND parent, HWND input) {
+    if (!input)
+        return;
+    RECT rect{};
+    GetWindowRect(input, &rect);
+    MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&rect), 2);
+    InflateRect(&rect, px(a, 3), px(a, 3));
+    bool focused = GetFocus() == input;
+    COLORREF outline = focused ? ui::focus : a.input_hover == input ? ui::muted : ui::border;
+    ui::control(a.painter, dc, rect, a.dpi, ui::chrome, ui::surface, outline, focused ? 2 : 1);
+}
+
+static void paint_sidebar_item(App& a, HDC dc, RECT rect, int index, bool selected, bool focused) {
+    fill_rect(dc, rect, ui::chrome);
+    RECT row = rect;
+    InflateRect(&row, -px(a, 8), -px(a, 2));
+    COLORREF fill = selected ? ui::selected : index == a.sidebar_hover ? ui::hover : ui::chrome;
+    ui::control(a.painter, dc, row, a.dpi, ui::chrome, fill, ui::focus, focused ? 2 : 0);
+    rect.left = row.left + px(a, 10);
+    rect.right = row.right - px(a, 10);
+    std::wstring text;
+    if (a.bookmarks && size_t(index) < a.outline.size()) {
+        const auto& outline = a.outline[size_t(index)];
+        text = outline.title;
+        rect.left += px(a, std::min(outline.depth, 5) * 12);
+    } else
+        text = L"Page " + std::to_wstring(index + 1);
+    label(dc, rect, text, selected || index == a.sidebar_hover ? ui::text : ui::muted,
+          selected ? a.selected_font : a.font);
 }
 
 static void paint_toolbar(App& a, HDC dc) {
     auto r = client(a);
-    fill_rect(dc, {0, 0, r.right, px(a, toolbar_height)}, RGB(25, 28, 33));
-    fill_rect(dc, {0, px(a, toolbar_height) - 1, r.right, px(a, toolbar_height)}, RGB(56, 61, 69));
+    fill_rect(dc, {0, 0, r.right, px(a, toolbar_height)}, ui::chrome);
+    fill_rect(dc, {0, px(a, toolbar_height) - 1, r.right, px(a, toolbar_height)}, ui::border);
     int hot = int(SendMessageW(a.toolbar, TB_GETHOTITEM, 0, 0));
     for (int index = 0; index < SendMessageW(a.toolbar, TB_BUTTONCOUNT, 0, 0); ++index) {
         TBBUTTON button{};
@@ -831,13 +869,13 @@ static void paint_toolbar(App& a, HDC dc) {
             rect.left += px(a, 54);
             rect.top = 0;
             rect.bottom = px(a, toolbar_height);
-            label(dc, rect, a.pages.empty() ? L"/ —" : L"/ " + std::to_wstring(a.pages.size()),
-                  RGB(167, 176, 189), a.small_font);
+            label(dc, rect, a.pages.empty() ? L"/ —" : L"/ " + std::to_wstring(a.pages.size()), ui::muted,
+                  a.small_font);
         } else if (button.idCommand == zoom_slot) {
             continue;
         } else if (button.fsStyle & BTNS_SEP) {
             int x = (rect.left + rect.right) / 2;
-            fill_rect(dc, {x, px(a, 8), x + 1, px(a, 28)}, RGB(56, 61, 69));
+            fill_rect(dc, {x, px(a, 8), x + 1, px(a, 28)}, ui::border);
         } else {
             UINT state = (button.fsState & TBSTATE_ENABLED) ? 0 : CDIS_DISABLED;
             if (button.fsState & TBSTATE_CHECKED)
@@ -852,6 +890,8 @@ static void paint_toolbar(App& a, HDC dc) {
             paint_toolbar_button(a, dc, rect, button.idCommand, state);
         }
     }
+    paint_input_frame(a, dc, a.toolbar, a.page_edit);
+    paint_input_frame(a, dc, a.toolbar, a.zoom_edit);
 }
 static RECT page_rect(App& a) {
     auto r = viewport(a);
@@ -889,12 +929,19 @@ static void highlight(HDC dc, RECT rect, uint32_t color) {
 static void paint_app(App& a, HDC dc) {
     auto r = client(a);
     auto vp = viewport(a);
-    fill_rect(dc, r, RGB(33, 36, 43));
+    fill_rect(dc, r, ui::canvas);
     paint_toolbar(a, dc);
     if (a.find_open) {
-        fill_rect(dc, {0, px(a, toolbar_height), r.right, px(a, toolbar_height + 40)}, RGB(26, 30, 38));
+        fill_rect(dc, {0, px(a, toolbar_height), r.right, px(a, toolbar_height + 40)}, ui::chrome);
         label(dc, {px(a, 454), px(a, toolbar_height), r.right - px(a, 12), px(a, toolbar_height + 40)},
-              L"Enter to find · F3 next page · Esc to close", RGB(165, 173, 192), a.small_font);
+              L"Enter to find · F3 next page · Esc to close", ui::muted, a.small_font);
+        paint_input_frame(a, dc, a.window, a.search);
+    }
+    if (a.show_sidebar && !a.pages.empty()) {
+        fill_rect(dc, {0, vp.top, vp.left, vp.bottom}, ui::chrome);
+        fill_rect(dc, {vp.left - 1, vp.top, vp.left, vp.bottom}, ui::border);
+        label(dc, {px(a, 18), vp.top, vp.left - px(a, 12), vp.top + px(a, ui::sidebar_header)},
+              a.bookmarks ? L"Bookmarks" : L"Pages", ui::muted, a.small_font);
     }
     int saved = SaveDC(dc);
     IntersectClipRect(dc, vp.left, vp.top, vp.right, vp.bottom);
@@ -911,12 +958,12 @@ static void paint_app(App& a, HDC dc) {
         heading.right = vp.right - px(a, 40);
         heading.top = center - px(a, 67) - height / 2;
         heading.bottom = heading.top + height;
-        label(dc, heading, prompt, RGB(234, 237, 245), a.title_font, DT_CENTER | DT_WORDBREAK);
+        label(dc, heading, prompt, ui::text, a.title_font, DT_CENTER | DT_WORDBREAK);
     } else {
         RECT page = page_rect(a);
         RECT shadow = page;
         OffsetRect(&shadow, px(a, 3), px(a, 5));
-        fill_rect(dc, shadow, RGB(17, 19, 24));
+        fill_rect(dc, shadow, ui::shadow);
         fill_rect(dc, page, RGB(255, 255, 255));
         if (a.bitmap) {
             BITMAPINFO bmi{};
@@ -942,27 +989,25 @@ static void paint_app(App& a, HDC dc) {
                 bool selected =
                     a.selected_all || std::find(a.selected.begin(), a.selected.end(), i) != a.selected.end();
                 if (selected)
-                    highlight(dc, span_rect(a, span.bounds), 0x50252550);
+                    highlight(dc, span_rect(a, span.bounds), 0x5010224b);
                 else if (!needle.empty() && lower(span.text).find(needle) != std::wstring::npos)
                     highlight(dc, span_rect(a, span.bounds), 0x60605000);
             }
         } else
-            label(dc, page, L"Rendering…", RGB(130, 134, 146), a.font,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            label(dc, page, L"Rendering…", ui::muted, a.font, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     RestoreDC(dc, saved);
     RECT status{0, r.bottom - px(a, 30), r.right, r.bottom};
-    fill_rect(dc, status, RGB(20, 23, 29));
-    label(dc, {px(a, 14), status.top, r.right - px(a, 250), status.bottom}, a.status, RGB(158, 169, 191),
+    fill_rect(dc, status, ui::chrome);
+    label(dc, {px(a, 14), status.top, r.right - px(a, 250), status.bottom}, a.status, ui::muted,
           a.small_font);
     if (!a.pages.empty()) {
-        std::wstring details = std::to_wstring(int(a.scale * 72 / a.dpi * 100)) + L"%";
-        if (a.bitmap)
-            details += L"   ·   " + std::to_wstring(int(a.bitmap->milliseconds)) + L" ms";
+        std::wstring details = L"Page " + std::to_wstring(a.page + 1) + L" of " +
+                               std::to_wstring(a.pages.size());
         if (a.bitmap && !a.bitmap->warnings.empty())
             details += L"   ·   " + std::to_wstring(a.bitmap->warnings.size()) + L" notes";
-        label(dc, {r.right - px(a, 240), status.top, r.right - px(a, 14), status.bottom}, details,
-              RGB(165, 175, 195), a.small_font, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        label(dc, {r.right - px(a, 240), status.top, r.right - px(a, 14), status.bottom}, details, ui::muted,
+              a.small_font, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     }
 }
 static void screenshot(App& a) {
@@ -988,12 +1033,18 @@ static void screenshot(App& a) {
     }
     if (a.show_sidebar && !a.pages.empty()) {
         auto vp = viewport(a);
-        fill_rect(memory, {0, vp.top, px(a, 220), vp.bottom}, RGB(26, 30, 38));
-        for (size_t i = 0; i < std::min<size_t>(a.pages.size(), size_t((vp.bottom - vp.top) / px(a, 40)));
-             ++i)
-            label(memory,
-                  {px(a, 18), vp.top + int(i) * px(a, 40), px(a, 202), vp.top + int(i + 1) * px(a, 40)},
-                  L"Page " + std::to_wstring(i + 1), RGB(185, 196, 218), a.font);
+        int top = vp.top + px(a, ui::sidebar_header);
+        int first = int(SendMessageW(a.sidebar, LB_GETTOPINDEX, 0, 0));
+        int count = int(SendMessageW(a.sidebar, LB_GETCOUNT, 0, 0));
+        int selected = int(SendMessageW(a.sidebar, LB_GETCURSEL, 0, 0));
+        int saved = SaveDC(memory);
+        IntersectClipRect(memory, 0, top, vp.left - 1, vp.bottom);
+        for (int i = std::max(0, first); i < count && top < vp.bottom; ++i) {
+            paint_sidebar_item(a, memory, {0, top, vp.left - 1, top + px(a, ui::row_height)}, i,
+                               i == selected, false);
+            top += px(a, ui::row_height);
+        }
+        RestoreDC(memory, saved);
     }
     RenderedPage page;
     page.width = unsigned(r.right);
@@ -1116,6 +1167,65 @@ static const Link* hit_link(App& a, POINT p) {
     }
     return nullptr;
 }
+
+static LRESULT CALLBACK input_frame_proc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR,
+                                         DWORD_PTR data) {
+    auto& a = *reinterpret_cast<App*>(data);
+    HWND parent = GetParent(window);
+    auto invalidate_frame = [&] {
+        RECT rect{};
+        GetWindowRect(window, &rect);
+        MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&rect), 2);
+        InflateRect(&rect, px(a, 4), px(a, 4));
+        InvalidateRect(parent, &rect, FALSE);
+    };
+    if (message == WM_MOUSEMOVE && a.input_hover != window) {
+        a.input_hover = window;
+        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+        TrackMouseEvent(&tracking);
+        invalidate_frame();
+    } else if (message == WM_MOUSELEAVE) {
+        if (a.input_hover == window)
+            a.input_hover = nullptr;
+        invalidate_frame();
+    }
+    LRESULT result = DefSubclassProc(window, message, wp, lp);
+    if (message == WM_SETFOCUS || message == WM_KILLFOCUS || message == WM_ENABLE)
+        invalidate_frame();
+    return result;
+}
+
+static LRESULT CALLBACK sidebar_proc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR,
+                                     DWORD_PTR data) {
+    auto& a = *reinterpret_cast<App*>(data);
+    if (message == WM_MOUSEMOVE) {
+        DWORD item = DWORD(SendMessageW(window, LB_ITEMFROMPOINT, 0, lp));
+        int hover = HIWORD(item) ? -1 : int(LOWORD(item));
+        if (hover != a.sidebar_hover) {
+            a.sidebar_hover = hover;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+        TrackMouseEvent(&tracking);
+    } else if (message == WM_MOUSELEAVE || message == WM_VSCROLL || message == WM_MOUSEWHEEL) {
+        a.sidebar_hover = -1;
+        InvalidateRect(window, nullptr, FALSE);
+    } else if (message == WM_KEYDOWN) {
+        if (wp == VK_ESCAPE) {
+            SetFocus(a.window);
+            return 0;
+        }
+        if (wp == VK_F6 || ((GetKeyState(VK_CONTROL) & 0x8000) &&
+                            (wp == 'O' || wp == 'F' || wp == 'G' || wp == 'P' || wp == 'S'))) {
+            SendMessageW(a.window, message, wp, lp);
+            return 0;
+        }
+    }
+    LRESULT result = DefSubclassProc(window, message, wp, lp);
+    if (message == WM_SETFOCUS || message == WM_KILLFOCUS)
+        InvalidateRect(window, nullptr, FALSE);
+    return result;
+}
 static LRESULT CALLBACK search_proc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR,
                                     DWORD_PTR data) {
     auto& a = *reinterpret_cast<App*>(data);
@@ -1140,6 +1250,8 @@ static LRESULT CALLBACK toolbar_control_proc(HWND window, UINT message, WPARAM w
                                              DWORD_PTR data) {
     auto& a = *reinterpret_cast<App*>(data);
     bool edit = window == a.page_edit || window == a.zoom_edit;
+    if (window == a.toolbar && (message == WM_SETFOCUS || message == WM_KILLFOCUS))
+        InvalidateRect(window, nullptr, FALSE);
     if (window == a.toolbar &&
         (message == WM_CTLCOLOREDIT || message == WM_CTLCOLORSTATIC || message == WM_COMMAND))
         return SendMessageW(a.window, message, wp, lp);
@@ -1235,9 +1347,9 @@ static void create_toolbar(App& a) {
         SendMessageW(a.toolbar, TB_ADDBUTTONSW, 1, LPARAM(&button));
     }
     auto edit = [&](int id, const wchar_t* name) {
-        HWND window = CreateWindowExW(
-            0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_CENTER | ES_AUTOHSCROLL, 0,
-            0, 0, 0, a.toolbar, HMENU(INT_PTR(id)), a.instance, nullptr);
+        HWND window =
+            CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_CENTER | ES_AUTOHSCROLL,
+                            0, 0, 0, 0, a.toolbar, HMENU(INT_PTR(id)), a.instance, nullptr);
         require(window != nullptr, "Cannot create toolbar entry");
         SendMessageW(window, EM_LIMITTEXT, 16, 0);
         SendMessageW(window, EM_SETCUEBANNER, TRUE, LPARAM(name));
@@ -1247,6 +1359,8 @@ static void create_toolbar(App& a) {
     a.zoom_edit = edit(id_zoom, L"Zoom (%)");
     for (auto control : {a.toolbar, a.page_edit, a.zoom_edit})
         SetWindowSubclass(control, toolbar_control_proc, 1, DWORD_PTR(&a));
+    for (auto control : {a.page_edit, a.zoom_edit})
+        SetWindowSubclass(control, input_frame_proc, 2, DWORD_PTR(&a));
     // The toolbar's native tooltip window also describes its two text fields.
     HWND tips = HWND(SendMessageW(a.toolbar, TB_GETTOOLTIPS, 0, 0));
     for (auto [window, name] : {std::pair{a.page_edit, L"Page number — Enter to go, Esc to cancel"},
@@ -1274,18 +1388,23 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         case WM_CREATE: {
             BOOL dark = TRUE;
             DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
+            DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &ui::chrome, sizeof(ui::chrome));
+            DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR, &ui::text, sizeof(ui::text));
             a.dpi = GetDpiForWindow(window);
             a.sidebar = CreateWindowExW(0, L"LISTBOX", L"Pages",
                                         WS_CHILD | WS_VSCROLL | LBS_NOTIFY | LBS_NODATA | LBS_OWNERDRAWFIXED |
                                             LBS_NOINTEGRALHEIGHT,
                                         0, 0, 0, 0, window, HMENU(INT_PTR(id_sidebar)), a.instance, nullptr);
-            a.search = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP,
-                                       0, 0, 0, 0, window, HMENU(INT_PTR(id_search)), a.instance, nullptr);
+            SetWindowSubclass(a.sidebar, sidebar_proc, 1, DWORD_PTR(&a));
+            a.search = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP, 0, 0, 0, 0,
+                                       window, HMENU(INT_PTR(id_search)), a.instance, nullptr);
             SendMessageW(a.search, EM_SETCUEBANNER, TRUE, LPARAM(L"Find in document"));
             SendMessageW(a.search, EM_LIMITTEXT, 4095, 0);
             SetWindowSubclass(a.search, search_proc, 1, DWORD_PTR(&a));
+            SetWindowSubclass(a.search, input_frame_proc, 2, DWORD_PTR(&a));
             create_toolbar(a);
-            a.edit_background = CreateSolidBrush(RGB(38, 43, 54));
+            a.edit_background = CreateSolidBrush(ui::surface);
+            a.chrome_background = CreateSolidBrush(ui::chrome);
             fonts(a);
             DragAcceptFiles(window, TRUE);
             a.worker.window = window;
@@ -1351,30 +1470,20 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             return 0;
         }
         case WM_CTLCOLORLISTBOX:
-            SetBkColor(HDC(wp), RGB(26, 30, 38));
-            return LRESULT(a.edit_background);
+            SetBkColor(HDC(wp), ui::chrome);
+            return LRESULT(a.chrome_background);
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORSTATIC:
-            SetBkColor(HDC(wp), RGB(38, 43, 54));
-            SetTextColor(HDC(wp), IsWindowEnabled(HWND(lp)) ? RGB(236, 240, 248) : RGB(89, 96, 107));
+            SetBkColor(HDC(wp), ui::surface);
+            SetTextColor(HDC(wp), IsWindowEnabled(HWND(lp)) ? ui::text : ui::disabled);
             return LRESULT(a.edit_background);
         case WM_DRAWITEM: {
             auto item = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
             if (item->CtlID != id_sidebar || item->itemID == UINT(-1))
                 break;
-            bool selected = (item->itemState & ODS_SELECTED) != 0;
-            fill_rect(item->hDC, item->rcItem, selected ? RGB(63, 56, 105) : RGB(26, 30, 38));
-            std::wstring text;
-            RECT rect = item->rcItem;
-            rect.left += px(a, 18);
-            rect.right -= px(a, 10);
-            if (a.bookmarks && item->itemID < a.outline.size()) {
-                auto& outline = a.outline[item->itemID];
-                text = outline.title;
-                rect.left += px(a, std::min(outline.depth, 5) * 12);
-            } else
-                text = L"Page " + std::to_wstring(item->itemID + 1);
-            label(item->hDC, rect, text, selected ? RGB(243, 241, 255) : RGB(177, 187, 208), a.font);
+            paint_sidebar_item(a, item->hDC, item->rcItem, int(item->itemID),
+                               (item->itemState & ODS_SELECTED) != 0,
+                               (item->itemState & ODS_FOCUS) != 0 && GetFocus() == a.sidebar);
             return TRUE;
         }
         case WM_COMMAND:
@@ -1387,7 +1496,6 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                     if (page >= 0)
                         goto_page(a, page);
                 }
-                SetFocus(window);
             } else if (LOWORD(wp) < 100)
                 command(a, LOWORD(wp));
             return 0;
@@ -1587,11 +1695,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             a.worker.ready.notify_all();
             if (a.worker.thread.joinable())
                 a.worker.thread.join();
-            for (auto f : {a.font, a.title_font, a.small_font})
+            for (auto f : {a.font, a.title_font, a.small_font, a.selected_font})
                 if (f)
                     DeleteObject(f);
             if (a.edit_background)
                 DeleteObject(a.edit_background);
+            if (a.chrome_background)
+                DeleteObject(a.chrome_background);
+            ui::close(a.painter);
             PostQuitMessage(a.exit_code);
             return 0;
         }

@@ -57,6 +57,9 @@ between the toolbar, page and zoom fields, search, and page list. The main menus
 document information, and any actions hidden when the window is narrow. Document controls are disabled
 until a PDF is open.
 
+The reader uses neutral dark surfaces, Segoe UI text, and blue keyboard-focus outlines. The page list
+keeps focus while you navigate with the arrow keys; Escape returns focus to the document.
+
 The UI renders in a worker thread, cancels obsolete render/search requests, caches page bitmaps, and prefetches adjacent pages when idle. Search reads text without rasterizing the page's images and graphics. The current UI displays one page at a time.
 
 ## Engine and command line
