@@ -5,6 +5,7 @@ Timing runs are serial. PNG writing and reference comparison are outside the
 engine timers. The file cache is not flushed; open_ms is not cold-disk latency.
 """
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import subprocess
@@ -107,6 +108,8 @@ def render_file(args, item, folder):
             summary = json.loads((folder / f"stdout-{first:06d}.json").read_text(encoding="utf-8"))
             result["warnings"] = sorted(set(result["warnings"] + summary.get("warnings", [])))
             result["private_bytes"] = summary.get("private_bytes")
+            result["encrypted"] = summary.get("encrypted", False)
+            result["repaired"] = summary.get("repaired", False)
         except (OSError, json.JSONDecodeError):
             pass
         if not opening:
@@ -136,8 +139,16 @@ def compare_file(args, item, folder, pymupdf):
                 try:
                     if not actual_path.exists():
                         raise RuntimeError("FastPDF image is missing")
-                    pixmap = document[index].get_pixmap(matrix=pymupdf.Matrix(args.scale, args.scale), colorspace=pymupdf.csRGB, alpha=False)
-                    reference = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+                    reference_path = folder / "reference" / actual_path.with_suffix(".png").name
+                    cached_path = reference_path
+                    if not cached_path.exists() and args.reuse_reference:
+                        cached_path = args.reuse_reference / item["id"] / "reference" / reference_path.name
+                    if cached_path.exists():
+                        with Image.open(cached_path) as cached:
+                            reference = cached.convert("RGB")
+                    else:
+                        pixmap = document[index].get_pixmap(matrix=pymupdf.Matrix(args.scale, args.scale), colorspace=pymupdf.csRGB, alpha=False)
+                        reference = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
                     with Image.open(actual_path) as actual:
                         row.update(compare_page(actual, reference))
                         # Store compact evidence after the measured process exits.
@@ -146,10 +157,9 @@ def compare_file(args, item, folder, pymupdf):
                             actual.save(actual_path.with_suffix(".png"), compress_level=1)
                     if actual_path.suffix == ".bmp":
                         actual_path.unlink()
-                    if row["flag"]:
-                        path = folder / "reference" / actual_path.with_suffix(".png").name
-                        path.parent.mkdir(exist_ok=True)
-                        reference.save(path)
+                    if (row["flag"] or args.cache_reference) and not reference_path.exists():
+                        reference_path.parent.mkdir(exist_ok=True)
+                        reference.save(reference_path, compress_level=1)
                 except Exception as error:
                     row.update(error=str(error), flag=True)
                 results.append(row)
@@ -157,6 +167,20 @@ def compare_file(args, item, folder, pymupdf):
         results.append({"error": str(error), "flag": True})
     write_json(folder / "comparison.json", results)
     return results
+
+
+def compare_task(args, item):
+    if args.reference_path:
+        sys.path.insert(0, str(args.reference_path.resolve()))
+    import pymupdf
+    folder = args.output / item["id"]
+    if args.resume and (folder / "comparison.json").exists():
+        comparisons = json.loads((folder / "comparison.json").read_text(encoding="utf-8"))
+    else:
+        comparisons = compare_file(args, item, folder, pymupdf)
+    return {"event": "compared", "id": item["id"], "pages": len(comparisons),
+            "flagged_pages": sum(r["flag"] for r in comparisons),
+            "errors": sum("error" in r for r in comparisons)}
 
 
 def main():
@@ -171,17 +195,49 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--skip-reference", action="store_true")
+    parser.add_argument("--compare-only", action="store_true")
+    parser.add_argument("--workers", type=int, default=4, help="Reference workers; timing is always serial")
+    parser.add_argument("--cache-reference", action="store_true", help="Keep every reference image for later checks")
+    parser.add_argument("--reuse-reference", type=Path, help="Reuse reference images from a matching prior run")
     args = parser.parse_args()
     if args.reference_path:
         sys.path.insert(0, str(args.reference_path.resolve()))
     import pymupdf
     inventory = json.loads(args.inventory.read_text(encoding="utf-8"))
+    if args.reuse_reference:
+        previous = json.loads((args.reuse_reference / "run.json").read_text(encoding="utf-8"))
+        if previous["scale"] != args.scale or previous["reference"] != pymupdf.VersionBind:
+            raise SystemExit("Reference cache scale or renderer version does not match")
     selected = set(args.ids.split(",")) if args.ids else None
     files = [r for r in inventory["files"] if not selected or r["id"] in selected]
     args.output.mkdir(parents=True, exist_ok=True)
-    write_json(args.output / "run.json", {"executable": str(args.exe.resolve()), "exe_sha256": hashlib.sha256(args.exe.read_bytes()).hexdigest(),
-               "scale": args.scale, "reference": pymupdf.VersionBind, "inventory": str(args.inventory.resolve()), "files": len(files),
-               "start_time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "threshold_ms": 500, "timeout_seconds": args.timeout})
+    metadata_path = args.output / "run.json"
+    identity = {"exe_sha256": hashlib.sha256(args.exe.read_bytes()).hexdigest(),
+                "inventory_sha256": hashlib.sha256(args.inventory.read_bytes()).hexdigest(),
+                "scale": args.scale, "reference": pymupdf.VersionBind, "profile": args.profile}
+    previous = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else None
+    if previous:
+        for key, value in identity.items():
+            if key in previous and previous[key] != value:
+                raise SystemExit(f"Existing run does not match {key}; use a new output folder")
+        if not args.resume and not args.compare_only:
+            raise SystemExit("Output already contains a run; use --resume or a new output folder")
+    if args.compare_only:
+        if not previous:
+            raise SystemExit("No timing run metadata exists in the output folder")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(compare_task, args, item) for item in files]
+            for future in concurrent.futures.as_completed(futures):
+                print(json.dumps(future.result()), flush=True)
+        previous["comparison_end_time"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        write_json(metadata_path, previous)
+        return
+    metadata = previous or {**identity, "executable": str(args.exe.resolve()),
+               "inventory": str(args.inventory.resolve()), "files": len(files),
+               "selected_ids": [item["id"] for item in files],
+               "start_time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "threshold_ms": 500,
+               "timeout_seconds": args.timeout}
+    write_json(metadata_path, metadata)
     for index, item in enumerate(files, 1):
         folder = args.output / item["id"]
         if args.resume and (folder / "render.json").exists():
@@ -199,6 +255,8 @@ def main():
               "open_ms": result.get("open_ms"), "slow_pages": sum(r.get("ms", 0) > 500 for r in result["samples"]),
               "errors": sum("error" in r for r in result["samples"]) + int("error" in result),
               "warnings": result["warnings"], "flagged_pages": sum(r["flag"] for r in comparisons)}), flush=True)
+    metadata["render_end_time"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    write_json(metadata_path, metadata)
 
 
 if __name__ == "__main__":
