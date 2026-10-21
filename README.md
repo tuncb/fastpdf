@@ -136,6 +136,22 @@ onward it is available in source builds, rather than the GitHub release download
 
 `pdfprobe` writes JSON with page counts, open/render timings, memory use, extracted text when requested, and compatibility warnings. Exit codes: 0 success, 2 error, 3 warnings with `--strict`. `--all` validates every page; PNG and text output refer to the selected `--page`. The benchmark includes the first render and subsequent renders with the engine's resource caches populated; the GUI also has a separate rendered-page cache. `--timings` separates individual samples, and `--profile` breaks down decoding work. `--full-resolution` disables resolution-aware image decoding, and `--image-workers 1` selects serial decoding. See the [measurement notes](docs/ARCHITECTURE.md#measuring-rendering) for the reproducible benchmark harness.
 
+For a long corpus check, use `--render-dir DIR` to save each page and
+`--progress FILE` to write an open record and each page result as JSON lines.
+Each progress record is flushed to disk. `--render-format bmp` selects fast,
+uncompressed image output. Image output time is outside the render timer.
+`--last-page N` sets the end of a page range that starts at `--page`.
+`--continue-on-error` keeps checking pages after a render error and returns exit
+code 2 if a page fails. The summary lists these errors in `samples` and gives
+their count in `failed_pages`.
+
+`scripts/audit-articles.py` uses these options to check a local corpus against
+PyMuPDF. It requires Pillow, NumPy, SciPy and PyMuPDF as development tools. It
+records every page result, warnings, timing, and image differences. The image
+comparison identifies pages for review; it is not a proof of PDF conformance.
+Its measurements use the existing file cache and do not measure cold-disk
+latency or the full time from GUI launch to display.
+
 The public procedural API is in [src/pdf.h](src/pdf.h) and [src/render.h](src/render.h). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for ownership, threading, resource limits, and optimization choices.
 
 ## Dependencies and ownership

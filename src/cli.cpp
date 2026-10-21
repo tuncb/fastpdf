@@ -50,6 +50,25 @@ static void write_profile(std::ostream& out, const pdf::RenderProfile& p) {
     }
     out << "]}";
 }
+static void save_bmp(const pdf::RenderedPage& page, const std::filesystem::path& path) {
+    BITMAPFILEHEADER header{};
+    BITMAPINFOHEADER info{};
+    header.bfType = 0x4d42;
+    header.bfOffBits = sizeof(header) + sizeof(info);
+    header.bfSize = header.bfOffBits + DWORD(page.pixels.size());
+    info.biSize = sizeof(info);
+    info.biWidth = LONG(page.width);
+    info.biHeight = -LONG(page.height);
+    info.biPlanes = 1;
+    info.biBitCount = 32;
+    info.biCompression = BI_RGB;
+    std::ofstream file(path, std::ios::binary);
+    pdf::require(bool(file), "Cannot open BMP output");
+    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    file.write(reinterpret_cast<const char*>(&info), sizeof(info));
+    file.write(reinterpret_cast<const char*>(page.pixels.data()), std::streamsize(page.pixels.size()));
+    pdf::require(bool(file), "Cannot write BMP output");
+}
 int wmain(int argc, wchar_t** argv) {
     if (argc < 2 || std::wstring_view(argv[1]) == L"--help") {
         std::cout
@@ -61,6 +80,11 @@ int wmain(int argc, wchar_t** argv) {
                "page\n  --benchmark N     Repeat rendering N times\n  --timings         Include per-render "
                "timings\n"
                "  --profile         Include rendering stage timings and image metadata\n"
+               "  --render-dir DIR  Save each rendered page as page-NNNNNN.png\n"
+               "  --render-format FORMAT  Use png (default) or uncompressed bmp in DIR\n"
+               "  --last-page N     Render from --page through this page\n"
+               "  --progress FILE   Flush open and page records as JSON lines\n"
+               "  --continue-on-error  Continue after a page error (exit code 2)\n"
                "  --image-workers N Decoder workers (0 automatic, 1 serial, maximum 16)\n"
                "  --full-resolution Disable resolution-aware image decoding\n  --password TEXT   Open a "
                "password-protected PDF\n  --strict          Exit with code 3 if compatibility warnings "
@@ -72,10 +96,12 @@ int wmain(int argc, wchar_t** argv) {
     bool com = false;
     int code = 0;
     try {
-        int page = 1, rotation = 0, repeats = 1;
+        int page = 1, last_page = 0, rotation = 0, repeats = 1;
         double scale = 1;
         bool text = false, all = false, strict = false, timings = false, benchmark = false;
-        std::filesystem::path output, extract;
+        bool continue_on_error = false;
+        bool bmp = false;
+        std::filesystem::path output, extract, render_dir, progress_path;
         std::string password;
         for (int i = 2; i < argc; ++i) {
             std::wstring arg = argv[i];
@@ -85,6 +111,8 @@ int wmain(int argc, wchar_t** argv) {
             };
             if (arg == L"--page")
                 page = std::stoi(next());
+            else if (arg == L"--last-page")
+                last_page = std::stoi(next());
             else if (arg == L"--scale")
                 scale = std::stod(next());
             else if (arg == L"--rotate")
@@ -93,6 +121,18 @@ int wmain(int argc, wchar_t** argv) {
                 output = next();
             else if (arg == L"--extract")
                 extract = next();
+            else if (arg == L"--render-dir")
+                render_dir = next();
+            else if (arg == L"--render-format") {
+                auto format = next();
+                pdf::require(format == L"png" || format == L"bmp", "Render format must be png or bmp");
+                bmp = format == L"bmp";
+            }
+            else if (arg == L"--progress") {
+                progress_path = next();
+                timings = true;
+            } else if (arg == L"--continue-on-error")
+                continue_on_error = true;
             else if (arg == L"--password")
                 password = pdf::utf8(next());
             else if (arg == L"--text")
@@ -119,34 +159,91 @@ int wmain(int argc, wchar_t** argv) {
                 pdf::fail("Unknown command line option");
         }
         pdf::require(page > 0 && repeats > 0 && repeats <= 1000, "Invalid page or benchmark count");
+        std::ofstream progress;
+        if (!progress_path.empty()) {
+            progress.open(progress_path, std::ios::binary);
+            pdf::require(bool(progress), "Cannot open progress output");
+            progress << std::fixed << std::setprecision(3);
+        }
+        if (!render_dir.empty())
+            std::filesystem::create_directories(render_dir);
         pdf::hr(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "Initialize COM");
         com = true;
         auto begin = std::chrono::steady_clock::now();
         pdf::open(doc, argv[1], password);
         double open_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        if (progress.is_open()) {
+            progress << "{\"event\":\"open\",\"pages\":" << doc.pages.size()
+                     << ",\"open_ms\":" << open_ms << "}\n" << std::flush;
+            pdf::require(bool(progress), "Cannot write progress output");
+        }
         pdf::require(size_t(page) <= doc.pages.size(), "Page number is out of range");
-        bool rendering = !output.empty() || all || benchmark || timings;
+        pdf::require(last_page == 0 || (last_page >= page && size_t(last_page) <= doc.pages.size()),
+                     "Last page is out of range");
+        bool rendering = !output.empty() || !render_dir.empty() || all || last_page || benchmark || timings;
         bool needed = rendering || text || !extract.empty();
         pdf::RenderedPage rendered;
         double total_ms = 0;
         size_t rendered_count = 0;
+        size_t sample_count = 0, failed_count = 0;
         std::ostringstream samples;
         samples << std::fixed << std::setprecision(3);
         if (needed) {
             pdf::init_renderer(renderer);
-            int first = all ? 1 : page, last = all ? int(doc.pages.size()) : page;
+            int first = all ? 1 : page;
+            int last = all ? int(doc.pages.size()) : (last_page ? last_page : page);
             for (int round = 0; round < repeats; ++round)
                 for (int p = first; p <= last; ++p) {
-                    auto result = pdf::render_page(renderer, doc, size_t(p - 1), scale, rotation, !rendering);
+                    pdf::RenderedPage result;
+                    size_t previous_warnings = doc.warnings.size();
+                    std::string error;
+                    try {
+                        result = pdf::render_page(renderer, doc, size_t(p - 1), scale, rotation, !rendering);
+                    } catch (const std::exception& e) {
+                        if (!continue_on_error)
+                            throw;
+                        error = e.what();
+                        ++failed_count;
+                        code = 2;
+                    }
                     if (timings) {
-                        if (rendered_count)
+                        if (sample_count++)
                             samples << ',';
-                        samples << "{\"page\":" << p << ",\"round\":" << round + 1
-                                << ",\"ms\":" << result.milliseconds;
-                        if (renderer.profiling)
-                            write_profile(samples, renderer.profile);
-                        samples << '}';
+                        std::ostringstream record;
+                        record << std::fixed << std::setprecision(3)
+                               << "{\"page\":" << p << ",\"round\":" << round + 1;
+                        if (!error.empty())
+                            record << ",\"error\":" << json(error);
+                        else {
+                            record << ",\"ms\":" << result.milliseconds
+                                   << ",\"width\":" << result.width << ",\"height\":" << result.height
+                                   << ",\"text_spans\":" << result.text.size();
+                            if (renderer.profiling)
+                                write_profile(record, renderer.profile);
+                        }
+                        record << ",\"new_warnings\":[";
+                        for (size_t i = previous_warnings; i < doc.warnings.size(); ++i) {
+                            if (i != previous_warnings)
+                                record << ',';
+                            record << json(doc.warnings[i]);
+                        }
+                        record << "]}";
+                        samples << record.str();
+                        if (progress.is_open()) {
+                            progress << record.str() << '\n' << std::flush;
+                            pdf::require(bool(progress), "Cannot write progress output");
+                        }
+                    }
+                    if (!error.empty())
+                        continue;
+                    if (!render_dir.empty()) {
+                        std::wostringstream name;
+                        name << L"page-" << std::setfill(L'0') << std::setw(6) << p << (bmp ? L".bmp" : L".png");
+                        if (bmp)
+                            save_bmp(result, render_dir / name.str());
+                        else
+                            pdf::save_png(renderer, result, render_dir / name.str());
                     }
                     total_ms += result.milliseconds;
                     ++rendered_count;
@@ -154,7 +251,7 @@ int wmain(int argc, wchar_t** argv) {
                         rendered = std::move(result);
                 }
         }
-        if (!output.empty())
+        if (!output.empty() && !rendered.pixels.empty())
             pdf::save_png(renderer, rendered, output);
         std::string extracted = needed ? pdf::utf8(pdf::page_text(rendered)) : "";
         if (!extract.empty()) {
@@ -171,6 +268,7 @@ int wmain(int argc, wchar_t** argv) {
                   << ",\"page\":" << page << ",\"objects_loaded\":" << doc.objects.size()
                   << ",\"open_ms\":" << open_ms << ",\"render_ms\":" << total_ms
                   << ",\"renders\":" << rendered_count << ",\"private_bytes\":" << memory.PrivateUsage
+                  << ",\"failed_pages\":" << failed_count
                   << ",\"repaired\":" << (doc.repaired ? "true" : "false")
                   << ",\"encrypted\":" << (doc.security.enabled ? "true" : "false");
         if (needed)
@@ -187,7 +285,7 @@ int wmain(int argc, wchar_t** argv) {
             std::cout << json(doc.warnings[i]);
         }
         std::cout << "]}\n";
-        if (strict && !doc.warnings.empty())
+        if (!code && strict && !doc.warnings.empty())
             code = 3;
     } catch (const std::exception& e) {
         std::cerr << "{\"error\":" << json(e.what()) << "}\n";
