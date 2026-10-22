@@ -37,7 +37,7 @@ def verify_file(args, item, run):
         raise RuntimeError(f"Source PDF changed: {item['id']}")
     folder = args.current / item["id"]
     before = read(args.previous / item["id"] / "comparison.json")
-    samples = read(folder / "render.json")["samples"]
+    samples = sorted(read(folder / "render.json")["samples"], key=lambda row: row["page"])
     expected = set(range(1, item["pages"] + 1))
     if len(before) != len(expected) or {row.get("page") for row in before} != expected:
         raise SystemExit(f"Incomplete prior comparison: {item['id']}")
@@ -54,6 +54,12 @@ def verify_file(args, item, run):
             return {"id": item["id"], "identical_pages": sum(row["comparison_source"] == "identical_pixels" for row in saved),
                     "replayed_pages": sum(row["comparison_source"] == "rendered_again" for row in saved),
                     "errors": 0, "flags": sum(row.get("flag", False) for row in saved)}
+    measured = {row["page"]: row for row in samples}
+    wanted = [row["page"] for row in samples if row.get("pixel_sha256") != before[row["page"]].get("pixel_sha256") or
+              before[row["page"]].get("actual_size") != [row.get("width"), row.get("height")] or
+              "error" in before[row["page"]]]
+    replayed = {}
+    replay_batches = 0
     rows = []
     with pymupdf.open(item["path"]) as document:
         for sample in samples:
@@ -67,18 +73,33 @@ def verify_file(args, item, run):
                 if digest == old.get("pixel_sha256") and old.get("actual_size") == [sample["width"], sample["height"]] and "error" not in old:
                     row = {**old, "comparison_source": "identical_pixels"}
                     inherited += 1
+                    # A short replay batch can include unchanged pages between
+                    # changed pages. Their hashes were checked with the batch.
+                    (folder / "pages" / f"page-{page:06d}.bmp").unlink(missing_ok=True)
                 else:
                     image = folder / "pages" / f"page-{page:06d}.png"
                     image.parent.mkdir(exist_ok=True)
-                    process = subprocess.run([str(args.exe.resolve()), item["path"], "--page", str(page),
-                        "--scale", str(run["scale"]), "--render-dir", str(image.parent),
-                        "--render-format", "bmp", "--pixel-hash"],
-                        capture_output=True, text=True, encoding="utf-8", timeout=180)
-                    if process.returncode:
-                        raise RuntimeError(process.stderr or process.stdout)
-                    replay = json.loads(process.stdout)["samples"][0]
-                    if replay.get("pixel_sha256") != digest:
-                        raise RuntimeError("The replay pixels differ from the measured run")
+                    if page not in replayed:
+                        # Bound temporary bitmaps to 32 pages per worker. This
+                        # avoids opening a large manual once for every page.
+                        last = max(number for number in wanted if page <= number < page + 32)
+                        process = subprocess.run([str(args.exe.resolve()), item["path"], "--page", str(page),
+                            "--last-page", str(last), "--scale", str(run["scale"]),
+                            "--render-dir", str(image.parent), "--render-format", "bmp", "--pixel-hash"],
+                            capture_output=True, text=True, encoding="utf-8", timeout=max(180, (last - page + 1) * 20))
+                        if process.returncode:
+                            raise RuntimeError(process.stderr or process.stdout)
+                        batch = json.loads(process.stdout)["samples"]
+                        replayed = {entry["page"]: entry for entry in batch}
+                        if len(batch) != last - page + 1 or set(replayed) != set(range(page, last + 1)):
+                            replayed = {}
+                            raise RuntimeError("The replay batch has incomplete page coverage")
+                        for number, entry in replayed.items():
+                            expected_page = measured[number]
+                            if any(entry.get(key) != expected_page.get(key) for key in ("pixel_sha256", "width", "height")):
+                                replayed = {}
+                                raise RuntimeError(f"The replay pixels differ from the measured run on page {number}")
+                        replay_batches += 1
                     reference = None
                     candidates = [args.previous / item["id"] / "reference" / image.name]
                     if args.reuse_reference:
@@ -113,6 +134,7 @@ def verify_file(args, item, run):
             rows.append(row)
     audit.write_json(folder / "comparison.json", rows)
     return {"id": item["id"], "identical_pages": inherited, "replayed_pages": changed, "errors": errors,
+            "replay_batches": replay_batches,
             "flags": sum(row.get("flag", False) for row in rows)}
 
 
