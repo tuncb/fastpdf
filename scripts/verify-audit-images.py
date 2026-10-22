@@ -8,6 +8,7 @@ import concurrent.futures
 import hashlib
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -97,6 +98,20 @@ def verify_file(args, item, run):
                         for number, entry in replayed.items():
                             expected_page = measured[number]
                             if any(entry.get(key) != expected_page.get(key) for key in ("pixel_sha256", "width", "height")):
+                                # Keep the evidence before a later batch can
+                                # overwrite this bitmap. Do not accept the replay.
+                                failures = folder / "replay-failures"
+                                failures.mkdir(exist_ok=True)
+                                diagnostic = failures / f"batch-{page:06d}-page-{number:06d}-{time.time_ns()}.json"
+                                audit.write_json(diagnostic, {
+                                    "start": page, "last": last, "page": number,
+                                    "actual": entry, "expected": expected_page,
+                                    "scale": run["scale"], "exe_sha256": run["exe_sha256"],
+                                    "input_sha256": item["sha256"], "command": process.args,
+                                })
+                                bitmap = image.parent / f"page-{number:06d}.bmp"
+                                if bitmap.exists():
+                                    shutil.copy2(bitmap, diagnostic.with_suffix(".bmp"))
                                 replayed = {}
                                 raise RuntimeError(f"The replay pixels differ from the measured run on page {number}")
                         replay_batches += 1
