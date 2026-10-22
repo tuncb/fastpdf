@@ -101,7 +101,8 @@ background services, or tray icons.
 - Selection: drag over text, then Ctrl+C. Ctrl+A selects the current page's extracted text.
 - Pan: middle-button drag. Scroll: mouse wheel, arrows, Space, or scrollbars.
 - Bookmarks: B or the bookmark icon. Links support document destinations and HTTP, HTTPS, and mail links.
-- Print: Ctrl+P.
+- Print: Ctrl+P. The print dialog includes a page preview with Previous and Next buttons.
+  The preview shows PDF page content and rotation. Printer margins and paper settings are not shown.
 - Exit: Alt+F4 or File → Exit.
 - About: F1 or the Help menu.
 - Installation and manual updates: Help menu.

@@ -24,7 +24,7 @@ constexpr int id_sidebar = 200, id_search = 201, id_toolbar = 202, id_page = 203
 constexpr int id_bookmark_tree = 205;
 constexpr int page_slot = 100, zoom_slot = 101, toolbar_height = 36;
 constexpr const wchar_t* menu_titles[] = {L"&File", L"&View", L"&Help"};
-enum class Job { open, render, search, print };
+enum class Job { open, render, search, preview, print };
 enum class Fit { page, width, custom };
 struct PageInfo {
     double width = 612, height = 792;
@@ -146,6 +146,11 @@ struct App {
     std::vector<PageInfo> pages;
     std::vector<Outline> outline;
     std::shared_ptr<RenderedPage> bitmap;
+    HWND print_preview = nullptr;
+    std::shared_ptr<RenderedPage> preview_bitmap;
+    std::wstring preview_error;
+    int preview_page = 0;
+    uint64_t preview_ticket = 0;
     int page = 0, rotation = 0, scroll_x = 0, scroll_y = 0;
     double scale = 1, bitmap_scale = 1, zoom = 1;
     Fit fit = Fit::page;
@@ -257,7 +262,7 @@ static void worker_run(Worker& w) {
                 } else {
                     require(generation == request.document && !document.pages.empty(),
                             "Document is no longer open");
-                    if (request.kind == Job::render)
+                    if (request.kind == Job::render || request.kind == Job::preview)
                         result.bitmap = render(request.page, request.scale, request.rotation);
                     else if (request.kind == Job::search) {
                         auto needle = lower(request.query);
@@ -371,9 +376,12 @@ static void enqueue(App& a, Request request) {
         a.render_ticket = request.ticket;
     if (request.kind == Job::search)
         a.search_ticket = request.ticket;
+    if (request.kind == Job::preview)
+        a.preview_ticket = request.ticket;
     {
         std::lock_guard lock(a.worker.mutex);
-        if (!a.worker.io_active)
+        // A preview must not cancel the reader's pending render or search.
+        if (!a.worker.io_active && request.kind != Job::preview)
             a.worker.cancel = true;
         if (request.kind == Job::open)
             a.worker.jobs.clear();
@@ -782,7 +790,9 @@ static INT_PTR dialog_theme_message(HWND window, UINT message, WPARAM wp, LPARAM
     }
     if (message == WM_NOTIFY) {
         const auto header = reinterpret_cast<const NMHDR*>(lp);
-        if (header->code == NM_CUSTOMDRAW && (header->idFrom == IDOK || header->idFrom == IDC_NOTICES)) {
+        if (header->code == NM_CUSTOMDRAW &&
+            (header->idFrom == IDOK || header->idFrom == IDC_NOTICES ||
+             header->idFrom == IDC_PREVIEW_PREVIOUS || header->idFrom == IDC_PREVIEW_NEXT)) {
             const auto draw = reinterpret_cast<const NMCUSTOMDRAW*>(lp);
             if (draw->dwDrawStage == CDDS_PREPAINT) {
                 const bool focused = (draw->uItemState & CDIS_FOCUS) != 0;
@@ -795,13 +805,164 @@ static INT_PTR dialog_theme_message(HWND window, UINT message, WPARAM wp, LPARAM
                 UINT flags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
                 if (SendMessageW(window, WM_QUERYUISTATE, 0, 0) & UISF_HIDEACCEL)
                     flags |= DT_HIDEPREFIX;
-                label(draw->hdc, draw->rc, text, ui::text,
+                label(draw->hdc, draw->rc, text, IsWindowEnabled(header->hwndFrom) ? ui::text : ui::disabled,
                       HFONT(SendMessageW(header->hwndFrom, WM_GETFONT, 0, 0)), flags);
                 SetWindowLongPtrW(window, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
                 return TRUE;
             }
         }
     }
+    return FALSE;
+}
+static void request_print_preview(App& a) {
+    if (!a.print_preview || a.pages.empty())
+        return;
+    a.preview_bitmap.reset();
+    a.preview_error.clear();
+    const auto caption =
+        L"Page " + std::to_wstring(a.preview_page + 1) + L" of " + std::to_wstring(a.pages.size());
+    SetDlgItemTextW(a.print_preview, IDC_PREVIEW_PAGE, caption.c_str());
+    EnableWindow(GetDlgItem(a.print_preview, IDC_PREVIEW_PREVIOUS), a.preview_page > 0);
+    EnableWindow(GetDlgItem(a.print_preview, IDC_PREVIEW_NEXT), a.preview_page + 1 < int(a.pages.size()));
+    RECT bounds{};
+    GetClientRect(GetDlgItem(a.print_preview, IDC_PREVIEW_IMAGE), &bounds);
+    auto page = a.pages[size_t(a.preview_page)];
+    if (page.rotation % 180)
+        std::swap(page.width, page.height);
+    Request request;
+    request.kind = Job::preview;
+    request.page = a.preview_page;
+    // Printing uses the PDF's rotation, not the reader's temporary view rotation.
+    request.scale = std::min(
+        {std::max(1L, bounds.right - 24) / page.width, std::max(1L, bounds.bottom - 24) / page.height, 2.0});
+    enqueue(a, std::move(request));
+    InvalidateRect(GetDlgItem(a.print_preview, IDC_PREVIEW_IMAGE), nullptr, TRUE);
+}
+static void paint_print_preview(App& a, const DRAWITEMSTRUCT& draw) {
+    const int saved = SaveDC(draw.hDC);
+    SetDCBrushColor(draw.hDC, ui::canvas);
+    FillRect(draw.hDC, &draw.rcItem, HBRUSH(GetStockObject(DC_BRUSH)));
+    if (a.preview_bitmap) {
+        const auto& image = *a.preview_bitmap;
+        RECT bounds = draw.rcItem;
+        InflateRect(&bounds, -12, -12);
+        const double scale = std::min(double(std::max(1L, bounds.right - bounds.left)) / image.width,
+                                      double(std::max(1L, bounds.bottom - bounds.top)) / image.height);
+        const int width = std::max(1, int(image.width * scale));
+        const int height = std::max(1, int(image.height * scale));
+        BITMAPINFO info{};
+        info.bmiHeader = {
+            sizeof(BITMAPINFOHEADER), LONG(image.width), -LONG(image.height), 1, 32, BI_RGB, 0, 0, 0, 0, 0};
+        SetStretchBltMode(draw.hDC, HALFTONE);
+        SetBrushOrgEx(draw.hDC, 0, 0, nullptr);
+        StretchDIBits(draw.hDC, (bounds.left + bounds.right - width) / 2,
+                      (bounds.top + bounds.bottom - height) / 2, width, height, 0, 0, int(image.width),
+                      int(image.height), image.pixels.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+    } else {
+        RECT bounds = draw.rcItem;
+        InflateRect(&bounds, -12, -12);
+        label(draw.hDC, bounds, a.preview_error.empty() ? L"Loading preview…" : a.preview_error, ui::muted,
+              HFONT(SendMessageW(a.print_preview, WM_GETFONT, 0, 0)), DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+    }
+    RestoreDC(draw.hDC, saved);
+}
+static INT_PTR CALLBACK print_preview_dialog(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    auto a = reinterpret_cast<App*>(GetWindowLongPtrW(window, DWLP_USER));
+    if (message == WM_INITDIALOG) {
+        a = reinterpret_cast<App*>(lp);
+        SetWindowLongPtrW(window, DWLP_USER, lp);
+        a->print_preview = window;
+        // The final panel can match the template size, so WM_SIZE is not guaranteed.
+        PostMessageW(window, WM_SIZE, 0, 0);
+        return TRUE;
+    }
+    if (!a)
+        return FALSE;
+    switch (message) {
+    case WM_SIZE: {
+        RECT bounds{};
+        GetClientRect(window, &bounds);
+        const int unit = MulDiv(10, int(GetDpiForWindow(window)), 96);
+        const int button_width = unit * 8, button_height = unit * 3;
+        const int bottom = bounds.bottom - unit - button_height;
+        MoveWindow(GetDlgItem(window, IDC_PREVIEW_TITLE), unit, unit,
+                   std::max(1L, bounds.right - unit * 2), unit * 2, TRUE);
+        MoveWindow(GetDlgItem(window, IDC_PREVIEW_IMAGE), unit, unit * 4,
+                   std::max(1L, bounds.right - unit * 2), std::max(1, bottom - unit * 5), TRUE);
+        MoveWindow(GetDlgItem(window, IDC_PREVIEW_PREVIOUS), unit, bottom, button_width, button_height, TRUE);
+        MoveWindow(GetDlgItem(window, IDC_PREVIEW_NEXT), bounds.right - unit - button_width, bottom,
+                   button_width, button_height, TRUE);
+        MoveWindow(GetDlgItem(window, IDC_PREVIEW_PAGE), unit * 2 + button_width, bottom,
+                   std::max(1L, bounds.right - unit * 4 - button_width * 2), button_height, TRUE);
+        PostMessageW(window, WM_APP, 0, 0);
+        return TRUE;
+    }
+    case WM_APP:
+        request_print_preview(*a);
+        return TRUE;
+    case WM_DRAWITEM:
+        if (wp == IDC_PREVIEW_IMAGE) {
+            paint_print_preview(*a, *reinterpret_cast<const DRAWITEMSTRUCT*>(lp));
+            return TRUE;
+        }
+        break;
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_PREVIEW_PREVIOUS || LOWORD(wp) == IDC_PREVIEW_NEXT) {
+            const int page = std::clamp(a->preview_page + (LOWORD(wp) == IDC_PREVIEW_NEXT ? 1 : -1), 0,
+                                        int(a->pages.size()) - 1);
+            if (page != a->preview_page) {
+                a->preview_page = page;
+                request_print_preview(*a);
+            }
+            return TRUE;
+        }
+        break;
+    case WM_NCDESTROY: {
+        a->print_preview = nullptr;
+        a->preview_bitmap.reset();
+        a->preview_error.clear();
+        std::lock_guard lock(a->worker.mutex);
+        std::erase_if(a->worker.jobs, [](const auto& job) { return job.kind == Job::preview; });
+        break;
+    }
+    }
+    return dialog_theme_message(window, message, wp, lp);
+}
+static UINT_PTR CALLBACK print_dialog_hook(HWND window, UINT message, WPARAM, LPARAM lp) {
+    if (message != WM_INITDIALOG)
+        return FALSE;
+    const auto dialog = reinterpret_cast<PRINTDLGW*>(lp);
+    auto& a = *reinterpret_cast<App*>(dialog->lCustData);
+    a.preview_page = a.page;
+    const auto pane = CreateDialogParamW(a.instance, MAKEINTRESOURCEW(IDD_PRINT_PREVIEW), window,
+                                         print_preview_dialog, LPARAM(&a));
+    if (!pane)
+        return FALSE;
+    RECT bounds{}, client_bounds{}, pane_bounds{};
+    GetWindowRect(window, &bounds);
+    GetClientRect(window, &client_bounds);
+    GetWindowRect(pane, &pane_bounds);
+    MONITORINFO monitor{sizeof(monitor)};
+    GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor);
+    const int frame_width = bounds.right - bounds.left - client_bounds.right;
+    const int frame_height = bounds.bottom - bounds.top - client_bounds.bottom;
+    const int pane_width = pane_bounds.right - pane_bounds.left;
+    const int pane_height = pane_bounds.bottom - pane_bounds.top;
+    const bool beside =
+        client_bounds.right + frame_width + pane_width <= monitor.rcWork.right - monitor.rcWork.left;
+    const int width =
+        beside ? client_bounds.right + pane_width : std::max<int>(client_bounds.right, pane_width);
+    const int height = std::min(beside ? std::max(client_bounds.bottom, LONG(pane_height))
+                                       : client_bounds.bottom + pane_height,
+                                monitor.rcWork.bottom - monitor.rcWork.top - frame_height);
+    const int x = std::clamp(bounds.left - (width - client_bounds.right) / 2, monitor.rcWork.left,
+                             std::max(monitor.rcWork.left, monitor.rcWork.right - width - frame_width));
+    const int y = std::clamp(bounds.top, monitor.rcWork.top,
+                             std::max(monitor.rcWork.top, monitor.rcWork.bottom - height - frame_height));
+    SetWindowPos(window, nullptr, x, y, width + frame_width, height + frame_height,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    MoveWindow(pane, beside ? client_bounds.right : 0, beside ? 0 : client_bounds.bottom,
+               beside ? pane_width : width, beside ? height : height - client_bounds.bottom, TRUE);
     return FALSE;
 }
 static INT_PTR CALLBACK licenses_dialog(HWND window, UINT message, WPARAM wp, LPARAM lp) {
@@ -1126,7 +1287,9 @@ static void command(App& a, int id) {
     else if (id == cmd_print && !a.pages.empty()) {
         PRINTDLGW dialog{sizeof(dialog)};
         dialog.hwndOwner = a.window;
-        dialog.Flags = PD_RETURNDC | PD_USEDEVMODECOPIESANDCOLLATE | PD_NOSELECTION;
+        dialog.Flags = PD_RETURNDC | PD_USEDEVMODECOPIESANDCOLLATE | PD_NOSELECTION | PD_ENABLEPRINTHOOK;
+        dialog.lpfnPrintHook = print_dialog_hook;
+        dialog.lCustData = LPARAM(&a);
         dialog.nMinPage = 1;
         dialog.nMaxPage = WORD(std::min<size_t>(a.pages.size(), 65535));
         dialog.nFromPage = dialog.nToPage = WORD(a.page + 1);
@@ -1554,6 +1717,14 @@ static void receive(App& a) {
     for (auto& result : results) {
         if (result.document != a.document && result.document != 0)
             continue;
+        if (result.kind == Job::preview) {
+            if (a.print_preview && result.ticket == a.preview_ticket) {
+                a.preview_bitmap = std::move(result.bitmap);
+                a.preview_error = std::move(result.error);
+                InvalidateRect(GetDlgItem(a.print_preview, IDC_PREVIEW_IMAGE), nullptr, TRUE);
+            }
+            continue;
+        }
         if (result.kind == Job::render && result.ticket != a.render_ticket)
             continue;
         if (result.kind == Job::search && result.ticket != a.search_ticket)
