@@ -15,6 +15,11 @@ static TextSpan span(std::wstring text, double x, double y) {
     result.bounds.x1 = x + result.text.size() * 5;
     return result;
 }
+static Rect mapped_box(Matrix matrix, Rect box) {
+    const auto a = transform(matrix, {box.x0, box.y0});
+    const auto b = transform(matrix, {box.x1, box.y1});
+    return {std::min(a.x, b.x), std::min(a.y, b.y), std::max(a.x, b.x), std::max(a.y, b.y)};
+}
 int main() {
     try {
         RenderedPage page;
@@ -48,6 +53,46 @@ int main() {
         boxes = search_rects(page, matches[0]);
         check(boxes.size() == 2 && boxes[0].y0 == 0 && boxes[1].y0 == 20,
               "Cross-line highlights stay on each line");
+        // Ableton's manual splits this word into A, b, l, e, and ton, with small
+        // kerning gaps. Every fragment used to get its own overlapping outline.
+        const std::vector<TextSpan> fragments{span(L"A", 10, 20), span(L"b", 15.08, 20),
+                                              span(L"l", 20.09, 20), span(L"e", 25.10, 20),
+                                              span(L"ton", 30.12, 20)};
+        const Matrix rotations[] = {
+            {1, 0, 0, -1, 0, 100}, {0, 1, 1, 0, 0, 0}, {-1, 0, 0, 1, 100, 0}, {0, -1, -1, 0, 100, 100}};
+        for (double scale : {0.75, 2.0})
+            for (auto rotation : rotations) {
+                page.page_matrix = multiply({scale, 0, 0, scale, 0, 0}, rotation);
+                page.text = fragments;
+                for (auto& fragment : page.text) {
+                    fragment.bounds = mapped_box(page.page_matrix, fragment.bounds);
+                    for (auto& character : fragment.characters)
+                        character = mapped_box(page.page_matrix, character);
+                }
+                matches = search_matches(search_text(page), L"Ableton", {});
+                check(matches.size() == 1, "Kerning fragments remain one match at every rotation");
+                boxes = search_rects(page, matches[0]);
+                const auto expected = mapped_box(page.page_matrix, {10, 20, 45.12, 30});
+                check(boxes.size() == 1 && std::abs(boxes[0].x0 - expected.x0) < 1e-9 &&
+                          std::abs(boxes[0].y0 - expected.y0) < 1e-9 &&
+                          std::abs(boxes[0].x1 - expected.x1) < 1e-9 &&
+                          std::abs(boxes[0].y1 - expected.y1) < 1e-9,
+                      "Split words have one highlight at every zoom and page rotation");
+                page.text = {span(L"serial", 0, 0), span(L"number", 0, 20)};
+                for (auto& fragment : page.text) {
+                    fragment.bounds = mapped_box(page.page_matrix, fragment.bounds);
+                    for (auto& character : fragment.characters)
+                        character = mapped_box(page.page_matrix, character);
+                }
+                matches = search_matches(search_text(page), L"serial number", {});
+                check(matches.size() == 1 && search_rects(page, matches[0]).size() == 2,
+                      "Rotated cross-line matches retain separate highlights");
+            }
+        page.page_matrix = {};
+        page.text = {span(L"left", 0, 0), span(L"right", 100, 0)};
+        matches = search_matches(search_text(page), L"left right", {});
+        check(matches.size() == 1 && search_rects(page, matches[0]).size() == 2,
+              "Highlights do not fill a gap between distant columns");
         page.text = {span(L"war", 0, 0), span(L"ranty", 15, 0)};
         check(search_matches(search_text(page), L"warranty", {}).size() == 1,
               "Adjacent PDF text fragments form one word");

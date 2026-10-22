@@ -322,15 +322,39 @@ static const char* regex_error_message(std::regex_constants::error_type error) {
 }
 std::vector<Rect> search_rects(const RenderedPage& page, const SearchMatch& match) {
     std::vector<Rect> result;
+    const auto to_page = inverse(page.page_matrix);
+    const auto page_box = [&](Rect box) {
+        // Page transforms contain scale and quarter turns, so opposite corners suffice.
+        const auto a = transform(to_page, {box.x0, box.y0});
+        const auto b = transform(to_page, {box.x1, box.y1});
+        return Rect{std::min(a.x, b.x), std::min(a.y, b.y), std::max(a.x, b.x), std::max(a.y, b.y)};
+    };
+    const auto append_box = [&](Rect box) {
+        if (!result.empty()) {
+            auto& previous = result.back();
+            const auto a = page_box(previous), b = page_box(box);
+            const double height = std::min(a.y1 - a.y0, b.y1 - b.y0);
+            const double gap = std::max(a.x0, b.x0) - std::min(a.x1, b.x1);
+            // Kerning can split a word into several PDF text runs. Join nearby
+            // fragments on the same line before painting their fill and outline.
+            if (height > 0 && std::abs(a.y0 - b.y0) <= height * 0.2 &&
+                std::abs(a.y1 - b.y1) <= height * 0.2 && gap <= height * 0.35) {
+                previous = {std::min(previous.x0, box.x0), std::min(previous.y0, box.y0),
+                            std::max(previous.x1, box.x1), std::max(previous.y1, box.y1)};
+                return;
+            }
+        }
+        result.push_back(box);
+    };
     for (const auto& piece : match.pieces) {
         if (piece.span >= page.text.size())
             continue;
         const auto& span = page.text[piece.span];
         if (span.characters.size() != span.text.size()) {
-            result.push_back(span.bounds);
+            append_box(span.bounds);
             continue;
         }
-        // Merge adjacent glyph boxes only within a text run. Keep line fragments separate.
+        // First collect the matching glyphs in this run, then join adjacent runs.
         std::optional<Rect> bounds;
         for (size_t i = piece.first; i < std::min(span.characters.size(), piece.first + piece.count); ++i) {
             const auto& r = span.characters[i];
@@ -344,7 +368,7 @@ std::vector<Rect> search_rects(const RenderedPage& page, const SearchMatch& matc
             }
         }
         if (bounds)
-            result.push_back(*bounds);
+            append_box(*bounds);
     }
     return result;
 }
