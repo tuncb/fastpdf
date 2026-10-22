@@ -15,7 +15,8 @@ inline constexpr COLORREF disabled = RGB(100, 100, 100);
 inline constexpr COLORREF focus = RGB(52, 107, 241);
 inline constexpr COLORREF link = RGB(114, 165, 255);
 inline constexpr COLORREF shadow = RGB(12, 12, 12);
-inline constexpr int radius = 6, sidebar_width = 160, sidebar_header = 32, row_height = 32;
+inline constexpr int radius = 6, sidebar_width = 320, sidebar_header = 32, row_height = 32;
+inline constexpr int sidebar_min_width = 160, document_min_width = 240, splitter_width = 6;
 
 // One reusable scratch surface for small UI shapes. Text stays at native resolution for ClearType.
 struct Painter {

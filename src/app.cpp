@@ -21,6 +21,7 @@
 using namespace pdf;
 constexpr UINT worker_message = WM_APP + 1;
 constexpr int id_sidebar = 200, id_search = 201, id_toolbar = 202, id_page = 203, id_zoom = 204;
+constexpr int id_bookmark_tree = 205;
 constexpr int page_slot = 100, zoom_slot = 101, toolbar_height = 36;
 constexpr const wchar_t* menu_titles[] = {L"&File", L"&View", L"&Help"};
 enum class Job { open, render, search, print };
@@ -124,6 +125,10 @@ constexpr ToolbarTool toolbar_tools[] = {
 };
 struct App {
     HWND window = nullptr, sidebar = nullptr, search = nullptr;
+    HWND bookmark_tree = nullptr;
+    std::vector<HTREEITEM> bookmark_items;
+    int sidebar_width = ui::sidebar_width, splitter_offset = 0;
+    bool resizing_sidebar = false, syncing_bookmarks = false;
     HWND toolbar = nullptr, page_edit = nullptr, zoom_edit = nullptr;
     HWND welcome_install = nullptr, welcome_portable = nullptr;
     HINSTANCE instance = nullptr;
@@ -390,7 +395,16 @@ static RECT viewport(App& a) {
     RECT r = client(a);
     r.top = px(a, toolbar_height + (a.find_open ? 40 : 0));
     r.bottom -= px(a, 30);
-    r.left = a.show_sidebar && !a.pages.empty() ? px(a, ui::sidebar_width) : 0;
+    if (a.show_sidebar && !a.pages.empty()) {
+        int maximum = std::max(0, int(r.right) - px(a, ui::document_min_width));
+        r.left = std::clamp(px(a, a.sidebar_width), std::min(px(a, ui::sidebar_min_width), maximum), maximum);
+    }
+    return r;
+}
+static RECT sidebar_splitter(App& a) {
+    auto r = viewport(a);
+    r.right = r.left;
+    r.left = std::max(0L, r.right - px(a, ui::splitter_width));
     return r;
 }
 static std::pair<double, double> dimensions(App& a) {
@@ -506,6 +520,9 @@ static void fonts(App& a) {
                     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     SendMessageW(a.sidebar, WM_SETFONT, WPARAM(a.font), TRUE);
     SendMessageW(a.sidebar, LB_SETITEMHEIGHT, 0, px(a, ui::row_height));
+    SendMessageW(a.bookmark_tree, WM_SETFONT, WPARAM(a.font), TRUE);
+    TreeView_SetItemHeight(a.bookmark_tree, px(a, ui::row_height));
+    TreeView_SetIndent(a.bookmark_tree, px(a, 20));
     SendMessageW(a.search, WM_SETFONT, WPARAM(a.small_font), TRUE);
     for (auto control : {a.welcome_install, a.welcome_portable})
         SendMessageW(control, WM_SETFONT, WPARAM(a.font), TRUE);
@@ -518,9 +535,17 @@ static void layout(App& a) {
     auto r = client(a);
     int top = px(a, toolbar_height + (a.find_open ? 40 : 0));
     int list_top = top + px(a, ui::sidebar_header);
-    MoveWindow(a.sidebar, 0, list_top, px(a, ui::sidebar_width) - 1,
-               std::max<LONG>(0, r.bottom - list_top - px(a, 30)), TRUE);
-    ShowWindow(a.sidebar, a.show_sidebar && !a.pages.empty() ? SW_SHOW : SW_HIDE);
+    for (auto control : {a.sidebar, a.bookmark_tree}) {
+        MoveWindow(control, 0, list_top, sidebar_splitter(a).left,
+                   std::max<LONG>(0, r.bottom - list_top - px(a, 30)), TRUE);
+        // Custom rows cover the full width, including the area outside native text bounds.
+        InvalidateRect(control, nullptr, FALSE);
+        bool visible =
+            a.show_sidebar && !a.pages.empty() && (control == a.bookmark_tree ? a.bookmarks : !a.bookmarks);
+        if (!visible && GetFocus() == control)
+            SetFocus(a.window);
+        ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
+    }
     MoveWindow(a.search, px(a, 18), px(a, toolbar_height + 11),
                std::max<LONG>(80, std::min<LONG>(px(a, 420), r.right - px(a, 140))), px(a, 18), TRUE);
     ShowWindow(a.search, a.find_open ? SW_SHOW : SW_HIDE);
@@ -547,10 +572,36 @@ static void set_sidebar_hover(App& a, int hover) {
     }
     a.sidebar_hover = hover;
 }
+static void rebuild_bookmarks(App& a) {
+    a.syncing_bookmarks = true;
+    SendMessageW(a.bookmark_tree, WM_SETREDRAW, FALSE, 0);
+    TreeView_DeleteAllItems(a.bookmark_tree);
+    a.bookmark_items.clear();
+    std::vector<HTREEITEM> parents;
+    for (size_t i = 0; i < a.outline.size(); ++i) {
+        const auto& entry = a.outline[i];
+        size_t depth = std::min(size_t(std::max(0, entry.depth)), parents.size());
+        parents.resize(depth);
+        std::wstring title = entry.title;
+        std::replace(title.begin(), title.end(), L'\t', L' ');
+        TVINSERTSTRUCTW item{};
+        item.hParent = parents.empty() ? TVI_ROOT : parents.back();
+        item.hInsertAfter = TVI_LAST;
+        item.item.mask = TVIF_TEXT | TVIF_PARAM;
+        item.item.pszText = title.data();
+        item.item.lParam = LPARAM(i);
+        auto handle = TreeView_InsertItem(a.bookmark_tree, &item);
+        a.bookmark_items.push_back(handle);
+        parents.push_back(handle);
+    }
+    SendMessageW(a.bookmark_tree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(a.bookmark_tree, nullptr, FALSE);
+    a.syncing_bookmarks = false;
+}
 static void update_sidebar(App& a, bool reset = false) {
-    int current = reset ? -1 : int(SendMessageW(a.sidebar, LB_GETCURSEL, 0, 0));
     int selected = a.pages.empty() ? -1 : a.page;
     if (a.bookmarks) {
+        auto current = TreeView_GetSelection(a.bookmark_tree);
         selected = -1;
         int best_page = -1;
         for (size_t i = 0; i < a.outline.size(); ++i) {
@@ -561,11 +612,22 @@ static void update_sidebar(App& a, bool reset = false) {
             }
         }
         // Keep the user's choice when several bookmarks have the same destination.
-        if (best_page >= 0 && current >= 0 && size_t(current) < a.outline.size() &&
-            a.outline[size_t(current)].page == best_page)
-            selected = current;
+        for (size_t i = 0; best_page >= 0 && i < a.bookmark_items.size(); ++i)
+            if (a.bookmark_items[i] == current && a.outline[i].page == best_page)
+                selected = int(i);
+        HTREEITEM item = selected >= 0 ? a.bookmark_items[size_t(selected)] : nullptr;
+        // Select a visible ancestor without opening a branch the user collapsed.
+        for (auto parent = TreeView_GetParent(a.bookmark_tree, item); parent;
+             parent = TreeView_GetParent(a.bookmark_tree, parent))
+            if (!(TreeView_GetItemState(a.bookmark_tree, parent, TVIS_EXPANDED) & TVIS_EXPANDED))
+                item = parent;
+        a.syncing_bookmarks = true;
+        if (current != item)
+            TreeView_SelectItem(a.bookmark_tree, item);
+        a.syncing_bookmarks = false;
+        return;
     }
-    int count = int(a.bookmarks ? a.outline.size() : a.pages.size());
+    int count = int(a.pages.size());
     if (reset || SendMessageW(a.sidebar, LB_GETCOUNT, 0, 0) != count) {
         // LB_SETCOUNT resets the selection and caret, even when the count is unchanged.
         SendMessageW(a.sidebar, LB_SETCOUNT, WPARAM(count), 0);
@@ -586,6 +648,7 @@ static void load_file(App& a, const std::wstring& path, const std::wstring& pass
     ++a.document;
     a.pages.clear();
     a.outline.clear();
+    rebuild_bookmarks(a);
     a.bitmap.reset();
     a.selected.clear();
     a.find_open = false;
@@ -1215,16 +1278,55 @@ static void paint_sidebar_item(App& a, HDC dc, RECT rect, int index, bool select
     ui::control(a.painter, dc, row, a.dpi, ui::chrome, fill, ui::focus, focused ? 2 : 0);
     rect.left = row.left + px(a, 10);
     rect.right = row.right - px(a, 10);
-    std::wstring text;
-    if (a.bookmarks && size_t(index) < a.outline.size()) {
-        const auto& outline = a.outline[size_t(index)];
-        text = outline.title;
-        std::replace(text.begin(), text.end(), L'\t', L' ');
-        rect.left += px(a, std::min(outline.depth, 5) * 12);
-    } else
-        text = L"Page " + std::to_wstring(index + 1);
+    std::wstring text = L"Page " + std::to_wstring(index + 1);
     label(dc, rect, text, selected || index == a.sidebar_hover ? ui::text : ui::muted,
           selected ? a.selected_font : a.font);
+}
+static LRESULT paint_bookmark(App& a, NMTVCUSTOMDRAW& draw) {
+    if (draw.nmcd.dwDrawStage == CDDS_PREPAINT)
+        return CDRF_NOTIFYITEMDRAW;
+    if (draw.nmcd.dwDrawStage != CDDS_ITEMPREPAINT)
+        return CDRF_DODEFAULT;
+    auto item = HTREEITEM(draw.nmcd.dwItemSpec);
+    size_t index = size_t(draw.nmcd.lItemlParam);
+    if (index >= a.outline.size())
+        return CDRF_SKIPDEFAULT;
+    RECT text{}, row{};
+    TreeView_GetItemRect(a.bookmark_tree, item, &text, TRUE);
+    GetClientRect(a.bookmark_tree, &row);
+    row.top = text.top;
+    row.bottom = text.bottom;
+    HDC dc = draw.nmcd.hdc;
+    fill_rect(dc, row, ui::chrome);
+    InflateRect(&row, -px(a, 8), -px(a, 2));
+    bool selected = TreeView_GetSelection(a.bookmark_tree) == item;
+    bool focused = selected && GetFocus() == a.bookmark_tree;
+    ui::control(a.painter, dc, row, a.dpi, ui::chrome, selected ? ui::selected : ui::chrome, ui::focus,
+                focused ? 2 : 0);
+    if (TreeView_GetChild(a.bookmark_tree, item)) {
+        int x = text.left - px(a, 10), y = (text.top + text.bottom) / 2, d = px(a, 3);
+        bool expanded = (TreeView_GetItemState(a.bookmark_tree, item, TVIS_EXPANDED) & TVIS_EXPANDED) != 0;
+        POINT points[3];
+        if (expanded) {
+            points[0] = {x - d, y - d / 2};
+            points[1] = {x, y + d / 2};
+            points[2] = {x + d, y - d / 2};
+        } else {
+            points[0] = {x - d / 2, y - d};
+            points[1] = {x + d / 2, y};
+            points[2] = {x - d / 2, y + d};
+        }
+        auto pen = CreatePen(PS_SOLID, std::max(1, px(a, 1)), ui::muted);
+        auto old = SelectObject(dc, pen);
+        Polyline(dc, points, 3);
+        SelectObject(dc, old);
+        DeleteObject(pen);
+    }
+    text.right = row.right - px(a, 10);
+    std::wstring title = a.outline[index].title;
+    std::replace(title.begin(), title.end(), L'\t', L' ');
+    label(dc, text, title, selected ? ui::text : ui::muted, selected ? a.selected_font : a.font);
+    return CDRF_SKIPDEFAULT;
 }
 
 static void paint_toolbar(App& a, HDC dc) {
@@ -1314,6 +1416,9 @@ static void paint_app(App& a, HDC dc) {
     if (a.show_sidebar && !a.pages.empty()) {
         fill_rect(dc, {0, vp.top, vp.left, vp.bottom}, ui::chrome);
         fill_rect(dc, {vp.left - 1, vp.top, vp.left, vp.bottom}, ui::border);
+        auto splitter = sidebar_splitter(a);
+        int center = (splitter.left + splitter.right) / 2;
+        fill_rect(dc, {center, vp.top, center + 1, vp.bottom}, a.resizing_sidebar ? ui::focus : ui::border);
         label(dc, {px(a, 18), vp.top, vp.left - px(a, 12), vp.top + px(a, ui::sidebar_header)},
               a.bookmarks ? L"Bookmarks" : L"Pages", ui::muted, a.small_font);
     }
@@ -1392,8 +1497,9 @@ static void screenshot(App& a) {
     require(bitmap != nullptr, "Cannot allocate UI capture");
     auto old = SelectObject(memory, bitmap);
     paint_app(a, memory);
-    for (auto control : {a.page_edit, a.zoom_edit, a.search}) {
-        if (control == a.search && !a.find_open)
+    for (auto control : {a.page_edit, a.zoom_edit, a.search, a.bookmark_tree}) {
+        if ((control == a.search && !a.find_open) ||
+            (control == a.bookmark_tree && (!a.show_sidebar || !a.bookmarks || a.pages.empty())))
             continue;
         RECT rect{};
         GetWindowRect(control, &rect);
@@ -1403,16 +1509,16 @@ static void screenshot(App& a) {
         SendMessageW(control, WM_PRINT, WPARAM(memory), PRF_CLIENT | PRF_NONCLIENT | PRF_ERASEBKGND);
         RestoreDC(memory, saved);
     }
-    if (a.show_sidebar && !a.pages.empty()) {
+    if (a.show_sidebar && !a.pages.empty() && !a.bookmarks) {
         auto vp = viewport(a);
         int top = vp.top + px(a, ui::sidebar_header);
         int first = int(SendMessageW(a.sidebar, LB_GETTOPINDEX, 0, 0));
         int count = int(SendMessageW(a.sidebar, LB_GETCOUNT, 0, 0));
         int selected = int(SendMessageW(a.sidebar, LB_GETCURSEL, 0, 0));
         int saved = SaveDC(memory);
-        IntersectClipRect(memory, 0, top, vp.left - 1, vp.bottom);
+        IntersectClipRect(memory, 0, top, sidebar_splitter(a).left, vp.bottom);
         for (int i = std::max(0, first); i < count && top < vp.bottom; ++i) {
-            paint_sidebar_item(a, memory, {0, top, vp.left - 1, top + px(a, ui::row_height)}, i,
+            paint_sidebar_item(a, memory, {0, top, sidebar_splitter(a).left, top + px(a, ui::row_height)}, i,
                                i == selected, false);
             top += px(a, ui::row_height);
         }
@@ -1472,6 +1578,7 @@ static void receive(App& a) {
         if (result.kind == Job::open) {
             a.pages = std::move(result.pages);
             a.outline = std::move(result.outline);
+            rebuild_bookmarks(a);
             a.bookmarks = true;
             a.show_sidebar = !a.outline.empty();
             a.status = result.message;
@@ -1577,13 +1684,14 @@ static LRESULT CALLBACK input_frame_proc(HWND window, UINT message, WPARAM wp, L
 static LRESULT CALLBACK sidebar_proc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR,
                                      DWORD_PTR data) {
     auto& a = *reinterpret_cast<App*>(data);
-    if (message == WM_MOUSEMOVE) {
+    if (window == a.sidebar && message == WM_MOUSEMOVE) {
         DWORD item = DWORD(SendMessageW(window, LB_ITEMFROMPOINT, 0, lp));
         int hover = HIWORD(item) ? -1 : int(LOWORD(item));
         set_sidebar_hover(a, hover);
         TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
         TrackMouseEvent(&tracking);
-    } else if (message == WM_MOUSELEAVE || message == WM_VSCROLL || message == WM_MOUSEWHEEL) {
+    } else if (window == a.sidebar &&
+               (message == WM_MOUSELEAVE || message == WM_VSCROLL || message == WM_MOUSEWHEEL)) {
         set_sidebar_hover(a, -1);
     } else if (message == WM_KEYDOWN) {
         if (wp == VK_ESCAPE) {
@@ -1794,6 +1902,16 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                                             LBS_NOINTEGRALHEIGHT,
                                         0, 0, 0, 0, window, HMENU(INT_PTR(id_sidebar)), a.instance, nullptr);
             SetWindowSubclass(a.sidebar, sidebar_proc, 1, DWORD_PTR(&a));
+            a.bookmark_tree =
+                CreateWindowExW(0, WC_TREEVIEWW, L"Bookmarks",
+                                WS_CHILD | WS_TABSTOP | TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS |
+                                    TVS_FULLROWSELECT | TVS_NOTOOLTIPS | TVS_DISABLEDRAGDROP,
+                                0, 0, 0, 0, window, HMENU(INT_PTR(id_bookmark_tree)), a.instance, nullptr);
+            SetWindowTheme(a.bookmark_tree, L"", L"");
+            TreeView_SetBkColor(a.bookmark_tree, ui::chrome);
+            TreeView_SetTextColor(a.bookmark_tree, ui::text);
+            TreeView_SetLineColor(a.bookmark_tree, ui::border);
+            SetWindowSubclass(a.bookmark_tree, sidebar_proc, 1, DWORD_PTR(&a));
             a.search = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP, 0, 0, 0, 0,
                                        window, HMENU(INT_PTR(id_search)), a.instance, nullptr);
             SendMessageW(a.search, EM_SETCUEBANNER, TRUE, LPARAM(L"Find in document"));
@@ -1838,6 +1956,18 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         }
         case WM_NOTIFY: {
             auto header = reinterpret_cast<NMHDR*>(lp);
+            if (header->hwndFrom == a.bookmark_tree) {
+                if (header->code == NM_CUSTOMDRAW)
+                    return paint_bookmark(a, *reinterpret_cast<NMTVCUSTOMDRAW*>(lp));
+                if (header->code == TVN_SELCHANGEDW && !a.syncing_bookmarks) {
+                    auto change = reinterpret_cast<NMTREEVIEWW*>(lp);
+                    size_t index = size_t(change->itemNew.lParam);
+                    if (change->action != TVC_UNKNOWN && index < a.outline.size() &&
+                        a.outline[index].page >= 0)
+                        goto_page(a, a.outline[index].page);
+                    return 0;
+                }
+            }
             if (header->hwndFrom == a.toolbar && header->code == TBN_GETINFOTIPW) {
                 auto tip = reinterpret_cast<NMTBGETINFOTIPW*>(lp);
                 for (const auto& tool : toolbar_tools)
@@ -2027,11 +2157,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             if (LOWORD(wp) == id_sidebar && HIWORD(wp) == LBN_SELCHANGE) {
                 int index = int(SendMessageW(a.sidebar, LB_GETCURSEL, 0, 0));
                 if (index >= 0) {
-                    int page = a.bookmarks
-                                   ? (size_t(index) < a.outline.size() ? a.outline[size_t(index)].page : -1)
-                                   : index;
-                    if (page >= 0)
-                        goto_page(a, page);
+                    goto_page(a, index);
                 }
             } else if (LOWORD(wp) < 100)
                 command(a, LOWORD(wp));
@@ -2075,6 +2201,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         }
         case WM_LBUTTONDOWN: {
             POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            auto splitter = sidebar_splitter(a);
+            if (PtInRect(&splitter, p)) {
+                a.resizing_sidebar = true;
+                a.splitter_offset = viewport(a).left - p.x;
+                SetCapture(window);
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                return 0;
+            }
             auto vp = viewport(a);
             if (PtInRect(&vp, p) && a.bitmap) {
                 SetFocus(window);
@@ -2100,6 +2234,22 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             return 0;
         case WM_MOUSEMOVE: {
             POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (a.resizing_sidebar) {
+                int maximum = std::max(0, int(client(a).right) - px(a, ui::document_min_width));
+                int width = std::clamp(int(p.x) + a.splitter_offset,
+                                       std::min(px(a, ui::sidebar_min_width), maximum), maximum);
+                a.sidebar_width = MulDiv(width, 96, int(a.dpi));
+                layout(a);
+                SetTimer(window, 1, 120, nullptr);
+                InvalidateRect(window, nullptr, FALSE);
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                return 0;
+            }
+            auto splitter = sidebar_splitter(a);
+            if (PtInRect(&splitter, p)) {
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                return 0;
+            }
             if (a.panning) {
                 a.scroll_x = a.pan_x - (p.x - a.pan_start.x);
                 a.scroll_y = a.pan_y - (p.y - a.pan_start.y);
@@ -2121,6 +2271,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             return 0;
         }
         case WM_LBUTTONUP:
+            if (a.resizing_sidebar) {
+                a.resizing_sidebar = false;
+                ReleaseCapture();
+                KillTimer(window, 1);
+                request_render(a);
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
             if (a.dragging) {
                 a.dragging = false;
                 ReleaseCapture();
@@ -2141,7 +2299,21 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             return 0;
         case WM_CAPTURECHANGED:
             a.dragging = a.panning = false;
+            a.resizing_sidebar = false;
+            InvalidateRect(window, nullptr, FALSE);
             return 0;
+        case WM_SETCURSOR:
+            if (LOWORD(lp) == HTCLIENT) {
+                POINT point{};
+                GetCursorPos(&point);
+                ScreenToClient(window, &point);
+                auto splitter = sidebar_splitter(a);
+                if (a.resizing_sidebar || PtInRect(&splitter, point)) {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                    return TRUE;
+                }
+            }
+            break;
         case WM_CONTEXTMENU: {
             HMENU menu = CreatePopupMenu();
             AppendMenuW(menu, MF_STRING, 1000, L"Copy page or selected text\tCtrl+C");
@@ -2280,7 +2452,8 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
             deployment::start_uninstall();
         return 0;
     }
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_LINK_CLASS};
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_LINK_CLASS |
+                                                        ICC_TREEVIEW_CLASSES};
     InitCommonControlsEx(&controls);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     App app;
@@ -2371,8 +2544,8 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (message.message == WM_KEYDOWN && message.wParam == VK_TAB) {
             std::vector<HWND> order{app.window, app.toolbar};
-            for (auto control : {app.page_edit, app.zoom_edit, app.search, app.sidebar, app.welcome_install,
-                                 app.welcome_portable})
+            for (auto control : {app.page_edit, app.zoom_edit, app.search, app.sidebar, app.bookmark_tree,
+                                 app.welcome_install, app.welcome_portable})
                 if (IsWindowVisible(control) && IsWindowEnabled(control))
                     order.push_back(control);
             auto it = std::find(order.begin(), order.end(), GetFocus());

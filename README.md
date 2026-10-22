@@ -115,6 +115,9 @@ until a PDF is open.
 
 The reader uses neutral dark surfaces, Segoe UI text, and blue keyboard-focus outlines. The page list
 keeps focus while you navigate with the arrow keys; Escape returns focus to the document.
+Bookmarks use a tree with collapsed branches when you open a document. Click an arrow, or use
+the Left and Right keys, to collapse or expand a branch. Drag the right edge of the Bookmarks
+or Pages pane to change its width. The default width is 320 pixels at 100% display scaling.
 
 The UI renders in a worker thread, cancels obsolete render/search requests, caches page bitmaps, and prefetches adjacent pages when idle. Search reads text without rasterizing the page's images and graphics. The current UI displays one page at a time.
 

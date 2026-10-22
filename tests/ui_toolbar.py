@@ -98,47 +98,107 @@ def rect(hwnd):
 
 
 def check_bookmarks(window, toolbar, page):
-    sidebar = user.GetDlgItem(window, 200)
+    tree = user.GetDlgItem(window, 205)
     assert user.SendMessageW(toolbar, TB_ISBUTTONCHECKED, 10, 0), "Bookmarks did not open by default"
+    next_item = lambda item, relation: user.SendMessageW(tree, 0x110A, relation, item)
+    roots = []
+    item = next_item(0, 0)  # TVGN_ROOT
+    while item:
+        roots.append(item)
+        item = next_item(item, 1)  # TVGN_NEXT
+    assert len(roots) == 5, "Bookmark hierarchy was flattened"
+    child = next_item(roots[1], 4)  # TVGN_CHILD
+    assert child, "Child bookmark is missing"
+
+    def expanded(item):
+        return bool(user.SendMessageW(tree, 0x1127, item, 0x20) & 0x20)  # TVM_GETITEMSTATE
 
     def selection(expected):
-        assert user.SendMessageW(sidebar, 0x188, 0, 0) == expected, "Wrong selected bookmark"
-        if expected >= 0:
-            assert user.SendMessageW(sidebar, 0x19F, 0, 0) == expected, "Bookmark focus does not match selection"
+        assert next_item(0, 9) == expected, "Wrong selected bookmark"
 
-    def point(index):
-        row = w.RECT()
-        assert user.SendMessageW(sidebar, 0x198, index, c.addressof(row)) != -1  # LB_GETITEMRECT
-        return (((row.top + row.bottom) // 2) << 16) | 20
+    def click_row(index, x=60):
+        dpi = user.GetDpiForWindow(window)
+        point = (((index * 32 + 16) * dpi // 96) << 16) | (x * dpi // 96)
+        user.SendMessageW(tree, 0x201, 1, point)
+        user.SendMessageW(tree, 0x202, 0, point)
 
-    # Click a child that shares its destination with the preceding parent bookmark.
-    user.SendMessageW(sidebar, 0x201, 1, point(2))
-    user.SendMessageW(sidebar, 0x202, 0, point(2))
+    assert not expanded(roots[1]), "Bookmarks must start collapsed"
+    click_row(1, 10)  # Expand with the disclosure button without changing page.
+    assert expanded(roots[1]) and text(page) == "1"
+    click_row(2)
     assert text(page) == "2"
-    selection(2)
-    assert focused(window) == sidebar, "Bookmark click lost list focus"
+    selection(child)
+    assert focused(window) == tree, "Bookmark click lost tree focus"
     for index in (0, 3, 1, 2, 0):
-        user.SendMessageW(sidebar, 0x200, 0, point(index))  # WM_MOUSEMOVE
-        user.SendMessageW(sidebar, 0xF, 0, 0)  # WM_PAINT
-        selection(2)
-    user.SendMessageW(sidebar, 0x2A3, 0, 0)  # WM_MOUSELEAVE
-    selection(2)
+        user.SendMessageW(tree, 0x200, 0, ((index * 32 + 16) << 16) | 60)
+        user.SendMessageW(tree, 0xF, 0, 0)
+        selection(child)
 
-    # Page navigation selects the nearest destination, even if the outline is not sorted.
     user.SendMessageW(window, WM_COMMAND, 3, 0)
-    selection(3)
+    selection(roots[2])
     user.SendMessageW(window, WM_COMMAND, 2, 0)
-    selection(1)
-    user.SendMessageW(sidebar, WM_KEYDOWN, 0x28, 0)
-    selection(2)  # A second bookmark on the same page must remain selectable.
-    user.SendMessageW(sidebar, WM_KEYDOWN, 0x28, 0)
-    selection(3)
+    selection(roots[1])
+    user.SendMessageW(tree, WM_KEYDOWN, 0x28, 0)
+    selection(child)  # A child on the same page must remain selectable.
+    user.SendMessageW(tree, WM_KEYDOWN, 0x28, 0)
+    selection(roots[2])
     assert text(page) == "3"
     user.SendMessageW(window, WM_COMMAND, 3, 0)
     assert text(page) == "4"
-    selection(3)  # Keep the section selected on pages with no bookmark destination.
+    selection(roots[2])
     enter(page, "1")
-    selection(-1)  # The first bookmark starts on page 2.
+    selection(0)
+
+    click_row(1)
+    selection(roots[1])
+    user.SendMessageW(tree, WM_KEYDOWN, 0x25, 0)  # Left collapses a branch.
+    wait_for(lambda: not expanded(roots[1]), "Left collapses the branch")
+    user.SendMessageW(tree, WM_KEYDOWN, 0x27, 0)  # Right expands it.
+    wait_for(lambda: expanded(roots[1]), "Right expands the branch")
+    user.SendMessageW(window, WM_COMMAND, 9, 0)
+    user.SendMessageW(window, WM_COMMAND, 10, 0)
+    assert expanded(roots[1]), "Changing pane mode lost expansion state"
+    click_row(1, 10)
+    assert not expanded(roots[1])
+    enter(page, "3")
+    enter(page, "2")
+    assert not expanded(roots[1]), "Page navigation opened a collapsed branch"
+    user.SendMessageW(tree, WM_KEYDOWN, 27, 0)
+    assert focused(window) == window
+    enter(page, "1")
+
+
+def check_sidebar_resize(window, toolbar):
+    dpi = user.GetDpiForWindow(window)
+    scale = lambda value: (value * dpi + 48) // 96
+    width = lambda control: rect(control).right - rect(control).left
+    tree, pages = user.GetDlgItem(window, 205), user.GetDlgItem(window, 200)
+    assert width(pages) == scale(320) - scale(6), "Default pane width is not doubled"
+    y = scale(120)
+
+    def drag(start, end):
+        user.SendMessageW(window, 0x201, 1, (y << 16) | start)
+        user.SendMessageW(window, 0x200, 1, (y << 16) | (end & 0xFFFF))
+        user.SendMessageW(window, 0x202, 0, (y << 16) | (end & 0xFFFF))
+
+    drag(scale(317), scale(457))
+    assert abs(width(pages) - scale(454)) <= 1, "Page pane did not resize"
+    user.SendMessageW(window, WM_COMMAND, 10, 0)
+    assert width(tree) == width(pages), "Pane modes do not share their width"
+    drag(scale(457), scale(397))
+    assert abs(width(tree) - scale(394)) <= 1, "Bookmark pane did not resize"
+    drag(scale(397), 0)
+    assert width(tree) == scale(160) - scale(6), "Minimum pane width was not enforced"
+    drag(scale(157), scale(2000))
+    bounds = w.RECT()
+    user.GetClientRect(window, c.byref(bounds))
+    assert bounds.right - width(tree) - scale(6) >= scale(240) - 1, "Resize hid the document"
+    drag(width(tree) + scale(3), scale(317))
+    assert abs(width(tree) - (scale(320) - scale(6))) <= 1
+    user.SendMessageW(window, WM_COMMAND, 9, 0)
+    user.SendMessageW(window, WM_COMMAND, 9, 0)
+    user.SendMessageW(window, WM_COMMAND, 9, 0)
+    assert width(pages) == width(tree), "Hiding the pane lost its width"
 
 
 def check_bookmark_titles(executable, output):
@@ -263,6 +323,8 @@ def run(executable, output):
             user.SendMessageW(window, WM_COMMAND, 9, 0)
             assert user.SendMessageW(toolbar, TB_ISBUTTONCHECKED, 9, 0)
             assert not user.SendMessageW(toolbar, TB_ISBUTTONCHECKED, 10, 0)
+
+            check_sidebar_resize(window, toolbar)
 
             # Selecting a page must keep focus in the list for repeated arrow navigation.
             sidebar = user.GetDlgItem(window, 200)
