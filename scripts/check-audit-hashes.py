@@ -1,4 +1,4 @@
-"""Find changed pages between a saved-image audit and a later pixel-hash audit."""
+"""Find changed pages between earlier comparisons or render hashes and a later audit."""
 import argparse
 import csv
 import hashlib
@@ -17,6 +17,8 @@ def main():
     parser.add_argument("--current", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-identical", action="store_true")
+    parser.add_argument("--previous-render", action="store_true",
+                        help="Read earlier pixel hashes from render.json instead of image comparisons")
     args = parser.parse_args()
     old_run, new_run = read(args.previous / "run.json"), read(args.current / "run.json")
     for key in ("scale", "inventory_sha256"):
@@ -27,14 +29,17 @@ def main():
     files = read(args.inventory)["files"]
     changes, matched, missing = [], 0, 0
     for item in files:
-        previous = args.previous / item["id"] / "comparison.json"
+        previous = args.previous / item["id"] / ("render.json" if args.previous_render else "comparison.json")
         current = args.current / item["id"] / "render.json"
-        before = {row["page"]: row for row in read(previous) if "page" in row} if previous.exists() else {}
+        old_rows = read(previous) if previous.exists() else []
+        if args.previous_render and previous.exists():
+            old_rows = [{**row, "actual_size": [row.get("width"), row.get("height")]} for row in old_rows["samples"]]
+        before = {row["page"]: row for row in old_rows if "page" in row}
         after = {row["page"]: row for row in read(current)["samples"]} if current.exists() else {}
         for page in range(1, item["pages"] + 1):
             old, new = before.get(page, {}), after.get(page, {})
             old_hash, new_hash = old.get("pixel_sha256"), new.get("pixel_sha256")
-            if old_hash and new_hash and old_hash == new_hash and old.get("actual_size") == [new.get("width"), new.get("height")]:
+            if old_hash and new_hash and old_hash == new_hash and "error" not in old and "error" not in new and old.get("actual_size") == [new.get("width"), new.get("height")]:
                 matched += 1
                 continue
             reason = "changed_pixels"
@@ -45,6 +50,7 @@ def main():
                             "reason": reason, "previous_hash": old_hash, "current_hash": new_hash,
                             "error": new.get("error", old.get("error", ""))})
     summary = {"previous_exe_sha256": old_run["exe_sha256"], "current_exe_sha256": new_run["exe_sha256"],
+               "previous_source": "render_hashes" if args.previous_render else "image_comparisons",
                "expected_pages": sum(item["pages"] for item in files), "identical_pages": matched,
                "changed_pages": len(changes) - missing, "missing_hashes": missing, "changes": changes}
     args.output.parent.mkdir(parents=True, exist_ok=True)
