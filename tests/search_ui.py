@@ -82,7 +82,9 @@ def run(exe, output):
             expect(f"{number} of 8")
             assert text(page) == "1", "Enter skipped a match on the same page"
         user.GetScrollPos.argtypes = [w.HWND, c.c_int]
-        wait_for(lambda: user.GetScrollPos(window, 1) > 0, "scroll to the match near the page bottom")
+        document_scroll = user.GetDlgItem(window, 210)
+        assert document_scroll, "Missing document scrollbar"
+        wait_for(lambda: user.GetScrollPos(document_scroll, 2) > 0, "scroll to the match near the page bottom")
         command(1042)
         expect("5 of 8")
         wait_for(lambda: text(page) == "2", "next matching page")

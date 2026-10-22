@@ -78,18 +78,60 @@ static std::vector<uint32_t> scrollbar_pixels(HWND window, int part, int state) 
 }
 
 static void check_document_scrollbars(App& app) {
+    check(!(GetWindowLongPtrW(app.window, GWL_STYLE) & (WS_HSCROLL | WS_VSCROLL)),
+          "PDF scrollbars are attached to the whole window");
+    const auto bounds = document_bounds(app), vp = viewport(app);
+    RECT vertical{}, horizontal{};
+    GetWindowRect(app.document_vscroll, &vertical);
+    GetWindowRect(app.document_hscroll, &horizontal);
+    MapWindowPoints(nullptr, app.window, reinterpret_cast<POINT*>(&vertical), 2);
+    MapWindowPoints(nullptr, app.window, reinterpret_cast<POINT*>(&horizontal), 2);
+    check(vertical.left == vp.right && vertical.right == bounds.right && vertical.top == bounds.top &&
+              vertical.bottom == vp.bottom,
+          "Vertical scrollbar extends outside the document pane");
+    check(horizontal.left == bounds.left && horizontal.right == vp.right && horizontal.top == vp.bottom &&
+              horizontal.bottom == bounds.bottom,
+          "Horizontal scrollbar extends outside the document pane");
     for (int part : {SBP_THUMBBTNHORZ, SBP_THUMBBTNVERT, SBP_LOWERTRACKHORZ, SBP_LOWERTRACKVERT})
         for (int state : {SCRBS_NORMAL, SCRBS_HOT, SCRBS_PRESSED, SCRBS_DISABLED})
-            check(scrollbar_pixels(app.window, part, state) ==
-                      scrollbar_pixels(app.bookmark_tree, part, state),
+            check(scrollbar_pixels(app.document_vscroll, part, state) ==
+                          scrollbar_pixels(app.bookmark_tree, part, state) &&
+                      scrollbar_pixels(app.document_hscroll, part, state) ==
+                          scrollbar_pixels(app.bookmark_tree, part, state),
                   "PDF scrollbars use a different theme from the sidebar scrollbars");
     const int x = app.scroll_x, y = app.scroll_y;
-    SendMessageW(app.window, WM_HSCROLL, SB_LINEDOWN, 0);
-    SendMessageW(app.window, WM_VSCROLL, SB_LINEDOWN, 0);
+    SendMessageW(app.window, WM_HSCROLL, SB_LINEDOWN, LPARAM(app.document_hscroll));
+    SendMessageW(app.window, WM_VSCROLL, SB_LINEDOWN, LPARAM(app.document_vscroll));
     check(app.scroll_x > x && app.scroll_y > y, "PDF scrollbars did not move the document");
-    SendMessageW(app.window, WM_HSCROLL, SB_TOP, 0);
-    SendMessageW(app.window, WM_VSCROLL, SB_TOP, 0);
+    SendMessageW(app.window, WM_HSCROLL, SB_BOTTOM, LPARAM(app.document_hscroll));
+    SendMessageW(app.window, WM_VSCROLL, SB_BOTTOM, LPARAM(app.document_vscroll));
+    const auto page = page_rect(app);
+    check(page.right == vp.right - px(app, 24) && page.bottom == vp.bottom - px(app, 24),
+          "Scrollbars cannot reach the bottom-right page margin");
+    SendMessageW(app.window, WM_HSCROLL, SB_TOP, LPARAM(app.document_hscroll));
+    SendMessageW(app.window, WM_VSCROLL, SB_TOP, LPARAM(app.document_vscroll));
     check(app.scroll_x == 0 && app.scroll_y == 0, "PDF scrollbars did not return to the start");
+}
+
+static void check_document_fit(App& app) {
+    const auto visible = [](HWND bar) { return (GetWindowLongPtrW(bar, GWL_STYLE) & WS_VISIBLE) != 0; };
+    app.fit = Fit::page;
+    request_render(app);
+    check(!visible(app.document_hscroll) && !visible(app.document_vscroll),
+          "Fit page left document scrollbars visible");
+    app.fit = Fit::width;
+    request_render(app);
+    check(!visible(app.document_hscroll) && visible(app.document_vscroll),
+          "Fit width did not reserve space for the vertical scrollbar");
+    const auto scale = app.scale;
+    request_render(app);
+    check(app.scale == scale, "Fit width changes scale on repeated layout");
+    app.fit = Fit::custom;
+    app.scale = 4;
+    update_scroll(app);
+    check(visible(app.document_hscroll) && visible(app.document_vscroll),
+          "Zoom did not show both document scrollbars");
+    check_document_scrollbars(app);
 }
 
 int main() {
@@ -109,8 +151,8 @@ int main() {
         type.lpszClassName = L"FastPDF.SidebarResizeTest";
         check(RegisterClassW(&type) != 0, "Cannot register test window");
         window = CreateWindowExW(0, type.lpszClassName, L"Sidebar resize test",
-                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VSCROLL | WS_HSCROLL,
-                                 0, 0, 1200, 900, nullptr, nullptr, app.instance, &app);
+                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, 0, 0, 1200, 900, nullptr, nullptr,
+                                 app.instance, &app);
         check(window != nullptr, "Cannot create test window");
         app.pages.resize(3);
         app.show_sidebar = true;
@@ -130,6 +172,16 @@ int main() {
             app.dpi = dpi;
             fonts(app);
             MoveWindow(window, 0, 0, px(app, 1100), px(app, 700), FALSE);
+            layout(app);
+            check_document_fit(app);
+            app.find_open = true;
+            layout(app);
+            check_document_scrollbars(app);
+            app.find_open = false;
+            app.show_sidebar = false;
+            layout(app);
+            check_document_scrollbars(app);
+            app.show_sidebar = true;
             layout(app);
             const auto first = TreeView_GetFirstVisible(app.bookmark_tree);
             const auto selected = TreeView_GetSelection(app.bookmark_tree);
@@ -152,6 +204,7 @@ int main() {
                 check(TreeView_GetSelection(app.bookmark_tree) == selected,
                       "Resize changed the bookmark selection");
                 check_bookmark_frame(app);
+                check_document_scrollbars(app);
             }
             SendMessageW(window, WM_LBUTTONUP, 0, MAKELPARAM(px(app, 317), y));
         }

@@ -27,6 +27,7 @@ constexpr int id_sidebar = 200, id_toolbar = 202, id_page = 203, id_zoom = 204;
 constexpr int id_bookmark_tree = 205;
 constexpr int id_find_bar = 206, id_results = 207, id_sidebar_tabs = 208;
 constexpr int id_results_summary = 209;
+constexpr int id_document_vscroll = 210, id_document_hscroll = 211;
 constexpr int page_slot = 100, zoom_slot = 101, toolbar_height = 36;
 constexpr const wchar_t* menu_titles[] = {L"&File", L"&View", L"&Help"};
 enum class Job { open, render, preview, print };
@@ -130,6 +131,7 @@ constexpr ToolbarTool toolbar_tools[] = {
 };
 struct App {
     HWND window = nullptr, sidebar = nullptr, search = nullptr;
+    HWND document_vscroll = nullptr, document_hscroll = nullptr;
     HWND bookmark_tree = nullptr, sidebar_tabs = nullptr;
     std::vector<HTREEITEM> bookmark_items;
     int sidebar_width = ui::sidebar_width, splitter_offset = 0;
@@ -449,7 +451,7 @@ static bool results_visible(const App& a) {
 static bool sidebar_visible(const App& a) {
     return (a.show_sidebar || results_visible(a)) && !a.pages.empty();
 }
-static RECT viewport(App& a) {
+static RECT document_bounds(App& a) {
     RECT r = client(a);
     r.top = px(a, toolbar_height) + find_height(a);
     r.bottom -= px(a, 30);
@@ -457,10 +459,12 @@ static RECT viewport(App& a) {
         int maximum = std::max(0, int(r.right) - px(a, ui::document_min_width));
         r.left = std::clamp(px(a, a.sidebar_width), std::min(px(a, ui::sidebar_min_width), maximum), maximum);
     }
+    r.right = std::max(r.left, r.right);
+    r.bottom = std::max(r.top, r.bottom);
     return r;
 }
 static RECT sidebar_splitter(App& a) {
-    auto r = viewport(a);
+    auto r = document_bounds(a);
     r.right = r.left;
     r.left = std::max(0L, r.right - px(a, ui::splitter_width));
     return r;
@@ -474,13 +478,36 @@ static std::pair<double, double> dimensions(App& a) {
         std::swap(w, h);
     return {w, h};
 }
+static RECT viewport(App& a) {
+    auto r = document_bounds(a);
+    if (a.pages.empty())
+        return r;
+    const auto [w, h] = dimensions(a);
+    const int total_w = int(std::ceil(w * a.scale)) + 2 * px(a, 24),
+              total_h = int(std::ceil(h * a.scale)) + 2 * px(a, 24);
+    const int bar_w = GetSystemMetricsForDpi(SM_CXVSCROLL, a.dpi),
+              bar_h = GetSystemMetricsForDpi(SM_CYHSCROLL, a.dpi);
+    bool vertical = false, horizontal = false;
+    // Each scrollbar can make the other axis overflow. Start with the full pane
+    // so bars disappear as soon as the page fits again.
+    for (int pass = 0; pass < 2; ++pass) {
+        vertical = total_h > r.bottom - r.top - (horizontal ? bar_h : 0);
+        horizontal = total_w > r.right - r.left - (vertical ? bar_w : 0);
+    }
+    if (vertical)
+        r.right = std::max(r.left, r.right - bar_w);
+    if (horizontal)
+        r.bottom = std::max(r.top, r.bottom - bar_h);
+    return r;
+}
 static void update_scroll(App& a) {
+    const auto bounds = document_bounds(a);
     auto r = viewport(a);
     auto [w, h] = dimensions(a);
     int width = std::max<LONG>(1, r.right - r.left), height = std::max<LONG>(1, r.bottom - r.top),
         margin = px(a, 24);
-    int total_w = int(std::ceil(w * a.scale)) + 2 * margin,
-        total_h = int(std::ceil(h * a.scale)) + 2 * margin;
+    int total_w = a.pages.empty() ? 0 : int(std::ceil(w * a.scale)) + 2 * margin,
+        total_h = a.pages.empty() ? 0 : int(std::ceil(h * a.scale)) + 2 * margin;
     a.scroll_x = std::clamp(a.scroll_x, 0, std::max(0, total_w - width));
     a.scroll_y = std::clamp(a.scroll_y, 0, std::max(0, total_h - height));
     SCROLLINFO si{sizeof(si), SIF_RANGE | SIF_PAGE | SIF_POS};
@@ -488,27 +515,36 @@ static void update_scroll(App& a) {
     si.nMax = std::max(0, total_h - 1);
     si.nPage = UINT(height);
     si.nPos = a.scroll_y;
-    SetScrollInfo(a.window, SB_VERT, &si, TRUE);
+    SetScrollInfo(a.document_vscroll, SB_CTL, &si, TRUE);
     si.nMax = std::max(0, total_w - 1);
     si.nPage = UINT(width);
     si.nPos = a.scroll_x;
-    SetScrollInfo(a.window, SB_HORZ, &si, TRUE);
+    SetScrollInfo(a.document_hscroll, SB_CTL, &si, TRUE);
+    MoveWindow(a.document_vscroll, r.right, r.top, bounds.right - r.right, r.bottom - r.top, TRUE);
+    MoveWindow(a.document_hscroll, r.left, r.bottom, r.right - r.left, bounds.bottom - r.bottom, TRUE);
+    ShowWindow(a.document_vscroll, r.right < bounds.right ? SW_SHOWNA : SW_HIDE);
+    ShowWindow(a.document_hscroll, r.bottom < bounds.bottom ? SW_SHOWNA : SW_HIDE);
 }
 static void request_render(App& a, bool reset_scroll = false) {
     if (a.pages.empty()) {
         sync_toolbar(a);
         return;
     }
-    auto r = viewport(a);
+    auto r = document_bounds(a);
     auto [w, h] = dimensions(a);
     double available_w = std::max<LONG>(32, r.right - r.left - px(a, 48)),
            available_h = std::max<LONG>(32, r.bottom - r.top - px(a, 48));
     if (a.fit == Fit::page)
         a.scale = std::min(available_w / w, available_h / h);
-    else if (a.fit == Fit::width)
+    else if (a.fit == Fit::width) {
+        if (h * (available_w / w) > available_h)
+            available_w = std::max(32.0, available_w - GetSystemMetricsForDpi(SM_CXVSCROLL, a.dpi));
         a.scale = available_w / w;
-    else
+    } else
         a.scale = a.zoom * double(a.dpi) / 72;
+    // Keep rounding to whole pixels from making a fitted page overflow by one pixel.
+    if (a.fit != Fit::custom)
+        a.scale = std::nextafter(a.scale, 0.0);
     a.scale = std::clamp(a.scale, 0.05, 12.0);
     double pixels = w * h * a.scale * a.scale;
     if (pixels > 60'000'000)
@@ -2066,14 +2102,15 @@ static void paint_app(App& a, HDC dc) {
     fill_rect(dc, r, a.search_colors.field);
     paint_toolbar(a, dc);
     if (sidebar_visible(a)) {
-        fill_rect(dc, {0, vp.top, vp.left, vp.bottom}, a.search_colors.footer);
+        const auto pane = document_bounds(a);
+        fill_rect(dc, {0, pane.top, pane.left, pane.bottom}, a.search_colors.footer);
         if (results_visible(a))
-            fill_rect(dc, {0, vp.top + a.sidebar_header_height, sidebar_splitter(a).left, vp.bottom},
+            fill_rect(dc, {0, pane.top + a.sidebar_header_height, sidebar_splitter(a).left, pane.bottom},
                       a.search_colors.body);
-        fill_rect(dc, {vp.left - 1, vp.top, vp.left, vp.bottom}, a.search_colors.border);
+        fill_rect(dc, {pane.left - 1, pane.top, pane.left, pane.bottom}, a.search_colors.border);
         auto splitter = sidebar_splitter(a);
         int center = (splitter.left + splitter.right) / 2;
-        fill_rect(dc, {center, vp.top, center + 1, vp.bottom},
+        fill_rect(dc, {center, pane.top, center + 1, pane.bottom},
                   a.resizing_sidebar ? a.search_colors.accent : a.search_colors.border);
     }
     int saved = SaveDC(dc);
@@ -2168,7 +2205,10 @@ static void screenshot(App& a) {
     require(bitmap != nullptr, "Cannot allocate UI capture");
     auto old = SelectObject(memory, bitmap);
     paint_app(a, memory);
-    for (auto control : {a.page_edit, a.zoom_edit, a.search, a.bookmark_tree, a.sidebar_tabs}) {
+    for (auto control : {a.page_edit, a.zoom_edit, a.search, a.bookmark_tree, a.sidebar_tabs,
+                         a.document_vscroll, a.document_hscroll}) {
+        if (!(GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE))
+            continue;
         if ((control == a.search && !a.find_open) ||
             (control == a.bookmark_tree &&
              (!a.show_sidebar || !a.bookmarks || results_visible(a) || a.pages.empty())) ||
@@ -2183,7 +2223,7 @@ static void screenshot(App& a) {
         RestoreDC(memory, saved);
     }
     if (a.show_sidebar && !results_visible(a) && !a.pages.empty() && !a.bookmarks) {
-        auto vp = viewport(a);
+        auto vp = document_bounds(a);
         int top = vp.top + a.sidebar_header_height;
         int first = int(SendMessageW(a.sidebar, LB_GETTOPINDEX, 0, 0));
         int count = int(SendMessageW(a.sidebar, LB_GETCOUNT, 0, 0));
@@ -2297,7 +2337,7 @@ static void scroll(App& a, int bar, int code, int delta = 0) {
     int& position = bar == SB_VERT ? a.scroll_y : a.scroll_x;
     int page = bar == SB_VERT ? vp.bottom - vp.top : vp.right - vp.left;
     SCROLLINFO info{sizeof(info), SIF_ALL};
-    GetScrollInfo(a.window, bar, &info);
+    GetScrollInfo(bar == SB_VERT ? a.document_vscroll : a.document_hscroll, SB_CTL, &info);
     if (code == SB_LINEUP)
         position -= px(a, 48);
     else if (code == SB_LINEDOWN)
@@ -2614,12 +2654,12 @@ static void refresh_reader_theme(App& a) {
     DwmSetWindowAttribute(a.window, 20, &dark, sizeof(dark));
     DwmSetWindowAttribute(a.window, DWMWA_CAPTION_COLOR, &c.footer, sizeof(COLORREF));
     DwmSetWindowAttribute(a.window, DWMWA_TEXT_COLOR, &c.text, sizeof(COLORREF));
-    // The PDF scrollbars are part of the main window's nonclient area.
     // SetWindowTheme sends WM_THEMECHANGED synchronously to this window.
     a.setting_window_theme = true;
     SetWindowTheme(a.window, c.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
     a.setting_window_theme = false;
-    for (auto control : {a.sidebar, a.bookmark_tree, a.search_results, a.page_edit, a.zoom_edit})
+    for (auto control : {a.sidebar, a.bookmark_tree, a.search_results, a.page_edit, a.zoom_edit,
+                         a.document_vscroll, a.document_hscroll})
         SetWindowTheme(control, c.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
     ListView_SetBkColor(a.search_results, c.body);
     ListView_SetTextBkColor(a.search_results, c.body);
@@ -2691,6 +2731,13 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             a.search_colors = ui::system_dialog_colors();
             a.dpi = GetDpiForWindow(window);
             window_icons(a);
+            a.document_vscroll =
+                CreateWindowExW(0, L"SCROLLBAR", L"Scroll document vertically", WS_CHILD | SBS_VERT, 0, 0, 0,
+                                0, window, HMENU(INT_PTR(id_document_vscroll)), a.instance, nullptr);
+            a.document_hscroll =
+                CreateWindowExW(0, L"SCROLLBAR", L"Scroll document horizontally", WS_CHILD | SBS_HORZ, 0, 0,
+                                0, 0, window, HMENU(INT_PTR(id_document_hscroll)), a.instance, nullptr);
+            require(a.document_vscroll && a.document_hscroll, "Cannot create document scrollbars");
             a.sidebar_tabs =
                 CreateWindowExW(0, WC_TABCONTROLW, L"Sidebar views",
                                 WS_CHILD | WS_TABSTOP | TCS_MULTILINE | TCS_FOCUSONBUTTONDOWN, 0, 0, 0, 0,
@@ -3409,8 +3456,8 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
     AppendMenuW(menu, MF_POPUP, UINT_PTR(view), menu_titles[1]);
     AppendMenuW(menu, MF_POPUP, UINT_PTR(help), menu_titles[2]);
     HWND window = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"FastPDF",
-                                  WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL | WS_CLIPCHILDREN,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 1280, 900, nullptr, menu, instance, &app);
+                                  WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1280,
+                                  900, nullptr, menu, instance, &app);
     if (!window) {
         return 1;
     }
