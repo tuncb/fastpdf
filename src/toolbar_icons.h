@@ -13,7 +13,10 @@ enum class ToolbarIcon {
     rotate,
     find,
     pages,
-    bookmarks
+    bookmarks,
+    up,
+    down,
+    close
 };
 
 static void draw_toolbar_icon(HDC dc, RECT rect, ToolbarIcon icon, COLORREF color, UINT dpi) {
@@ -54,6 +57,16 @@ static void draw_toolbar_icon(HDC dc, RECT rect, ToolbarIcon icon, COLORREF colo
         break;
     case ToolbarIcon::next:
         line({{6, 3}, {11, 8}, {6, 13}});
+        break;
+    case ToolbarIcon::up:
+        line({{3, 10}, {8, 5}, {13, 10}});
+        break;
+    case ToolbarIcon::down:
+        line({{3, 6}, {8, 11}, {13, 6}});
+        break;
+    case ToolbarIcon::close:
+        line({{4, 4}, {12, 12}});
+        line({{12, 4}, {4, 12}});
         break;
     case ToolbarIcon::plus:
         line({{8, 3}, {8, 13}});

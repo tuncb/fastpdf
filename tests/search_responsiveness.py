@@ -58,7 +58,6 @@ def run(exe, output, worker_test):
         bar = user.GetDlgItem(window, 206)
         query, count, status = [user.GetDlgItem(bar, item) for item in (201, 1046, 1047)]
         results = user.GetDlgItem(window, 207)
-        send(bar, 0x111, 1043)
 
         def read(control):
             value = c.create_unicode_buffer(256)

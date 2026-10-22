@@ -83,6 +83,7 @@ struct DialogStyle {
     HWND window = nullptr;
     HWND tooltips = nullptr;
     std::vector<std::pair<HWND, std::wstring>> button_captions;
+    std::vector<std::pair<HWND, ToolbarIcon>> button_icons;
     DialogColors colors{};
     HBRUSH body = nullptr, footer = nullptr, field = nullptr;
     Painter painter;
@@ -123,6 +124,84 @@ static bool window_class(HWND window, const wchar_t* name) {
     wchar_t value[64]{};
     GetClassNameW(window, value, int(std::size(value)));
     return _wcsicmp(value, name) == 0;
+}
+struct CenteredEdit {
+    int top = 0, bottom = 0;
+};
+static void update_edit_frame(HWND window) {
+    SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
+}
+static LRESULT CALLBACK centered_edit_proc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id,
+                                           DWORD_PTR data) {
+    auto& state = *reinterpret_cast<CenteredEdit*>(data);
+    if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(window, centered_edit_proc, id);
+        delete &state;
+        return DefSubclassProc(window, message, wp, lp);
+    }
+    const auto result = DefSubclassProc(window, message, wp, lp);
+    if (message == WM_NCCALCSIZE) {
+        auto& bounds = wp ? reinterpret_cast<NCCALCSIZE_PARAMS*>(lp)->rgrc[0] : *reinterpret_cast<RECT*>(lp);
+        const HDC dc = GetDC(window);
+        const auto font = HFONT(SendMessageW(window, WM_GETFONT, 0, 0));
+        const auto old = SelectObject(dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
+        TEXTMETRICW metrics{};
+        GetTextMetricsW(dc, &metrics);
+        SelectObject(dc, old);
+        ReleaseDC(window, dc);
+        const int extra = std::max(0L, bounds.bottom - bounds.top - metrics.tmHeight);
+        state.top = extra / 2;
+        state.bottom = extra - state.top;
+        bounds.top += state.top;
+        bounds.bottom -= state.bottom;
+        return wp ? WVR_REDRAW : 0;
+    }
+    if (message == WM_NCPAINT && (state.top || state.bottom)) {
+        const HDC dc = GetWindowDC(window);
+        RECT outer{}, client{};
+        GetWindowRect(window, &outer);
+        GetClientRect(window, &client);
+        MapWindowPoints(window, nullptr, reinterpret_cast<POINT*>(&client), 2);
+        OffsetRect(&client, -outer.left, -outer.top);
+        const bool read_only =
+            !IsWindowEnabled(window) || (GetWindowLongPtrW(window, GWL_STYLE) & ES_READONLY);
+        auto brush = HBRUSH(SendMessageW(GetParent(window), read_only ? WM_CTLCOLORSTATIC : WM_CTLCOLOREDIT,
+                                         WPARAM(dc), LPARAM(window)));
+        if (!brush)
+            brush = GetSysColorBrush(COLOR_WINDOW);
+        const RECT top{client.left, client.top - state.top, client.right, client.top};
+        const RECT bottom{client.left, client.bottom, client.right, client.bottom + state.bottom};
+        FillRect(dc, &top, brush);
+        FillRect(dc, &bottom, brush);
+        ReleaseDC(window, dc);
+    }
+    if (message == WM_NCHITTEST) {
+        POINT point{short(LOWORD(lp)), short(HIWORD(lp))};
+        ScreenToClient(window, &point);
+        RECT bounds{};
+        GetClientRect(window, &bounds);
+        bounds.top -= state.top;
+        bounds.bottom += state.bottom;
+        // The padding is still part of the editable field for mouse input.
+        if (PtInRect(&bounds, point))
+            return HTCLIENT;
+    }
+    if (message == WM_SETFONT || message == WM_THEMECHANGED || message == WM_DPICHANGED_AFTERPARENT)
+        update_edit_frame(window);
+    return result;
+}
+void center_edit_text(HWND window) {
+    if (!window_class(window, L"Edit") || (GetWindowLongPtrW(window, GWL_STYLE) & ES_MULTILINE))
+        return;
+    DWORD_PTR existing = 0;
+    if (!GetWindowSubclass(window, centered_edit_proc, 1, &existing)) {
+        auto state = std::make_unique<CenteredEdit>();
+        if (SetWindowSubclass(window, centered_edit_proc, 1, DWORD_PTR(state.get())))
+            state.release();
+    }
+    update_edit_frame(window);
 }
 static LRESULT CALLBACK field_proc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id,
                                    DWORD_PTR data) {
@@ -296,6 +375,7 @@ static BOOL CALLBACK theme_child(HWND child, LPARAM context) {
         SetWindowSubclass(child, field_proc, 1, DWORD_PTR(&state));
         SetWindowLongPtrW(child, GWL_EXSTYLE, GetWindowLongPtrW(child, GWL_EXSTYLE) & ~WS_EX_CLIENTEDGE);
         SetWindowLongPtrW(child, GWL_STYLE, GetWindowLongPtrW(child, GWL_STYLE) | WS_BORDER);
+        center_edit_text(child);
         SetWindowPos(child, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
@@ -356,6 +436,10 @@ static void draw_button(HWND window, DialogStyle& state, const NMCUSTOMDRAW& dra
     const bool pressed = (draw.uItemState & CDIS_SELECTED) != 0;
     const bool focused = (draw.uItemState & CDIS_FOCUS) != 0;
     const bool primary = !check && GetDlgCtrlID(button) == state.primary;
+    std::optional<ToolbarIcon> icon;
+    for (const auto& [control, value] : state.button_icons)
+        if (control == button)
+            icon = value;
     const auto& c = state.colors;
     const bool footer = in_footer(window, button, state);
     const auto background = footer ? c.footer : c.body;
@@ -399,7 +483,8 @@ static void draw_button(HWND window, DialogStyle& state, const NMCUSTOMDRAW& dra
                           : (draw.uItemState & CDIS_HOT) && enabled   ? c.hover
                                                                       : c.body;
         control(state.painter, draw.hdc, draw.rc, GetDpiForWindow(window), background, fill,
-                (primary || focused || checked) && enabled ? c.accent : c.border, 1);
+                (primary || focused || checked) && enabled ? c.accent : c.border, !icon || focused ? 1 : 0,
+                icon, enabled ? c.text : c.muted);
     }
     wchar_t caption[256]{};
     GetWindowTextW(button, caption, int(std::size(caption)));
@@ -565,6 +650,13 @@ void compact_button(HWND button, const wchar_t* caption) {
     tool.lpszText = LPSTR_TEXTCALLBACKW;
     SendMessageW(state->tooltips, TTM_ADDTOOLW, 0, LPARAM(&tool));
     InvalidateRect(button, nullptr, FALSE);
+}
+void icon_button(HWND button, ToolbarIcon icon) {
+    const auto state = reinterpret_cast<DialogStyle*>(GetPropW(GetParent(button), style_property));
+    if (!state)
+        return;
+    state->button_icons.emplace_back(button, icon);
+    compact_button(button, L"");
 }
 void style_dialog(HWND window, int footer_top, int primary, bool center) {
     if (GetPropW(window, style_property))

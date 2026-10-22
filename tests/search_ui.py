@@ -7,7 +7,7 @@ import sys
 
 from search_fixture import search_document
 from search_accessibility import result_row
-from ui_toolbar import user, wait_for, find_window, text, enter, rect, CALLBACK
+from ui_toolbar import user, wait_for, find_window, text, enter, rect
 
 user.ScreenToClient.argtypes = [w.HWND, c.POINTER(w.POINT)]
 
@@ -43,6 +43,8 @@ def run(exe, output):
         user.SendMessageW(window, 0x111, 11, 0)
         bar = user.GetDlgItem(window, 206)
         query, count = user.GetDlgItem(bar, 201), user.GetDlgItem(bar, 1046)
+        results = user.GetDlgItem(window, 207)
+        summary = user.GetDlgItem(window, 209)
         assert visible(bookmarks), "Opening Find hid bookmarks"
         assert user.SendMessageW(tabs, 0x1304, 0, 0) == 3, "Missing Results tab"
 
@@ -52,9 +54,23 @@ def run(exe, output):
         def command(control):
             user.SendMessageW(bar, 0x111, control, 0)
 
-        enter(query, "warranty")
+        def type_query(value):
+            buffer = c.create_unicode_buffer(value)
+            user.SendMessageW(query, 0xC, 0, c.addressof(buffer))
+
+        first_bookmark = user.SendMessageW(bookmarks, 0x110A, 5, 0)
+        type_query("warranty")
         expect("1 of 8")
         assert visible(bookmarks), "Search replaced bookmarks without a request"
+        assert text(summary) == "8 matches on 3 pages", "Missing results summary"
+        assert not visible(user.GetDlgItem(bar, 1047)), "Completed search kept a redundant status row"
+        user.SendMessageW(query, 0x100, 13, 0)
+        expect("1 of 8")
+        assert visible(results), "First Enter did not open Results"
+        result_area = w.RECT()
+        user.GetClientRect(results, c.byref(result_area))
+        assert not (user.GetWindowLongW(results, -16) & 0x100000), \
+            f"Opening Results added a horizontal scrollbar: client {result_area.right}, column {user.SendMessageW(results, 0x101D, 0, 0)}"
         assert text(page) == "1"
         user.SendMessageW(window, 0x100, 0x72, 0)  # F3
         expect("2 of 8")
@@ -80,8 +96,6 @@ def run(exe, output):
         command(1042)
         expect("1 of 8")
 
-        command(1043)
-        results = user.GetDlgItem(window, 207)
         assert user.SendMessageW(results, 0x1004, 0, 0) == 8, "Missing results"
         name, _ = result_row(results, 0)
         assert name.startswith("Page 1:") and "warranty" in name, "Missing accessible result text"
@@ -103,6 +117,11 @@ def run(exe, output):
 
         select_tab(1, bookmarks)
         assert user.SendMessageW(bookmarks, 0x1127, root, 0x20) & 0x20, "Switching tabs collapsed bookmarks"
+        assert user.SendMessageW(bookmarks, 0x110A, 5, 0) == first_bookmark, "Search moved the bookmark scroll position"
+        user.SendMessageW(query, 0x100, 13, 0)
+        expect("6 of 8")
+        assert visible(results), "Enter did not reveal the current match from Bookmarks"
+        select_tab(1, bookmarks)
         user.SendMessageW(tabs, 0x100, 0x27, 0)  # Right selects Results.
         assert visible(results), "Arrow-key tab navigation failed"
         user.SendMessageW(window, 0x111, 10, 0)  # Bookmarks toolbar command from Results.
@@ -113,20 +132,9 @@ def run(exe, output):
         assert visible(pages), "Pages command closed the sidebar from Results"
         select_tab(1, bookmarks)
         select_tab(2, results)
-        command(1043)
-        assert visible(results), "Results button should keep Results open"
-
-        def options_dialog():
-            matches = []
-            @CALLBACK
-            def visit(hwnd, _):
-                pid = w.DWORD()
-                user.GetWindowThreadProcessId(hwnd, c.byref(pid))
-                if pid.value == process.pid and text(hwnd) == "Search Scope":
-                    matches.append(hwnd)
-                return True
-            user.EnumWindows(visit, 0)
-            return matches[0] if matches else None
+        assert not user.GetDlgItem(bar, 1043) and not user.GetDlgItem(bar, 1044), "Obsolete search buttons remain"
+        assert "Previous match" in text(user.GetDlgItem(bar, 1041)), "Icon lost its accessible name"
+        assert "Close find" in text(user.GetDlgItem(bar, 1045)), "Close icon lost its accessible name"
 
         def toggle(control):
             user.SendMessageW(user.GetDlgItem(bar, control), 0xF5, 0, 0)  # BM_CLICK
@@ -151,16 +159,37 @@ def run(exe, output):
         enter(query, "warranty")
         wait_for(lambda: text(count).endswith(" of 6"), "literal mode restored")
 
-        user.PostMessageW(bar, 0x111, 1044, 0)
-        dialog = wait_for(options_dialog, "scope options")
-        user.SendMessageW(user.GetDlgItem(dialog, 1052), 0x14E, 1, 0)
-        user.PostMessageW(dialog, 0x111, 1, 0)
+        user.SendMessageW(tabs, 0x1330, 1, 0)
+        scope = user.GetDlgItem(bar, 1052)
+        assert user.SendMessageW(scope, 0x146, 0, 0) == 2, "Missing inline scopes"
+        prior_count = text(count)
+        user.SendMessageW(scope, 0x14F, 1, 0)  # Open, highlight Current page, then cancel.
+        user.SendMessageW(scope, 0x100, 0x28, 0)
+        assert text(count) == prior_count, "Highlighting a scope applied an unconfirmed choice"
+        user.SendMessageW(scope, 0x100, 27, 0)
+        assert user.SendMessageW(scope, 0x147, 0, 0) == 0, "Escape did not restore the scope"
+        assert text(count) == prior_count, "Canceling the scope changed the search"
+        user.SendMessageW(scope, 0x14F, 1, 0)
+        user.SendMessageW(scope, 0x100, 0x28, 0)
+        user.SendMessageW(scope, 0x100, 13, 0)
         expect("1 of 2")
+        assert visible(bookmarks), "Changing scope replaced Bookmarks"
         assert text(page) == "2", "Current page scope changed pages"
+        user.SendMessageW(scope, 0x100, 0x26, 0)  # Closed-combo arrow keys apply immediately.
+        wait_for(lambda: text(count).endswith(" of 6"), "entire-document scope restored")
+        user.SendMessageW(scope, 0x100, 0x28, 0)
+        expect("1 of 2")
+        user.SendMessageW(query, 0x100, 13, 0)
+        expect("1 of 2")
+        assert visible(results), "Enter did not open scoped Results"
         enter(query, "not in this document")
         expect("0 matches")
-        enter(query, "warranty")
+        type_query("warranty")
         expect("1 of 2")
+        user.SendMessageW(query, 0x100, 13, 0)
+        expect("1 of 2")
+        user.SendMessageW(query, 0x100, 13, 0)
+        expect("2 of 2")
         user.SendMessageW(query, 0x100, 27, 0)
         assert not visible(bar), "Escape did not close search"
         assert visible(bookmarks), "Closing Find did not restore bookmarks"
@@ -168,23 +197,27 @@ def run(exe, output):
         user.SendMessageW(window, 0x111, 11, 0)
         expect("1 of 2")
         assert visible(bookmarks), "Reopening Find replaced bookmarks"
-        for dpi, window_width in ((96, 1000), (96, 640), (144, 1000), (144, 640)):
+        for dpi, window_width in ((96, 1000), (96, 640), (144, 1000), (144, 640), (192, 640)):
             bounds = w.RECT(50, 50, 50 + window_width * dpi // 96, 50 + 700 * dpi // 96)
             user.SendMessageW(window, 0x2E0, dpi | (dpi << 16), c.addressof(bounds))
-            command(1043)
+            user.SendMessageW(tabs, 0x1330, 2, 0)
             _, row = result_row(results, 0)
             assert row[3] == 72 * dpi // 96, f"Result row height does not follow DPI: {row[3]} at {dpi}"
             assert not (user.GetWindowLongW(results, -16) & 0x100000), "Results have a horizontal scrollbar"
             user.SendMessageW(tabs, 0x1330, 1, 0)
             assert visible(bookmarks), "DPI check did not restore bookmarks"
             expect("1 of 2")
-            controls = [query] + [user.GetDlgItem(bar, i) for i in (1050, 1051, 1053)] + [count] + [user.GetDlgItem(bar, i) for i in (1041, 1042, 1043, 1044, 1045)]
+            controls = [query, scope] + [user.GetDlgItem(bar, i) for i in (1050, 1051, 1053)] + [count] + [user.GetDlgItem(bar, i) for i in (1041, 1042, 1045)]
             boxes = [rect(control) for control in controls]
             assert all(box.left < box.right and box.top < box.bottom for box in boxes)
-            assert all(left.right <= right.left or left.bottom <= right.top for left, right in zip(boxes, boxes[1:])), "Search controls overlap"
+            assert all(left.right <= right.left or right.right <= left.left or left.bottom <= right.top or right.bottom <= left.top
+                       for i, left in enumerate(boxes) for right in boxes[i + 1:]), "Search controls overlap"
             assert boxes[-1].right <= rect(bar).right, "Search controls exceed the bar"
             assert boxes[0].bottom - boxes[0].top >= 16 * dpi // 96, "Search field does not follow DPI"
-            assert boxes[-1].bottom <= rect(user.GetDlgItem(bar, 1047)).top, "Search status overlaps buttons"
+            assert boxes[-1].bottom <= rect(bar).bottom, "Search buttons exceed the bar"
+            assert boxes[0].right < boxes[-1].left, "Query does not leave room for Close"
+            assert abs(boxes[0].top + boxes[0].bottom - boxes[-1].top - boxes[-1].bottom) <= 2, "Close is not centered beside the query"
+            assert rect(summary).bottom <= rect(results).top, "Results summary overlaps matches"
             assert rect(tabs).bottom <= rect(bookmarks).top, "Sidebar tabs overlap content"
             assert rect(tabs).bottom - rect(tabs).top >= 32 * dpi // 96, "Tabs do not follow DPI"
             width = rect(bookmarks).right - rect(bookmarks).left

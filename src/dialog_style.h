@@ -4,6 +4,8 @@
 #include <span>
 #include <string>
 
+enum class ToolbarIcon;
+
 namespace ui {
 struct DialogColors {
     bool dark;
@@ -18,8 +20,12 @@ void style_common_dialog(HWND window);
 void refresh_dialog_style(HWND window);
 void dialog_footer(HWND window, int footer_top);
 void position_dialog_control(HWND window, int id, RECT units);
+// Center the native text and caret in single-line edit controls.
+void center_edit_text(HWND window);
 // Keep the full native control name for accessibility and its tooltip.
 void compact_button(HWND button, const wchar_t* caption);
+// Draw a scalable icon while retaining the native name and tooltip.
+void icon_button(HWND button, ToolbarIcon icon);
 int show_prompt(HWND owner, const wchar_t* title, const std::wstring& content,
                 std::span<const TASKDIALOG_BUTTON> buttons, int default_button = IDCANCEL,
                 const wchar_t* checkbox = nullptr, BOOL* checked = nullptr);

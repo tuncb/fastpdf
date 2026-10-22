@@ -26,6 +26,7 @@ constexpr UINT search_message = WM_APP + 3;
 constexpr int id_sidebar = 200, id_toolbar = 202, id_page = 203, id_zoom = 204;
 constexpr int id_bookmark_tree = 205;
 constexpr int id_find_bar = 206, id_results = 207, id_sidebar_tabs = 208;
+constexpr int id_results_summary = 209;
 constexpr int page_slot = 100, zoom_slot = 101, toolbar_height = 36;
 constexpr const wchar_t* menu_titles[] = {L"&File", L"&View", L"&Help"};
 enum class Job { open, render, preview, print };
@@ -146,14 +147,17 @@ struct App {
     int sidebar_hover = -1;
     Worker worker;
     SearchWorker search_worker;
-    HWND find_bar = nullptr, search_results = nullptr;
+    HWND find_bar = nullptr, search_results = nullptr, results_summary = nullptr;
     SearchOptions search_options;
     SearchResults matches;
     bool syncing_results = false;
     int active_match = -1, search_start_page = 0, search_checked = 0, search_total = 0;
     bool search_running = false, search_complete = false, search_has_text = false, search_failed = false;
     bool show_results = false, reveal_match = false, search_stopped = false;
-    std::wstring search_notice;
+    bool search_enter_pending = true, show_find_status = false;
+    bool sidebar_before_find = false, bookmarks_before_find = true;
+    int find_layout_height = 0, summary_layout_height = 0;
+    std::wstring search_notice, search_summary;
     ui::DialogColors search_colors{};
     HBRUSH results_background = nullptr;
     HFONT search_font = nullptr;
@@ -201,8 +205,15 @@ static void sync_search(App& a);
 static void fit_search_results(HWND window) {
     RECT bounds{};
     GetClientRect(window, &bounds);
-    if (ListView_GetColumnWidth(window, 0) != bounds.right)
-        ListView_SetColumnWidth(window, 0, bounds.right);
+    // The native list needs one pixel beyond the column to avoid a horizontal scrollbar.
+    const int width = std::max(0, int(bounds.right) - 1);
+    const int current = ListView_GetColumnWidth(window, 0);
+    const bool overflow = (GetWindowLongPtrW(window, GWL_STYLE) & WS_HSCROLL) != 0;
+    // Showing a hidden list can restore stale scroll ranges. A same-width assignment is a no-op.
+    if (overflow && current == width)
+        ListView_SetColumnWidth(window, 0, std::max(0, width - 1));
+    if (current != width || overflow)
+        ListView_SetColumnWidth(window, 0, width);
 }
 static void clear_search_results(App& a) {
     KillTimer(a.window, 4);
@@ -428,7 +439,7 @@ static int find_width_units(App& a) {
 static int find_height(App& a) {
     if (!a.find_open || !a.find_bar)
         return 0;
-    RECT units{0, 0, 0, find_width_units(a) < 480 ? 54 : 36};
+    RECT units{0, 0, 0, (find_width_units(a) < 350 ? 64 : 44) + (a.show_find_status ? 18 : 0)};
     MapDialogRect(a.find_bar, &units);
     return units.bottom;
 }
@@ -583,6 +594,7 @@ static void fonts(App& a) {
     if (a.search_results) {
         SendMessageW(a.search_results, WM_SETFONT, WPARAM(a.search_font), TRUE);
     }
+    SendMessageW(a.results_summary, WM_SETFONT, WPARAM(a.search_font), TRUE);
     SendMessageW(a.sidebar_tabs, WM_SETFONT, WPARAM(a.search_font), TRUE);
     TabCtrl_SetPadding(a.sidebar_tabs, px(a, 12), 0);
     TabCtrl_SetItemSize(a.sidebar_tabs, 0, px(a, ui::sidebar_header));
@@ -593,9 +605,19 @@ static void fonts(App& a) {
     style_menu(a, GetMenu(a.window), true);
     DrawMenuBar(a.window);
 }
+static int search_summary_height(App& a) {
+    RECT text{0, 0, std::max(px(a, 24), int(sidebar_splitter(a).left) - px(a, 24)), 0};
+    const auto dc = GetDC(a.window);
+    const auto old = SelectObject(dc, a.search_font);
+    DrawTextW(dc, a.search_summary.c_str(), -1, &text, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(dc, old);
+    ReleaseDC(a.window, dc);
+    return std::max(px(a, 18), int(text.bottom)) + px(a, 16);
+}
 static void layout(App& a) {
     auto r = client(a);
-    int top = px(a, toolbar_height) + find_height(a);
+    a.find_layout_height = find_height(a);
+    int top = px(a, toolbar_height) + a.find_layout_height;
     const int tab_count = a.find_open ? 3 : 2;
     while (TabCtrl_GetItemCount(a.sidebar_tabs) > tab_count)
         TabCtrl_DeleteItem(a.sidebar_tabs, tab_count);
@@ -630,37 +652,48 @@ static void layout(App& a) {
     if (a.find_bar) {
         MoveWindow(a.find_bar, 0, px(a, toolbar_height), r.right, find_height(a), TRUE);
         const int width = find_width_units(a);
-        const bool wrapped = width < 480;
-        const int button_y = wrapped ? 23 : 5, status_y = wrapped ? 43 : 23;
+        const bool wrapped = width < 350;
+        const int button_y = wrapped ? 43 : 23, status_y = button_y + 20;
         int right = width - 12;
-        for (auto [id, size] : {std::pair{IDC_FIND_CLOSE, 32},
-                                {IDC_FIND_OPTIONS, 42},
-                                {IDC_FIND_RESULTS, 42},
-                                {IDC_FIND_NEXT, 32},
-                                {IDC_FIND_PREVIOUS, 44}}) {
-            ui::position_dialog_control(a.find_bar, id, {right - size, button_y, right, button_y + 14});
-            right -= size + 4;
-        }
-        if (wrapped)
-            right = width - 12;
-        ui::position_dialog_control(a.find_bar, IDC_FIND_COUNT, {right - 50, 6, right, 18});
-        right -= 56;
-        for (int id : {IDC_FIND_REGEX, IDC_FIND_WORDS, IDC_FIND_CASE}) {
-            ui::position_dialog_control(a.find_bar, id, {right - 18, 5, right, 19});
+        for (int id : {IDC_FIND_NEXT, IDC_FIND_PREVIOUS}) {
+            ui::position_dialog_control(a.find_bar, id, {right - 18, button_y, right, button_y + 14});
             right -= 20;
         }
-        ui::position_dialog_control(a.find_bar, IDC_FIND_TEXT, {12, 6, right - 4, 18});
+        ui::position_dialog_control(a.find_bar, IDC_FIND_COUNT,
+                                    {right - 68, button_y + 1, right - 4, button_y + 13});
+        ui::position_dialog_control(a.find_bar, IDC_FIND_SCOPE, {12, 23, 112, 87});
+        // A native combo keeps its own closed height; center it within the control row.
+        RECT row{12, 23, 112, 37}, combo{};
+        MapDialogRect(a.find_bar, &row);
+        const auto scope = GetDlgItem(a.find_bar, IDC_FIND_SCOPE);
+        GetWindowRect(scope, &combo);
+        SetWindowPos(scope, nullptr, row.left,
+                     row.top + (row.bottom - row.top - (combo.bottom - combo.top)) / 2, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        int left = 120;
+        for (int id : {IDC_FIND_CASE, IDC_FIND_WORDS, IDC_FIND_REGEX}) {
+            ui::position_dialog_control(a.find_bar, id, {left, 23, left + 18, 37});
+            left += 20;
+        }
+        ui::position_dialog_control(a.find_bar, IDC_FIND_TEXT, {12, 6, width - 36, 18});
+        ui::position_dialog_control(a.find_bar, IDC_FIND_CLOSE, {width - 30, 5, width - 12, 19});
         ui::position_dialog_control(a.find_bar, IDC_FIND_STATUS, {12, status_y, width - 50, status_y + 10});
         ui::position_dialog_control(a.find_bar, IDC_FIND_STOP,
-                                    {width - 42, status_y - 1, width - 12, status_y + 11});
+                                    {width - 42, status_y - 1, width - 12, status_y + 13});
+        ShowWindow(GetDlgItem(a.find_bar, IDC_FIND_STATUS), a.show_find_status ? SW_SHOW : SW_HIDE);
         ShowWindow(a.find_bar, a.find_open ? SW_SHOW : SW_HIDE);
     }
-    MoveWindow(a.search_results, 0, list_top, sidebar_splitter(a).left,
-               std::max<LONG>(0, r.bottom - list_top - px(a, 30)), TRUE);
-    fit_search_results(a.search_results);
+    a.summary_layout_height = search_summary_height(a);
+    MoveWindow(a.results_summary, px(a, 12), list_top + px(a, 8), std::max(0, sidebar_width - px(a, 24)),
+               a.summary_layout_height - px(a, 16), TRUE);
+    ShowWindow(a.results_summary, results_visible(a) ? SW_SHOW : SW_HIDE);
+    const int results_top = list_top + a.summary_layout_height;
+    MoveWindow(a.search_results, 0, results_top, sidebar_splitter(a).left,
+               std::max<LONG>(0, r.bottom - results_top - px(a, 30)), TRUE);
     if (!results_visible(a) && GetFocus() == a.search_results)
         SetFocus(a.window);
     ShowWindow(a.search_results, results_visible(a) ? SW_SHOW : SW_HIDE);
+    fit_search_results(a.search_results);
     const auto vp = viewport(a);
     const int midpoint = (vp.left + vp.right) / 2, center = (vp.top + vp.bottom) / 2;
     const bool welcome = !a.installed && !a.portable_choice && a.path.empty() && a.pages.empty();
@@ -713,6 +746,9 @@ static void rebuild_bookmarks(App& a) {
 static void update_sidebar(App& a, bool reset = false) {
     int selected = a.pages.empty() ? -1 : a.page;
     if (a.bookmarks) {
+        // Search navigation must not move or expand the user's bookmark tree.
+        if (a.find_open)
+            return;
         auto current = TreeView_GetSelection(a.bookmark_tree);
         selected = -1;
         int best_page = -1;
@@ -755,6 +791,8 @@ static void select_sidebar_tab(App& a, int index) {
     if (index < 0 || index > (a.find_open ? 2 : 1))
         return;
     a.show_results = index == 2;
+    if (a.show_results)
+        a.search_enter_pending = false;
     if (!a.show_results) {
         a.show_sidebar = true;
         a.bookmarks = index == 1;
@@ -1209,16 +1247,29 @@ static void sync_search(App& a) {
         count = L"0 matches";
         status = L"No matches. Check the spelling or change the search options.";
     }
-    if (!a.search_notice.empty())
+    a.search_summary = status;
+    if (!a.search_notice.empty()) {
+        if (!a.search_summary.empty())
+            a.search_summary += L"\n";
+        a.search_summary += a.search_notice;
         status = a.search_notice;
+    }
+    a.show_find_status = a.search_running || a.search_stopped || a.search_failed || !a.search_notice.empty();
     SetDlgItemTextW(a.find_bar, IDC_FIND_COUNT, count.c_str());
-    SetDlgItemTextW(a.find_bar, IDC_FIND_STATUS, status.c_str());
+    SetDlgItemTextW(a.find_bar, IDC_FIND_STATUS, a.show_find_status ? status.c_str() : L"");
+    SetWindowTextW(a.results_summary, a.search_summary.c_str());
     CheckDlgButton(a.find_bar, IDC_FIND_CASE, a.search_options.match_case ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(a.find_bar, IDC_FIND_WORDS, a.search_options.whole_words ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(a.find_bar, IDC_FIND_REGEX, a.search_options.regex ? BST_CHECKED : BST_UNCHECKED);
     EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_PREVIOUS), a.matches.count != 0);
     EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_NEXT), a.matches.count != 0);
     ShowWindow(GetDlgItem(a.find_bar, IDC_FIND_STOP), a.search_running ? SW_SHOW : SW_HIDE);
+    const bool resized = a.find_layout_height != find_height(a);
+    if (resized || a.summary_layout_height != search_summary_height(a)) {
+        layout(a);
+        if (resized)
+            request_render(a);
+    }
     const int selected = ListView_GetNextItem(a.search_results, -1, LVNI_SELECTED);
     if (selected != a.active_match) {
         a.syncing_results = true;
@@ -1231,6 +1282,7 @@ static void sync_search(App& a) {
         }
         a.syncing_results = false;
     }
+    fit_search_results(a.search_results);
     InvalidateRect(a.window, nullptr, FALSE);
 }
 static void start_search(App& a) {
@@ -1248,6 +1300,7 @@ static void start_search(App& a) {
     a.search_running = !a.query.empty() && !a.pages.empty();
     a.search_complete = a.search_stopped = a.search_has_text = a.reveal_match = false;
     a.search_failed = false;
+    a.search_enter_pending = true;
     a.search_notice.clear();
     if (a.search_running)
         submit_search(a.search_worker,
@@ -1273,6 +1326,7 @@ static void find(App& a, int direction) {
     }
     if (a.matches.count == 0)
         return;
+    a.search_enter_pending = false;
     int next = a.active_match + direction;
     a.search_notice.clear();
     if (next < 0 || size_t(next) >= a.matches.count) {
@@ -1291,6 +1345,23 @@ static void find(App& a, int direction) {
         next = next < 0 ? int(a.matches.count) - 1 : 0;
     }
     select_match(a, next);
+}
+static void submit_find(App& a, int direction) {
+    if (search_query(a) != a.query || (a.search_stopped && !a.search_failed) ||
+        (!a.search_running && !a.search_complete && !a.search_stopped))
+        start_search(a);
+    const bool reveal = a.search_enter_pending || !results_visible(a);
+    if (!results_visible(a))
+        select_sidebar_tab(a, 2);
+    a.search_enter_pending = false;
+    // The first Enter submits the query or reveals a hidden result, without advancing it.
+    if (reveal) {
+        select_match(a, a.active_match);
+        if (a.active_match >= 0)
+            ListView_EnsureVisible(a.search_results, a.active_match, FALSE);
+        return;
+    }
+    find(a, direction);
 }
 static void receive_search(App& a) {
     KillTimer(a.window, 4);
@@ -1341,31 +1412,6 @@ static void receive_search(App& a) {
     else
         sync_search(a);
 }
-static INT_PTR CALLBACK search_options_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
-    auto a = reinterpret_cast<App*>(GetWindowLongPtrW(window, DWLP_USER));
-    if (message == WM_INITDIALOG) {
-        a = reinterpret_cast<App*>(lp);
-        SetWindowLongPtrW(window, DWLP_USER, lp);
-        SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_ADDSTRING, 0, LPARAM(L"Entire document"));
-        SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_ADDSTRING, 0, LPARAM(L"Current page"));
-        SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_SETCURSEL, a->search_options.page < 0 ? 0 : 1, 0);
-        ui::style_dialog(window, 45);
-        return TRUE;
-    }
-    if (message == WM_COMMAND && a) {
-        if (LOWORD(wp) == IDOK) {
-            a->search_options.page =
-                SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_GETCURSEL, 0, 0) == 1 ? a->page : -1;
-            EndDialog(window, IDOK);
-            return TRUE;
-        }
-        if (LOWORD(wp) == IDCANCEL) {
-            EndDialog(window, IDCANCEL);
-            return TRUE;
-        }
-    }
-    return FALSE;
-}
 static INT_PTR CALLBACK find_bar_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     auto a = reinterpret_cast<App*>(GetWindowLongPtrW(window, DWLP_USER));
     if (message == WM_INITDIALOG) {
@@ -1374,6 +1420,14 @@ static INT_PTR CALLBACK find_bar_proc(HWND window, UINT message, WPARAM wp, LPAR
         ui::compact_button(GetDlgItem(window, IDC_FIND_CASE), L"Aa");
         ui::compact_button(GetDlgItem(window, IDC_FIND_WORDS), L"ab");
         ui::compact_button(GetDlgItem(window, IDC_FIND_REGEX), L".*");
+        ui::icon_button(GetDlgItem(window, IDC_FIND_PREVIOUS), ToolbarIcon::up);
+        ui::icon_button(GetDlgItem(window, IDC_FIND_NEXT), ToolbarIcon::down);
+        ui::icon_button(GetDlgItem(window, IDC_FIND_CLOSE), ToolbarIcon::close);
+        SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_ADDSTRING, 0, LPARAM(L"Entire document"));
+        SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_ADDSTRING, 0, LPARAM(L"Current page"));
+        SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_SETCURSEL, 0, 0);
+        ShowWindow(GetDlgItem(window, IDC_FIND_STATUS), SW_HIDE);
+        ShowWindow(GetDlgItem(window, IDC_FIND_STOP), SW_HIDE);
         return TRUE;
     }
     if (!a)
@@ -1388,6 +1442,7 @@ static INT_PTR CALLBACK find_bar_proc(HWND window, UINT message, WPARAM wp, LPAR
                 a->active_match = -1;
                 a->search_running = a->search_complete = a->search_stopped = false;
                 a->search_failed = false;
+                a->search_enter_pending = true;
                 a->search_notice = L"";
                 SetTimer(a->window, 3, 180, nullptr);
                 sync_search(*a);
@@ -1407,13 +1462,22 @@ static INT_PTR CALLBACK find_bar_proc(HWND window, UINT message, WPARAM wp, LPAR
         case IDC_FIND_NEXT:
             find(*a);
             return TRUE;
-        case IDC_FIND_RESULTS:
-            select_sidebar_tab(*a, 2);
-            return TRUE;
-        case IDC_FIND_OPTIONS:
-            if (DialogBoxParamW(a->instance, MAKEINTRESOURCEW(IDD_FIND_OPTIONS), a->window,
-                                search_options_proc, LPARAM(a)) == IDOK)
+        case IDC_FIND_SCOPE:
+            if (HIWORD(wp) == CBN_SELENDCANCEL) {
+                SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_SETCURSEL, a->search_options.page < 0 ? 0 : 1,
+                                    0);
+                return TRUE;
+            }
+            if (HIWORD(wp) == CBN_SELENDOK ||
+                (HIWORD(wp) == CBN_SELCHANGE &&
+                 !SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_GETDROPPEDSTATE, 0, 0))) {
+                const bool current_page =
+                    SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_GETCURSEL, 0, 0) == 1;
+                if (current_page == (a->search_options.page >= 0))
+                    return TRUE;
+                a->search_options.page = current_page ? a->page : -1;
                 start_search(*a);
+            }
             return TRUE;
         case IDC_FIND_STOP:
             KillTimer(a->window, 4);
@@ -1620,9 +1684,16 @@ static void command(App& a, int id) {
         layout(a);
         request_render(a);
     } else if (id == cmd_search) {
+        if (!a.find_open) {
+            a.sidebar_before_find = a.show_sidebar;
+            a.bookmarks_before_find = a.bookmarks;
+        }
         a.find_open = !a.find_open;
-        if (!a.find_open)
+        if (!a.find_open) {
             a.show_results = false;
+            a.show_sidebar = a.sidebar_before_find;
+            a.bookmarks = a.bookmarks_before_find;
+        }
         layout(a);
         if (a.find_open) {
             SetFocus(a.search);
@@ -1994,6 +2065,9 @@ static void paint_app(App& a, HDC dc) {
     paint_toolbar(a, dc);
     if (sidebar_visible(a)) {
         fill_rect(dc, {0, vp.top, vp.left, vp.bottom}, a.search_colors.footer);
+        if (results_visible(a))
+            fill_rect(dc, {0, vp.top + a.sidebar_header_height, sidebar_splitter(a).left, vp.bottom},
+                      a.search_colors.body);
         fill_rect(dc, {vp.left - 1, vp.top, vp.left, vp.bottom}, a.search_colors.border);
         auto splitter = sidebar_splitter(a);
         int center = (splitter.left + splitter.right) / 2;
@@ -2360,7 +2434,7 @@ static LRESULT CALLBACK search_proc(HWND window, UINT message, WPARAM wp, LPARAM
     auto& a = *reinterpret_cast<App*>(data);
     if (message == WM_KEYDOWN) {
         if (wp == VK_RETURN) {
-            find(a, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
+            submit_find(a, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
             return 0;
         }
         if (wp == VK_ESCAPE) {
@@ -2482,6 +2556,7 @@ static void create_toolbar(App& a) {
         require(window != nullptr, "Cannot create toolbar entry");
         SendMessageW(window, EM_LIMITTEXT, 16, 0);
         SendMessageW(window, EM_SETCUEBANNER, TRUE, LPARAM(name));
+        ui::center_edit_text(window);
         return window;
     };
     a.page_edit = edit(id_page, L"Page number");
@@ -2639,6 +2714,10 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             SendMessageW(a.search, EM_SETCUEBANNER, TRUE, LPARAM(L"Find in document"));
             SendMessageW(a.search, EM_LIMITTEXT, 4095, 0);
             SetWindowSubclass(a.search, search_proc, 1, DWORD_PTR(&a));
+            a.results_summary =
+                CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT | SS_NOPREFIX, 0, 0, 0, 0, window,
+                                HMENU(INT_PTR(id_results_summary)), a.instance, nullptr);
+            require(a.results_summary != nullptr, "Cannot create search summary");
             a.search_results =
                 CreateWindowExW(0, WC_LISTVIEWW, L"Search Results",
                                 WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_NOCOLUMNHEADER |
@@ -2813,6 +2892,11 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             return LRESULT(a.chrome_background);
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORSTATIC:
+            if (HWND(lp) == a.results_summary) {
+                SetBkColor(HDC(wp), a.search_colors.body);
+                SetTextColor(HDC(wp), a.search_colors.muted);
+                return LRESULT(a.results_background);
+            }
             SetBkColor(HDC(wp), a.search_colors.field);
             SetTextColor(HDC(wp), IsWindowEnabled(HWND(lp)) ? a.search_colors.text : a.search_colors.muted);
             return LRESULT(a.edit_background);
@@ -3337,6 +3421,10 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (message.message == WM_SYSKEYDOWN && app.find_open && IsWindowEnabled(app.window) &&
             (GetKeyState(VK_MENU) & 0x8000) && !(GetKeyState(VK_CONTROL) & 0x8000)) {
+            if (message.wParam == 'I') {
+                SetFocus(GetDlgItem(app.find_bar, IDC_FIND_SCOPE));
+                continue;
+            }
             const int option = message.wParam == 'C'   ? IDC_FIND_CASE
                                : message.wParam == 'W' ? IDC_FIND_WORDS
                                : message.wParam == 'R' ? IDC_FIND_REGEX
@@ -3350,6 +3438,12 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
         if (message.message == WM_KEYDOWN && IsWindowEnabled(app.window)) {
             const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            const auto focus = GetFocus();
+            if (message.wParam == VK_RETURN && GetParent(focus) == app.find_bar && focus != app.search &&
+                focus != GetDlgItem(app.find_bar, IDC_FIND_SCOPE)) {
+                SendMessageW(focus, BM_CLICK, 0, 0);
+                continue;
+            }
             if (ctrl && message.wParam == 'F') {
                 if (!app.find_open)
                     command(app, cmd_search);
@@ -3364,7 +3458,8 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
                     find(app, shift ? -1 : 1);
                 continue;
             }
-            if (message.wParam == VK_ESCAPE && app.find_open) {
+            if (message.wParam == VK_ESCAPE && app.find_open &&
+                !SendDlgItemMessageW(app.find_bar, IDC_FIND_SCOPE, CB_GETDROPPEDSTATE, 0, 0)) {
                 command(app, cmd_search);
                 continue;
             }
@@ -3372,13 +3467,12 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
         if (message.message == WM_KEYDOWN && message.wParam == VK_TAB) {
             std::vector<HWND> order{app.window, app.toolbar};
             for (auto control :
-                 {app.page_edit, app.zoom_edit, app.search, GetDlgItem(app.find_bar, IDC_FIND_CASE),
-                  GetDlgItem(app.find_bar, IDC_FIND_WORDS), GetDlgItem(app.find_bar, IDC_FIND_REGEX),
-                  GetDlgItem(app.find_bar, IDC_FIND_PREVIOUS), GetDlgItem(app.find_bar, IDC_FIND_NEXT),
-                  GetDlgItem(app.find_bar, IDC_FIND_RESULTS), GetDlgItem(app.find_bar, IDC_FIND_OPTIONS),
-                  GetDlgItem(app.find_bar, IDC_FIND_CLOSE), GetDlgItem(app.find_bar, IDC_FIND_STOP),
-                  app.sidebar_tabs, app.search_results, app.sidebar, app.bookmark_tree, app.welcome_install,
-                  app.welcome_portable})
+                 {app.page_edit, app.zoom_edit, app.search, GetDlgItem(app.find_bar, IDC_FIND_SCOPE),
+                  GetDlgItem(app.find_bar, IDC_FIND_CASE), GetDlgItem(app.find_bar, IDC_FIND_WORDS),
+                  GetDlgItem(app.find_bar, IDC_FIND_REGEX), GetDlgItem(app.find_bar, IDC_FIND_PREVIOUS),
+                  GetDlgItem(app.find_bar, IDC_FIND_NEXT), GetDlgItem(app.find_bar, IDC_FIND_CLOSE),
+                  GetDlgItem(app.find_bar, IDC_FIND_STOP), app.sidebar_tabs, app.search_results, app.sidebar,
+                  app.bookmark_tree, app.welcome_install, app.welcome_portable})
                 if (IsWindowVisible(control) && IsWindowEnabled(control))
                     order.push_back(control);
             auto it = std::find(order.begin(), order.end(), GetFocus());

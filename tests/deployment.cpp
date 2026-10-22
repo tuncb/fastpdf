@@ -130,6 +130,75 @@ static ui::InstallationAction installation_fixture(ui::InstallationOptions& opti
         std::rethrow_exception(dialog_error);
     return result;
 }
+static void check_edit_center(HWND edit) {
+    RECT window{};
+    GetWindowRect(edit, &window);
+    POINT origin{};
+    ClientToScreen(edit, &origin);
+    const HDC dc = GetDC(edit);
+    const auto old = SelectObject(dc, HFONT(SendMessageW(edit, WM_GETFONT, 0, 0)));
+    TEXTMETRICW metrics{};
+    GetTextMetricsW(dc, &metrics);
+    SelectObject(dc, old);
+    ReleaseDC(edit, dc);
+    const auto position = SendMessageW(edit, EM_POSFROMCHAR, 0, 0);
+    const int top = origin.y + short(HIWORD(position)) - window.top;
+    const int bottom = window.bottom - window.top - top - metrics.tmHeight;
+    test(std::abs(top - bottom) <= 1 && top >= 0 && bottom >= 0,
+         "Native edit text has equal space above and below it");
+    for (int y : {window.top + 2, window.bottom - 3})
+        test(SendMessageW(edit, WM_NCHITTEST, 0, MAKELPARAM(window.left + 8, y)) == HTCLIENT,
+             "Vertical padding accepts mouse input as part of the field");
+}
+static void edit_alignment_tests() {
+    const auto instance = GetModuleHandleW(nullptr);
+    const auto parent =
+        CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 400, 200, nullptr, nullptr, instance, nullptr);
+    for (const auto [resource, control] :
+         {std::pair{IDD_FIND_BAR, IDC_FIND_TEXT}, std::pair{IDD_PASSWORD, IDC_PASSWORD},
+          std::pair{IDD_GOTO, IDC_PAGE}}) {
+        const auto dialog = CreateDialogParamW(instance, MAKEINTRESOURCEW(resource), parent, nullptr, 0);
+        test(dialog != nullptr, "Create the real text-entry dialog template");
+        ui::style_dialog(dialog, -1, IDOK, false);
+        const auto edit = GetDlgItem(dialog, control);
+        SetWindowTextW(edit, L"741");
+        check_edit_center(edit);
+        DestroyWindow(dialog);
+    }
+    for (DWORD style : {DWORD(0), DWORD(WS_BORDER), DWORD(WS_BORDER | ES_PASSWORD),
+                        DWORD(WS_BORDER | ES_NUMBER), DWORD(WS_BORDER | ES_READONLY)}) {
+        const auto edit = CreateWindowExW(0, L"EDIT", L"741", WS_CHILD | ES_AUTOHSCROLL | style, 0, 0, 200,
+                                          36, parent, nullptr, instance, nullptr);
+        ui::center_edit_text(edit);
+        for (int dpi : {96, 144, 192}) {
+            const auto font = CreateFontW(-MulDiv(10, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                          DEFAULT_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            SendMessageW(edit, WM_SETFONT, WPARAM(font), FALSE);
+            for (int height : {24, 36}) {
+                MoveWindow(edit, 0, 0, 200, MulDiv(height, dpi, 96), FALSE);
+                check_edit_center(edit);
+                ui::center_edit_text(edit);
+                SendMessageW(edit, WM_THEMECHANGED, 0, 0);
+                check_edit_center(edit);
+                test(SendMessageW(edit, EM_GETLINECOUNT, 0, 0) == 1,
+                     "Centered fields retain single-line editing");
+            }
+            SendMessageW(edit, WM_SETFONT, WPARAM(GetStockObject(DEFAULT_GUI_FONT)), FALSE);
+            DeleteObject(font);
+        }
+        DestroyWindow(edit);
+    }
+    const auto multiline =
+        CreateWindowExW(0, L"EDIT", L"First\r\nSecond", WS_CHILD | WS_BORDER | ES_MULTILINE, 0, 0, 200, 100,
+                        parent, nullptr, instance, nullptr);
+    RECT before{}, after{};
+    GetClientRect(multiline, &before);
+    ui::center_edit_text(multiline);
+    GetClientRect(multiline, &after);
+    test(EqualRect(&before, &after), "Multiline documents retain their full text area");
+    DestroyWindow(parent);
+}
 static void installation_dialog_tests() {
     RegistrySandbox theme_registry;
     const auto set_light = [](DWORD light) {
@@ -148,6 +217,7 @@ static void installation_dialog_tests() {
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES};
     test(InitCommonControlsEx(&controls) != FALSE, "Initialize installation controls");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    edit_alignment_tests();
     ui::InstallationOptions options{L"C:\\isolated user 文書\\LocalAppData\\Programs\\FastPDF"};
     const auto install = installation_fixture(options, [&](HWND window) {
         const HDC dc = GetDC(window);
