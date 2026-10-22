@@ -428,6 +428,16 @@ def generate(directory):
                b"q 1 0 0 rg 40 0 0 40 140 20 cm " + inverse_mask + b" Q\n")
     add("inline_stencil_reuse", pdf(base(content)),
         pixels=[(40, 180, (255, 0, 0)), (100, 180, (0, 0, 255)), (160, 180, (255, 255, 255))])
+    content = (b"q 1 0 0 rg 40 0 0 40 20.3 20.3 cm " + inline_mask + b" Q " +
+               b"q /Half gs 1 0 0 rg 40 0 0 40 80.3 20.3 cm " + inline_mask + b" Q " +
+               b"q 0 0 1 rg 40 0 0 40 140.3 20.3 cm " + inline_mask + b" Q " +
+               b"q /Quarter gs 1 0 0 rg 40 0 0 40 200.3 20.3 cm " + inline_mask + b" Q " +
+               b"q 1 0 0 rg 0 40 -40 0 60.3 100.3 cm " + inline_mask + b" Q")
+    add("stencil_brush_reuse", pdf(base(content,
+        b"/ExtGState << /Half << /ca .5 >> /Quarter << /ca .25 >> >>")),
+        pixels=[(40, 180, (255, 0, 0)), (100, 180, (255, 128, 128)),
+                (160, 180, (0, 0, 255)), (220, 180, (255, 191, 191)),
+                (40, 100, (255, 0, 0))], tolerance=2)
     for cap in (0, 1, 2):
         content = f"20 w {cap} J 50 50 m 50 50 l s 100 50 m 100 50 l S 150 50 m h S 200 50 m S ".encode()
         # The last stroke contains a degenerate and a non-degenerate subpath.
@@ -774,6 +784,18 @@ def generate(directory):
     objects[3]=b"<< /Type /Font /Subtype /Type3 /Name /F1 /FontBBox [0 0 600 700] /FontMatrix [.001 0 0 .001 0 0] /FirstChar 65 /LastChar 65 /Widths [600] /Encoding << /Differences [65 /A] >> /CharProcs << /A 6 0 R >> /Resources << >> >>"
     objects += [stream(b"600 0 d0 0 0 500 700 re f")]
     add("type3",pdf(objects),text="AAA",pixel=(50,150,(0,0,0)))
+    content = (b"BT /F1 1 Tf 1 0 0 1 20.25 50.25 Tm (A) Tj ET "
+               b"0 g 80.42 20.42 99.88 99.88 re f 1 g q 100 0 0 100 80.36 20.36 cm " +
+               scan_mask + b" Q")
+    objects = base(content)
+    objects[3] = (b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 11 11] "
+                  b"/FontMatrix [1 0 0 1 0 0] /FirstChar 65 /LastChar 65 /Widths [10] "
+                  b"/Encoding << /Differences [65 /A] >> /CharProcs << /A 6 0 R >> /Resources << >> >>")
+    objects.append(stream(b"10 0 d0 q 10.25 0 0 10.25 0 0 cm " + inline_mask + b" Q"))
+    add("type3_stencil_edges", pdf(objects), pixels=[
+        (20, 165, (64, 64, 64)), (30, 165, (128, 128, 128)),
+        (25, 159, (128, 128, 128)), (25, 169, (64, 64, 64)), (25, 165, (0, 0, 0)),
+        (80, 150, (255, 255, 255)), (180, 150, (255, 255, 255)), (130, 150, (0, 0, 0))], tolerance=3)
     # Type 3 widths use FontMatrix, including across separate text operations.
     objects=base(b"BT /F1 40 Tf 20 160 Td (AAA) Tj 0 -60 Td (A) Tj (A) Tj (A) Tj "
                  b"0 -60 Td 3 Tc 5 Tw 80 Tz [(A) -100 ( ) 100 (A)] TJ (A) Tj ET")

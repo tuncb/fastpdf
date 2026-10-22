@@ -80,6 +80,7 @@ struct StencilBitmap {
     std::shared_ptr<Image> source;
     Color color;
     ID2D1Bitmap* bitmap = nullptr;
+    ID2D1BitmapBrush* edge_brush = nullptr;
 };
 struct Surface {
     IWICBitmap* bitmap = nullptr;
@@ -94,8 +95,10 @@ struct Surface {
 };
 static void destroy_surface(Surface* s) {
     if (s) {
-        for (auto& [key, entry] : s->stencils)
+        for (auto& [key, entry] : s->stencils) {
+            release(entry.edge_brush);
             release(entry.bitmap);
+        }
         release(s->solid_brush);
         release(s->stroke_style);
         release(s->target);
@@ -150,6 +153,7 @@ struct Context {
     bool collect_text = true;
     bool alpha_only = false;
     bool text_only = false;
+    bool glyph_image = false;
     int origin_x = 0, origin_y = 0;
 };
 static void set_transform(Context& c, Matrix m = {}) {
@@ -183,6 +187,18 @@ static void set_rect_clip_antialias(Context& c, D2D1_ANTIALIAS_MODE antialias) {
     for (size_t i = first; i < c.clips.size(); ++i)
         apply_clip(c, c.clips[i], antialias);
     c.canvas->target->SetTransform(transform);
+}
+static bool rect_clip_affects_edges(const Context& c, Rect bounds) {
+    if (!std::isfinite(bounds.x0) || !std::isfinite(bounds.y0) ||
+        !std::isfinite(bounds.x1) || !std::isfinite(bounds.y1))
+        return true;
+    // These are the same clips changed by set_rect_clip_antialias. An image
+    // at least one pixel inside each edge cannot touch their partial coverage.
+    for (auto clip = c.clips.rbegin(); clip != c.clips.rend() && !clip->geometry; ++clip)
+        if (bounds.x0 < clip->bounds.left + 1 || bounds.y0 < clip->bounds.top + 1 ||
+            bounds.x1 > clip->bounds.right - 1 || bounds.y1 > clip->bounds.bottom - 1)
+            return true;
+    return false;
 }
 static void push_clip(Context& c, Clip clip) {
     require(c.clips.size() < 256, "Graphics clipping depth limit exceeded");
@@ -876,38 +892,52 @@ static void draw_image(Context& c, const Value& image, const Value& resources,
             auto antialias = target.canvas->target->GetAntialiasMode();
             // Image sampling still interpolates pixels. Axis-aligned outer
             // edges use pixel centers, so adjacent image tiles meet exactly.
-            // Narrow stencils need fractional coverage: producers use masks
-            // to draw table rules and figure borders narrower than one pixel.
-            bool narrow_stencil = decoded->stencil && (width < 1 || height < 1);
-            bool aligned = !narrow_stencil &&
+            // Stencil glyphs and subpixel rules need fractional coverage.
+            // Expanding a glyph's bitmap boundary makes its stems too heavy.
+            bool fractional_stencil = decoded->stencil && (target.glyph_image || width < 1 || height < 1);
+            bool aligned = !fractional_stencil &&
                            ((target.g.ctm.b == 0 && target.g.ctm.c == 0) ||
                             (target.g.ctm.a == 0 && target.g.ctm.d == 0));
             ID2D1BitmapBrush* edge_brush = nullptr;
             Rect edge_bounds{};
+            auto bounds = transformed_box(image_transform, {0, 0, 1, 1});
             if (aligned && decoded->stencil) {
                 // A scanned page can paint a black base, then cover its white
                 // pixels with a stencil. Cover the complete boundary pixels;
                 // partial edge coverage would expose a gray frame underneath.
-                auto bounds = transformed_box(image_transform, {0, 0, 1, 1});
                 bounds = {std::floor(bounds.x0), std::floor(bounds.y0),
                           std::ceil(bounds.x1), std::ceil(bounds.y1)};
                 edge_bounds = transformed_box(inverse(image_transform), bounds);
-                auto properties = D2D1::BitmapBrushProperties(
-                    D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
-                    interpolate ? D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
-                                : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
-                auto result = target.canvas->target->CreateBitmapBrush(
-                    bitmap, properties, D2D1::BrushProperties(target.g.fill_alpha,
-                        D2D1::Matrix3x2F::Scale(1.f / decoded->width, 1.f / decoded->height)), &edge_brush);
-                if (FAILED(result)) {
-                    release(bitmap);
-                    hr(result, "Create stencil edge brush");
+                auto found = canvas.stencils.find(decoded.get());
+                auto* entry = found != canvas.stencils.end() && found->second.bitmap == bitmap
+                                  ? &found->second : nullptr;
+                if (entry && entry->edge_brush) {
+                    edge_brush = entry->edge_brush;
+                    edge_brush->AddRef();
+                } else {
+                    auto properties = D2D1::BitmapBrushProperties(
+                        D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP);
+                    auto result = target.canvas->target->CreateBitmapBrush(
+                        bitmap, properties, D2D1::BrushProperties(1,
+                            D2D1::Matrix3x2F::Scale(1.f / decoded->width, 1.f / decoded->height)), &edge_brush);
+                    if (FAILED(result)) {
+                        release(bitmap);
+                        hr(result, "Create stencil edge brush");
+                    }
+                    if (entry) {
+                        entry->edge_brush = edge_brush;
+                        edge_brush->AddRef();
+                    }
                 }
+                edge_brush->SetOpacity(target.g.fill_alpha);
+                edge_brush->SetInterpolationMode(interpolate ? D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
+                                                            : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
             }
-            if (aligned) {
+            bool change_clip_edges = aligned && rect_clip_affects_edges(target, bounds);
+            if (change_clip_edges)
                 set_rect_clip_antialias(target, D2D1_ANTIALIAS_MODE_ALIASED);
+            if (aligned)
                 target.canvas->target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-            }
             if (edge_brush)
                 target.canvas->target->FillRectangle(D2D1::RectF(float(edge_bounds.x0), float(edge_bounds.y0),
                     float(edge_bounds.x1), float(edge_bounds.y1)), edge_brush);
@@ -918,7 +948,7 @@ static void draw_image(Context& c, const Value& image, const Value& resources,
             target.canvas->target->SetAntialiasMode(antialias);
             // Vector strokes can lie on a fractional clip boundary. Restore
             // edge coverage so those strokes are not discarded with a pixel.
-            if (aligned)
+            if (change_clip_edges)
                 set_rect_clip_antialias(target, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             release(edge_brush);
             release(bitmap);
@@ -1020,18 +1050,22 @@ static void show_text(Context& c, std::string_view text, const Value& resources,
                 auto& procedure = entry(*c.document, entry(*c.document, f.dictionary, "CharProcs"), g.name);
                 if (procedure.has_stream) {
                     auto saved = c.g;
+                    bool saved_glyph_image = c.glyph_image;
                     size_t clips = c.clips.size();
                     c.g.ctm = multiply(local, f.matrix);
                     auto& font_resources = entry(*c.document, f.dictionary, "Resources");
                     auto bytes = type3_content(*c.renderer, *c.document, procedure);
+                    c.glyph_image = true;
                     try {
                         interpret(c, *bytes, font_resources.kind == Kind::null ? resources : font_resources,
                                   c.depth + 1);
                     } catch (...) {
+                        c.glyph_image = saved_glyph_image;
                         pop_clips(c, clips);
                         c.g = saved;
                         throw;
                     }
+                    c.glyph_image = saved_glyph_image;
                     pop_clips(c, clips);
                     c.g = saved;
                 }
