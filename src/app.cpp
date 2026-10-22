@@ -18,14 +18,17 @@
 #include <exception>
 #include <optional>
 #include "ui_style.h"
+#include "search.h"
 
 using namespace pdf;
 constexpr UINT worker_message = WM_APP + 1;
-constexpr int id_sidebar = 200, id_search = 201, id_toolbar = 202, id_page = 203, id_zoom = 204;
+constexpr UINT search_message = WM_APP + 3;
+constexpr int id_sidebar = 200, id_toolbar = 202, id_page = 203, id_zoom = 204;
 constexpr int id_bookmark_tree = 205;
+constexpr int id_find_bar = 206, id_results = 207, id_sidebar_tabs = 208;
 constexpr int page_slot = 100, zoom_slot = 101, toolbar_height = 36;
 constexpr const wchar_t* menu_titles[] = {L"&File", L"&View", L"&Help"};
-enum class Job { open, render, search, preview, print };
+enum class Job { open, render, preview, print };
 enum class Fit { page, width, custom };
 struct PageInfo {
     double width = 612, height = 792;
@@ -45,7 +48,7 @@ static void destroy_print_job(PrintJob* job) {
 struct Request {
     Job kind = Job::render;
     uint64_t document = 0, ticket = 0;
-    std::wstring path, password, query;
+    std::wstring path, password;
     int page = 0, rotation = 0;
     double scale = 1;
     std::shared_ptr<PrintJob> print;
@@ -126,9 +129,10 @@ constexpr ToolbarTool toolbar_tools[] = {
 };
 struct App {
     HWND window = nullptr, sidebar = nullptr, search = nullptr;
-    HWND bookmark_tree = nullptr;
+    HWND bookmark_tree = nullptr, sidebar_tabs = nullptr;
     std::vector<HTREEITEM> bookmark_items;
     int sidebar_width = ui::sidebar_width, splitter_offset = 0;
+    int sidebar_header_height = ui::sidebar_header, tab_hover = -1;
     bool resizing_sidebar = false, syncing_bookmarks = false;
     HWND toolbar = nullptr, page_edit = nullptr, zoom_edit = nullptr;
     HWND welcome_install = nullptr, welcome_portable = nullptr;
@@ -141,6 +145,17 @@ struct App {
     HWND input_hover = nullptr;
     int sidebar_hover = -1;
     Worker worker;
+    SearchWorker search_worker;
+    HWND find_bar = nullptr, search_results = nullptr;
+    SearchOptions search_options;
+    std::vector<SearchMatch> matches;
+    int active_match = -1, search_start_page = 0, search_checked = 0, search_total = 0;
+    bool search_running = false, search_complete = false, search_has_text = false;
+    bool show_results = false, reveal_match = false, search_stopped = false;
+    std::wstring search_notice;
+    ui::DialogColors search_colors{};
+    HBRUSH results_background = nullptr;
+    HFONT search_font = nullptr;
     UINT dpi = 96;
     uint64_t document = 0, ticket = 0, render_ticket = 0, search_ticket = 0;
     std::wstring path, password, status = L"Open a PDF to begin", query;
@@ -179,6 +194,12 @@ static void command(App& a, int id);
 static void paint_input_frame(App& a, HDC dc, HWND parent, HWND input);
 static void paint_sidebar_item(App& a, HDC dc, RECT rect, int index, bool selected, bool focused);
 static void label(HDC dc, RECT rect, std::wstring_view text, COLORREF color, HFONT font, UINT flags);
+static void find(App& a, int direction = 1);
+static void start_search(App& a);
+static void sync_search(App& a);
+static void select_match(App& a, int index);
+static void reveal_search_match(App& a);
+static INT_PTR CALLBACK find_bar_proc(HWND window, UINT message, WPARAM wp, LPARAM lp);
 static std::wstring lower(std::wstring s) {
     for (auto& c : s)
         c = wchar_t(std::towlower(c));
@@ -265,22 +286,7 @@ static void worker_run(Worker& w) {
                             "Document is no longer open");
                     if (request.kind == Job::render || request.kind == Job::preview)
                         result.bitmap = render(request.page, request.scale, request.rotation);
-                    else if (request.kind == Job::search) {
-                        auto needle = lower(request.query);
-                        result.page = -1;
-                        for (size_t offset = 0; offset < document.pages.size(); ++offset) {
-                            check_cancel(document);
-                            size_t page = (size_t(request.page) + offset) % document.pages.size();
-                            auto text = render_page(renderer, document, page, 1, 0, true);
-                            if (lower(page_text(text)).find(needle) != std::wstring::npos) {
-                                result.page = int(page);
-                                result.message = L"Match on page " + std::to_wstring(page + 1);
-                                break;
-                            }
-                        }
-                        if (result.page < 0)
-                            result.message = L"No matches for “" + request.query + L"”";
-                    } else if (request.kind == Job::print) {
+                    else if (request.kind == Job::print) {
                         HDC dc = request.print->dc;
                         DOCINFOW info{sizeof(info)};
                         info.lpszDocName = document.path.c_str();
@@ -375,8 +381,6 @@ static void enqueue(App& a, Request request) {
     request.ticket = ++a.ticket;
     if (request.kind == Job::render)
         a.render_ticket = request.ticket;
-    if (request.kind == Job::search)
-        a.search_ticket = request.ticket;
     if (request.kind == Job::preview)
         a.preview_ticket = request.ticket;
     {
@@ -400,11 +404,24 @@ static RECT client(App& a) {
     GetClientRect(a.window, &r);
     return r;
 }
+static int find_height(App& a) {
+    if (!a.find_open || !a.find_bar)
+        return 0;
+    RECT units{0, 0, 0, 36};
+    MapDialogRect(a.find_bar, &units);
+    return units.bottom;
+}
+static bool results_visible(const App& a) {
+    return a.find_open && a.show_results;
+}
+static bool sidebar_visible(const App& a) {
+    return (a.show_sidebar || results_visible(a)) && !a.pages.empty();
+}
 static RECT viewport(App& a) {
     RECT r = client(a);
-    r.top = px(a, toolbar_height + (a.find_open ? 40 : 0));
+    r.top = px(a, toolbar_height) + find_height(a);
     r.bottom -= px(a, 30);
-    if (a.show_sidebar && !a.pages.empty()) {
+    if (sidebar_visible(a)) {
         int maximum = std::max(0, int(r.right) - px(a, ui::document_min_width));
         r.left = std::clamp(px(a, a.sidebar_width), std::min(px(a, ui::sidebar_min_width), maximum), maximum);
     }
@@ -499,8 +516,8 @@ static void style_menu(App& a, HMENU menu, bool bar) {
                 shortcut = title.substr(tab + 1);
                 title.resize(tab);
             }
-            a.menu_items.push_back({std::move(title), std::move(shortcut), bar,
-                                    (item.fType & MFT_SEPARATOR) != 0});
+            a.menu_items.push_back(
+                {std::move(title), std::move(shortcut), bar, (item.fType & MFT_SEPARATOR) != 0});
             item.dwItemData = reinterpret_cast<ULONG_PTR>(&a.menu_items.back());
         }
         // Keep the native strings and submenus for accessibility and menu navigation.
@@ -532,7 +549,23 @@ static void fonts(App& a) {
     SendMessageW(a.bookmark_tree, WM_SETFONT, WPARAM(a.font), TRUE);
     TreeView_SetItemHeight(a.bookmark_tree, px(a, ui::row_height));
     TreeView_SetIndent(a.bookmark_tree, px(a, 20));
-    SendMessageW(a.search, WM_SETFONT, WPARAM(a.small_font), TRUE);
+    if (a.search_font)
+        DeleteObject(a.search_font);
+    a.search_font =
+        CreateFontW(-MulDiv(10, int(a.dpi), 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    if (a.find_bar) {
+        SendMessageW(a.find_bar, WM_SETFONT, WPARAM(a.search_font), FALSE);
+        for (auto child = GetWindow(a.find_bar, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
+            SendMessageW(child, WM_SETFONT, WPARAM(a.search_font), TRUE);
+    }
+    if (a.search_results) {
+        SendMessageW(a.search_results, WM_SETFONT, WPARAM(a.search_font), TRUE);
+        SendMessageW(a.search_results, LB_SETITEMHEIGHT, 0, px(a, 72));
+    }
+    SendMessageW(a.sidebar_tabs, WM_SETFONT, WPARAM(a.search_font), TRUE);
+    TabCtrl_SetPadding(a.sidebar_tabs, px(a, 12), 0);
+    TabCtrl_SetItemSize(a.sidebar_tabs, 0, px(a, ui::sidebar_header));
     for (auto control : {a.welcome_install, a.welcome_portable})
         SendMessageW(control, WM_SETFONT, WPARAM(a.font), TRUE);
     for (auto control : {a.toolbar, a.page_edit, a.zoom_edit})
@@ -542,22 +575,62 @@ static void fonts(App& a) {
 }
 static void layout(App& a) {
     auto r = client(a);
-    int top = px(a, toolbar_height + (a.find_open ? 40 : 0));
-    int list_top = top + px(a, ui::sidebar_header);
+    int top = px(a, toolbar_height) + find_height(a);
+    const int tab_count = a.find_open ? 3 : 2;
+    while (TabCtrl_GetItemCount(a.sidebar_tabs) > tab_count)
+        TabCtrl_DeleteItem(a.sidebar_tabs, tab_count);
+    constexpr const wchar_t* titles[] = {L"Pages", L"Bookmarks", L"Results"};
+    for (int i = TabCtrl_GetItemCount(a.sidebar_tabs); i < tab_count; ++i) {
+        TCITEMW item{};
+        item.mask = TCIF_TEXT;
+        item.pszText = const_cast<wchar_t*>(titles[i]);
+        TabCtrl_InsertItem(a.sidebar_tabs, i, &item);
+    }
+    TabCtrl_SetCurSel(a.sidebar_tabs, results_visible(a) ? 2 : a.bookmarks ? 1 : 0);
+    const int sidebar_width = sidebar_splitter(a).left;
+    MoveWindow(a.sidebar_tabs, 0, top, sidebar_width, px(a, ui::sidebar_header), FALSE);
+    RECT tab_area{0, 0, sidebar_width, px(a, ui::sidebar_header)};
+    TabCtrl_AdjustRect(a.sidebar_tabs, FALSE, &tab_area);
+    a.sidebar_header_height = std::max(px(a, ui::sidebar_header), int(tab_area.top));
+    MoveWindow(a.sidebar_tabs, 0, top, sidebar_width, a.sidebar_header_height, TRUE);
+    ShowWindow(a.sidebar_tabs, sidebar_visible(a) ? SW_SHOW : SW_HIDE);
+    InvalidateRect(a.sidebar_tabs, nullptr, FALSE);
+    int list_top = top + a.sidebar_header_height;
     for (auto control : {a.sidebar, a.bookmark_tree}) {
         MoveWindow(control, 0, list_top, sidebar_splitter(a).left,
                    std::max<LONG>(0, r.bottom - list_top - px(a, 30)), TRUE);
         // Custom rows cover the full width, including the area outside native text bounds.
         InvalidateRect(control, nullptr, FALSE);
-        bool visible =
-            a.show_sidebar && !a.pages.empty() && (control == a.bookmark_tree ? a.bookmarks : !a.bookmarks);
+        bool visible = a.show_sidebar && !results_visible(a) && !a.pages.empty() &&
+                       (control == a.bookmark_tree ? a.bookmarks : !a.bookmarks);
         if (!visible && GetFocus() == control)
             SetFocus(a.window);
         ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
     }
-    MoveWindow(a.search, px(a, 18), px(a, toolbar_height + 11),
-               std::max<LONG>(80, std::min<LONG>(px(a, 420), r.right - px(a, 140))), px(a, 18), TRUE);
-    ShowWindow(a.search, a.find_open ? SW_SHOW : SW_HIDE);
+    if (a.find_bar) {
+        MoveWindow(a.find_bar, 0, px(a, toolbar_height), r.right, find_height(a), TRUE);
+        RECT unit{0, 0, 4, 8};
+        MapDialogRect(a.find_bar, &unit);
+        int width = MulDiv(r.right, 4, std::max(1L, unit.right)), right = width - 12;
+        for (auto [id, size] : {std::pair{IDC_FIND_CLOSE, 32},
+                                {IDC_FIND_OPTIONS, 42},
+                                {IDC_FIND_RESULTS, 42},
+                                {IDC_FIND_NEXT, 32},
+                                {IDC_FIND_PREVIOUS, 44}}) {
+            ui::position_dialog_control(a.find_bar, id, {right - size, 5, right, 19});
+            right -= size + 4;
+        }
+        ui::position_dialog_control(a.find_bar, IDC_FIND_COUNT, {right - 50, 6, right, 18});
+        ui::position_dialog_control(a.find_bar, IDC_FIND_TEXT, {12, 6, std::max(50, right - 56), 18});
+        ui::position_dialog_control(a.find_bar, IDC_FIND_STATUS, {12, 23, width - 50, 33});
+        ui::position_dialog_control(a.find_bar, IDC_FIND_STOP, {width - 42, 22, width - 12, 34});
+        ShowWindow(a.find_bar, a.find_open ? SW_SHOW : SW_HIDE);
+    }
+    MoveWindow(a.search_results, 0, list_top, sidebar_splitter(a).left,
+               std::max<LONG>(0, r.bottom - list_top - px(a, 30)), TRUE);
+    if (!results_visible(a) && GetFocus() == a.search_results)
+        SetFocus(a.window);
+    ShowWindow(a.search_results, results_visible(a) ? SW_SHOW : SW_HIDE);
     const auto vp = viewport(a);
     const int midpoint = (vp.left + vp.right) / 2, center = (vp.top + vp.bottom) / 2;
     const bool welcome = !a.installed && !a.portable_choice && a.path.empty() && a.pages.empty();
@@ -648,6 +721,18 @@ static void update_sidebar(App& a, bool reset = false) {
         SendMessageW(a.sidebar, LB_SETCURSEL, WPARAM(selected), 0);
     }
 }
+static void select_sidebar_tab(App& a, int index) {
+    if (index < 0 || index > (a.find_open ? 2 : 1))
+        return;
+    a.show_results = index == 2;
+    if (!a.show_results) {
+        a.show_sidebar = true;
+        a.bookmarks = index == 1;
+        update_sidebar(a);
+    }
+    layout(a);
+    request_render(a);
+}
 static void load_file(App& a, const std::wstring& path, const std::wstring& password = {}) {
     if (a.restore && (a.restore->document.empty() ||
                       std::filesystem::absolute(path) != std::filesystem::absolute(a.restore->document)))
@@ -661,6 +746,16 @@ static void load_file(App& a, const std::wstring& path, const std::wstring& pass
     a.bitmap.reset();
     a.selected.clear();
     a.find_open = false;
+    cancel_search(a.search_worker);
+    KillTimer(a.window, 3);
+    ++a.search_ticket;
+    a.matches.clear();
+    a.active_match = -1;
+    a.search_running = a.search_complete = a.search_stopped = a.search_has_text = false;
+    a.show_results = a.reveal_match = false;
+    a.search_notice.clear();
+    SetWindowTextW(a.search, L"");
+    SendMessageW(a.search_results, LB_RESETCONTENT, 0, 0);
     a.query.clear();
     a.page = 0;
     a.rotation = 0;
@@ -829,8 +924,9 @@ static void paint_print_preview(App& a, const DRAWITEMSTRUCT& draw) {
     } else {
         RECT bounds = draw.rcItem;
         InflateRect(&bounds, -12, -12);
-        label(draw.hDC, bounds, a.preview_error.empty() ? L"Loading preview…" : a.preview_error, ui::system_dialog_colors().muted,
-              HFONT(SendMessageW(a.print_preview, WM_GETFONT, 0, 0)), DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+        label(draw.hDC, bounds, a.preview_error.empty() ? L"Loading preview…" : a.preview_error,
+              ui::system_dialog_colors().muted, HFONT(SendMessageW(a.print_preview, WM_GETFONT, 0, 0)),
+              DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
     }
     RestoreDC(draw.hDC, saved);
 }
@@ -860,9 +956,8 @@ static INT_PTR CALLBACK print_preview_dialog(HWND window, UINT message, WPARAM w
         ui::position_dialog_control(window, IDC_PREVIEW_IMAGE, {12, 25, width - 12, footer - 9});
         ui::position_dialog_control(window, IDC_PREVIEW_PREVIOUS, {12, footer + 6, 62, footer + 20});
         ui::position_dialog_control(window, IDC_PREVIEW_NEXT,
-                                     {width - 62, footer + 6, width - 12, footer + 20});
-        ui::position_dialog_control(window, IDC_PREVIEW_PAGE,
-                                     {68, footer + 6, width - 68, footer + 20});
+                                    {width - 62, footer + 6, width - 12, footer + 20});
+        ui::position_dialog_control(window, IDC_PREVIEW_PAGE, {68, footer + 6, width - 68, footer + 20});
         PostMessageW(window, WM_APP, 0, 0);
         return TRUE;
     }
@@ -944,8 +1039,8 @@ static UINT_PTR CALLBACK print_dialog_hook(HWND window, UINT message, WPARAM, LP
         const int button_height = MulDiv(14, units.bottom, 8);
         const int cancel_width = MulDiv(44, units.right, 4);
         const int primary_width = MulDiv(50, units.right, 4);
-        MoveWindow(GetDlgItem(window, IDCANCEL), right - cancel_width, y_button,
-                   cancel_width, button_height, TRUE);
+        MoveWindow(GetDlgItem(window, IDCANCEL), right - cancel_width, y_button, cancel_width, button_height,
+                   TRUE);
         MoveWindow(GetDlgItem(window, IDOK), right - cancel_width - MulDiv(6, units.right, 4) - primary_width,
                    y_button, primary_width, button_height, TRUE);
     }
@@ -1046,20 +1141,233 @@ static INT_PTR CALLBACK goto_dialog(HWND window, UINT message, WPARAM wp, LPARAM
     }
     return FALSE;
 }
-static void find(App& a, bool next = false) {
+static std::wstring search_query(App& a) {
     wchar_t text[4096]{};
-    GetWindowTextW(a.search, text, 4096);
-    a.query = text;
-    if (a.query.empty() || a.pages.empty())
+    GetWindowTextW(a.search, text, int(std::size(text)));
+    std::wstring value = text;
+    const auto first = value.find_first_not_of(L" \t\r\n");
+    return first == std::wstring::npos ? L""
+                                       : value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
+}
+static void sync_search(App& a) {
+    if (!a.find_bar)
         return;
-    a.status = L"Searching…";
-    a.busy = true;
-    Request request;
-    request.kind = Job::search;
-    request.page = next ? (a.page + 1) % int(a.pages.size()) : a.page;
-    request.query = a.query;
-    enqueue(a, std::move(request));
+    std::wstring count, status;
+    if (a.query.empty())
+        status = L"Enter text to find.";
+    else if (a.search_running) {
+        count = std::to_wstring(a.matches.size()) + L" found";
+        status = L"Searching… " + std::to_wstring(a.search_checked) + L" of " +
+                 std::to_wstring(a.search_total) + L" pages checked";
+    } else if (a.search_stopped) {
+        count = std::to_wstring(a.matches.size()) + L" found";
+        status = L"Search stopped. " + std::to_wstring(a.search_checked) + L" of " +
+                 std::to_wstring(a.search_total) + L" pages checked";
+    } else if (!a.matches.empty()) {
+        count = std::to_wstring(a.active_match + 1) + L" of " + std::to_wstring(a.matches.size());
+        int pages = 0, previous = -1;
+        for (const auto& match : a.matches)
+            if (match.page != previous) {
+                ++pages;
+                previous = match.page;
+            }
+        status = std::to_wstring(a.matches.size()) +
+                 (a.matches.size() == 1 ? L" match on " : L" matches on ") + std::to_wstring(pages) +
+                 (pages == 1 ? L" page" : L" pages");
+    } else if (a.search_complete && !a.search_has_text) {
+        count = L"No text";
+        status = L"No searchable text detected. These pages may contain scanned images.";
+    } else if (a.search_complete) {
+        count = L"0 matches";
+        status = L"No matches. Check the spelling or change the search options.";
+    }
+    if (!a.search_notice.empty())
+        status = a.search_notice;
+    SetDlgItemTextW(a.find_bar, IDC_FIND_COUNT, count.c_str());
+    SetDlgItemTextW(a.find_bar, IDC_FIND_STATUS, status.c_str());
+    EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_PREVIOUS), !a.matches.empty());
+    EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_NEXT), !a.matches.empty());
+    ShowWindow(GetDlgItem(a.find_bar, IDC_FIND_STOP), a.search_running ? SW_SHOW : SW_HIDE);
+    SendMessageW(a.search_results, LB_SETCURSEL, WPARAM(a.active_match), 0);
     InvalidateRect(a.window, nullptr, FALSE);
+}
+static void start_search(App& a) {
+    KillTimer(a.window, 3);
+    cancel_search(a.search_worker);
+    ++a.search_ticket;
+    a.query = search_query(a);
+    if (a.search_options.page >= 0)
+        a.search_options.page = a.page;
+    a.matches.clear();
+    a.active_match = -1;
+    a.search_checked = 0;
+    a.search_start_page = a.page;
+    a.search_total = a.search_options.page < 0 ? int(a.pages.size()) : 1;
+    a.search_running = !a.query.empty() && !a.pages.empty();
+    a.search_complete = a.search_stopped = a.search_has_text = a.reveal_match = false;
+    a.search_notice.clear();
+    SendMessageW(a.search_results, LB_RESETCONTENT, 0, 0);
+    if (a.search_running)
+        submit_search(a.search_worker,
+                      {a.document, a.search_ticket, a.path, a.password, a.query, a.search_options});
+    sync_search(a);
+}
+static void select_match(App& a, int index) {
+    if (index < 0 || size_t(index) >= a.matches.size())
+        return;
+    a.active_match = index;
+    a.reveal_match = true;
+    const int page = a.matches[size_t(index)].page;
+    if (a.page != page || !a.bitmap)
+        goto_page(a, page);
+    else
+        reveal_search_match(a);
+    sync_search(a);
+}
+static void find(App& a, int direction) {
+    if (search_query(a) != a.query || (!a.search_running && !a.search_complete && !a.search_stopped)) {
+        start_search(a);
+        return;
+    }
+    if (a.matches.empty())
+        return;
+    int next = a.active_match + direction;
+    a.search_notice.clear();
+    if (next < 0 || size_t(next) >= a.matches.size()) {
+        if (a.search_running || a.search_stopped) {
+            a.search_notice = a.search_running ? L"Searching for more matches…"
+                                               : L"Search stopped. Press Enter to search again.";
+            if (a.search_stopped) {
+                start_search(a);
+                return;
+            }
+            sync_search(a);
+            return;
+        }
+        a.search_notice = next < 0 ? L"Continued from the end of the document."
+                                   : L"Continued from the start of the document.";
+        next = next < 0 ? int(a.matches.size()) - 1 : 0;
+    }
+    select_match(a, next);
+}
+static void receive_search(App& a) {
+    std::vector<SearchUpdate> updates;
+    {
+        std::lock_guard lock(a.search_worker.mutex);
+        updates.swap(a.search_worker.updates);
+    }
+    int select = -1;
+    SendMessageW(a.search_results, WM_SETREDRAW, FALSE, 0);
+    for (auto& update : updates) {
+        if (update.document != a.document || update.ticket != a.search_ticket || !a.find_open)
+            continue;
+        a.search_checked = update.checked;
+        a.search_total = update.total;
+        a.search_has_text = a.search_has_text || update.has_text;
+        a.search_complete = update.complete;
+        a.search_running = !update.complete;
+        if (!update.error.empty()) {
+            a.search_notice = L"Search could not finish: " + update.error;
+            a.search_complete = false;
+            a.search_stopped = true;
+        }
+        for (auto& match : update.matches) {
+            if (a.active_match < 0 && select < 0 && match.page >= a.search_start_page)
+                select = int(a.matches.size());
+            const auto label = L"Page " + std::to_wstring(match.page + 1) + L": " + match.snippet;
+            SendMessageW(a.search_results, LB_ADDSTRING, 0, LPARAM(label.c_str()));
+            a.matches.push_back(std::move(match));
+        }
+    }
+    SendMessageW(a.search_results, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(a.search_results, nullptr, TRUE);
+    if (a.active_match < 0 && select < 0 && (a.search_complete || a.search_stopped) && !a.matches.empty())
+        select = 0;
+    if (select >= 0)
+        select_match(a, select);
+    else
+        sync_search(a);
+}
+static INT_PTR CALLBACK search_options_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    auto a = reinterpret_cast<App*>(GetWindowLongPtrW(window, DWLP_USER));
+    if (message == WM_INITDIALOG) {
+        a = reinterpret_cast<App*>(lp);
+        SetWindowLongPtrW(window, DWLP_USER, lp);
+        CheckDlgButton(window, IDC_FIND_CASE, a->search_options.match_case ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(window, IDC_FIND_WORDS, a->search_options.whole_words ? BST_CHECKED : BST_UNCHECKED);
+        SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_ADDSTRING, 0, LPARAM(L"Entire document"));
+        SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_ADDSTRING, 0, LPARAM(L"Current page"));
+        SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_SETCURSEL, a->search_options.page < 0 ? 0 : 1, 0);
+        ui::style_dialog(window, 87);
+        return TRUE;
+    }
+    if (message == WM_COMMAND && a) {
+        if (LOWORD(wp) == IDOK) {
+            a->search_options.match_case = IsDlgButtonChecked(window, IDC_FIND_CASE) == BST_CHECKED;
+            a->search_options.whole_words = IsDlgButtonChecked(window, IDC_FIND_WORDS) == BST_CHECKED;
+            a->search_options.page =
+                SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_GETCURSEL, 0, 0) == 1 ? a->page : -1;
+            EndDialog(window, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(wp) == IDCANCEL) {
+            EndDialog(window, IDCANCEL);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+static INT_PTR CALLBACK find_bar_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    auto a = reinterpret_cast<App*>(GetWindowLongPtrW(window, DWLP_USER));
+    if (message == WM_INITDIALOG) {
+        SetWindowLongPtrW(window, DWLP_USER, lp);
+        ui::style_dialog(window, -1, 0, false);
+        return TRUE;
+    }
+    if (!a)
+        return FALSE;
+    if (message == WM_COMMAND) {
+        switch (LOWORD(wp)) {
+        case IDC_FIND_TEXT:
+            if (HIWORD(wp) == EN_CHANGE && a->find_open) {
+                cancel_search(a->search_worker);
+                ++a->search_ticket;
+                a->matches.clear();
+                a->active_match = -1;
+                a->search_running = a->search_complete = a->search_stopped = false;
+                SendMessageW(a->search_results, LB_RESETCONTENT, 0, 0);
+                a->search_notice = L"";
+                SetTimer(a->window, 3, 180, nullptr);
+                sync_search(*a);
+            }
+            return TRUE;
+        case IDC_FIND_PREVIOUS:
+            find(*a, -1);
+            return TRUE;
+        case IDC_FIND_NEXT:
+            find(*a);
+            return TRUE;
+        case IDC_FIND_RESULTS:
+            select_sidebar_tab(*a, 2);
+            return TRUE;
+        case IDC_FIND_OPTIONS:
+            if (DialogBoxParamW(a->instance, MAKEINTRESOURCEW(IDD_FIND_OPTIONS), a->window,
+                                search_options_proc, LPARAM(a)) == IDOK)
+                start_search(*a);
+            return TRUE;
+        case IDC_FIND_STOP:
+            cancel_search(a->search_worker);
+            ++a->search_ticket;
+            a->search_running = false;
+            a->search_stopped = true;
+            sync_search(*a);
+            return TRUE;
+        case IDC_FIND_CLOSE:
+            command(*a, cmd_search);
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 static void copy(App& a) {
     if (!a.bitmap)
@@ -1126,8 +1434,9 @@ static void installation_dialog(App& a) {
         deployment::open_installed(current_session(a));
         PostMessageW(a.window, WM_CLOSE, 0, 0);
     } else if (result == ui::InstallationAction::uninstall) {
-        if (ui::message_box(a.window, L"Uninstall FastPDF for your Windows account? Your PDF files will be kept.",
-                        L"Uninstall FastPDF", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+        if (ui::message_box(a.window,
+                            L"Uninstall FastPDF for your Windows account? Your PDF files will be kept.",
+                            L"Uninstall FastPDF", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
             deployment::start_uninstall();
             PostMessageW(a.window, WM_CLOSE, 0, 0);
         }
@@ -1193,7 +1502,7 @@ static void poll_update(App& a) {
         ready_update(a);
     } else if (result.release.version <= deployment::parse_version(FASTPDF_VERSION)) {
         ui::message_box(a.window, L"FastPDF " FASTPDF_VERSION_W L" is up to date.", L"FastPDF Update",
-                    MB_OK | MB_ICONINFORMATION);
+                        MB_OK | MB_ICONINFORMATION);
     } else if (task_dialog(a, L"A FastPDF Update Is Available",
                            L"Version " + utf8(result.release.tag) + L" is available. Download it now?",
                            {{100, L"Download update"}}) == 100) {
@@ -1214,10 +1523,11 @@ static void command(App& a, int id) {
         layout(a);
     } else if (id == cmd_updates) {
         if (!a.installed) {
-            ui::message_box(a.window,
-                        L"Install FastPDF to update it here. You can also download a new portable copy from "
-                        L"GitHub Releases.",
-                        L"FastPDF Updates", MB_OK | MB_ICONINFORMATION);
+            ui::message_box(
+                a.window,
+                L"Install FastPDF to update it here. You can also download a new portable copy from "
+                L"GitHub Releases.",
+                L"FastPDF Updates", MB_OK | MB_ICONINFORMATION);
             installation_dialog(a);
         } else if (!a.pending_update.directory.empty())
             ready_update(a);
@@ -1242,18 +1552,29 @@ static void command(App& a, int id) {
         request_render(a, true);
     } else if (id == cmd_sidebar || id == cmd_bookmarks) {
         bool bookmarks = id == cmd_bookmarks;
-        a.show_sidebar = !(a.show_sidebar && a.bookmarks == bookmarks);
+        a.show_sidebar = results_visible(a) || !(a.show_sidebar && a.bookmarks == bookmarks);
+        a.show_results = false;
         a.bookmarks = bookmarks;
         update_sidebar(a, true);
         layout(a);
         request_render(a);
     } else if (id == cmd_search) {
         a.find_open = !a.find_open;
+        if (!a.find_open)
+            a.show_results = false;
         layout(a);
         if (a.find_open) {
             SetFocus(a.search);
             SendMessageW(a.search, EM_SETSEL, 0, -1);
+            start_search(a);
         } else {
+            KillTimer(a.window, 3);
+            cancel_search(a.search_worker);
+            ++a.search_ticket;
+            a.search_running = false;
+            a.matches.clear();
+            a.active_match = -1;
+            a.reveal_match = false;
             SetFocus(a.window);
             a.query.clear();
         }
@@ -1307,6 +1628,37 @@ static void label(HDC dc, RECT rect, std::wstring_view text, COLORREF color, HFO
     DrawTextW(dc, text.data(), int(text.size()), &rect, flags);
     SelectObject(dc, old);
 }
+static void paint_sidebar_tabs(App& a, HDC dc) {
+    RECT bounds{};
+    GetClientRect(a.sidebar_tabs, &bounds);
+    const auto& colors = a.search_colors;
+    fill_rect(dc, bounds, colors.footer);
+    fill_rect(dc, {0, bounds.bottom - 1, bounds.right, bounds.bottom}, colors.border);
+    const int selected = TabCtrl_GetCurSel(a.sidebar_tabs);
+    for (int i = 0; i < TabCtrl_GetItemCount(a.sidebar_tabs); ++i) {
+        RECT tab{};
+        TabCtrl_GetItemRect(a.sidebar_tabs, i, &tab);
+        wchar_t title[32]{};
+        TCITEMW item{};
+        item.mask = TCIF_TEXT;
+        item.pszText = title;
+        item.cchTextMax = int(std::size(title));
+        TabCtrl_GetItem(a.sidebar_tabs, i, &item);
+        if (i == selected || i == a.tab_hover)
+            fill_rect(dc, tab, i == selected ? colors.body : colors.hover);
+        label(dc, tab, title, i == selected ? colors.text : colors.muted, a.search_font,
+              DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        if (i == selected) {
+            fill_rect(dc, {tab.left + px(a, 10), tab.bottom - px(a, 2), tab.right - px(a, 10), tab.bottom},
+                      colors.accent);
+            if (GetFocus() == a.sidebar_tabs &&
+                !(SendMessageW(a.sidebar_tabs, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
+                InflateRect(&tab, -px(a, 4), -px(a, 4));
+                DrawFocusRect(dc, &tab);
+            }
+        }
+    }
+}
 
 static std::wstring page_number(const App& a) {
     return a.pages.empty() ? L"—" : std::to_wstring(a.page + 1);
@@ -1326,11 +1678,12 @@ static void sync_toolbar(App& a) {
             enabled = loaded && a.page + 1 < int(a.pages.size());
         SendMessageW(a.toolbar, TB_ENABLEBUTTON, WPARAM(tool.command), MAKELPARAM(enabled, 0));
     }
-    for (auto [id, checked] : {std::pair{cmd_fit, loaded && a.fit == Fit::page},
-                               {cmd_width, loaded && a.fit == Fit::width},
-                               {cmd_search, loaded && a.find_open},
-                               {cmd_sidebar, loaded && a.show_sidebar && !a.bookmarks},
-                               {cmd_bookmarks, loaded && a.show_sidebar && a.bookmarks}})
+    for (auto [id, checked] :
+         {std::pair{cmd_fit, loaded && a.fit == Fit::page},
+          {cmd_width, loaded && a.fit == Fit::width},
+          {cmd_search, loaded && a.find_open},
+          {cmd_sidebar, loaded && a.show_sidebar && !results_visible(a) && !a.bookmarks},
+          {cmd_bookmarks, loaded && a.show_sidebar && !results_visible(a) && a.bookmarks}})
         SendMessageW(a.toolbar, TB_CHECKBUTTON, WPARAM(id), MAKELPARAM(checked, 0));
     EnableWindow(a.page_edit, loaded);
     EnableWindow(a.zoom_edit, loaded);
@@ -1390,10 +1743,14 @@ static void paint_toolbar_button(App& a, HDC dc, RECT rect, int id, UINT state) 
     InflateRect(&rect, -px(a, 1), 0);
     for (const auto& tool : toolbar_tools)
         if (tool.command == id) {
-            COLORREF background = active ? ui::selected : hot && enabled ? ui::hover : ui::chrome;
-            COLORREF color = !enabled ? ui::disabled : active || hot ? ui::text : ui::muted;
-            ui::control(a.painter, dc, rect, a.dpi, ui::chrome, background, ui::focus,
-                        (state & CDIS_FOCUS) ? 2 : 0, tool.icon, color);
+            COLORREF background = active           ? a.search_colors.pressed
+                                  : hot && enabled ? a.search_colors.hover
+                                                   : a.search_colors.footer;
+            COLORREF color = !enabled        ? a.search_colors.muted
+                             : active || hot ? a.search_colors.text
+                                             : a.search_colors.muted;
+            ui::control(a.painter, dc, rect, a.dpi, a.search_colors.footer, background,
+                        a.search_colors.accent, (state & CDIS_FOCUS) ? 2 : 0, tool.icon, color);
             break;
         }
 }
@@ -1406,20 +1763,26 @@ static void paint_input_frame(App& a, HDC dc, HWND parent, HWND input) {
     MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&rect), 2);
     InflateRect(&rect, px(a, 3), px(a, 3));
     bool focused = GetFocus() == input;
-    COLORREF outline = focused ? ui::focus : a.input_hover == input ? ui::muted : ui::border;
-    ui::control(a.painter, dc, rect, a.dpi, ui::chrome, ui::surface, outline, focused ? 2 : 1);
+    COLORREF outline = focused                  ? a.search_colors.accent
+                       : a.input_hover == input ? a.search_colors.muted
+                                                : a.search_colors.border;
+    ui::control(a.painter, dc, rect, a.dpi, a.search_colors.footer, a.search_colors.field, outline,
+                focused ? 2 : 1);
 }
 
 static void paint_sidebar_item(App& a, HDC dc, RECT rect, int index, bool selected, bool focused) {
-    fill_rect(dc, rect, ui::chrome);
+    fill_rect(dc, rect, a.search_colors.footer);
     RECT row = rect;
     InflateRect(&row, -px(a, 8), -px(a, 2));
-    COLORREF fill = selected ? ui::selected : index == a.sidebar_hover ? ui::hover : ui::chrome;
-    ui::control(a.painter, dc, row, a.dpi, ui::chrome, fill, ui::focus, focused ? 2 : 0);
+    COLORREF fill = selected                   ? a.search_colors.pressed
+                    : index == a.sidebar_hover ? a.search_colors.hover
+                                               : a.search_colors.footer;
+    ui::control(a.painter, dc, row, a.dpi, a.search_colors.footer, fill, a.search_colors.accent,
+                focused ? 2 : 0);
     rect.left = row.left + px(a, 10);
     rect.right = row.right - px(a, 10);
     std::wstring text = L"Page " + std::to_wstring(index + 1);
-    label(dc, rect, text, selected || index == a.sidebar_hover ? ui::text : ui::muted,
+    label(dc, rect, text, selected || index == a.sidebar_hover ? a.search_colors.text : a.search_colors.muted,
           selected ? a.selected_font : a.font);
 }
 static LRESULT paint_bookmark(App& a, NMTVCUSTOMDRAW& draw) {
@@ -1437,11 +1800,12 @@ static LRESULT paint_bookmark(App& a, NMTVCUSTOMDRAW& draw) {
     row.top = text.top;
     row.bottom = text.bottom;
     HDC dc = draw.nmcd.hdc;
-    fill_rect(dc, row, ui::chrome);
+    fill_rect(dc, row, a.search_colors.footer);
     InflateRect(&row, -px(a, 8), -px(a, 2));
     bool selected = TreeView_GetSelection(a.bookmark_tree) == item;
     bool focused = selected && GetFocus() == a.bookmark_tree;
-    ui::control(a.painter, dc, row, a.dpi, ui::chrome, selected ? ui::selected : ui::chrome, ui::focus,
+    ui::control(a.painter, dc, row, a.dpi, a.search_colors.footer,
+                selected ? a.search_colors.pressed : a.search_colors.footer, a.search_colors.accent,
                 focused ? 2 : 0);
     if (TreeView_GetChild(a.bookmark_tree, item)) {
         int x = text.left - px(a, 10), y = (text.top + text.bottom) / 2, d = px(a, 3);
@@ -1456,7 +1820,7 @@ static LRESULT paint_bookmark(App& a, NMTVCUSTOMDRAW& draw) {
             points[1] = {x + d / 2, y};
             points[2] = {x - d / 2, y + d};
         }
-        auto pen = CreatePen(PS_SOLID, std::max(1, px(a, 1)), ui::muted);
+        auto pen = CreatePen(PS_SOLID, std::max(1, px(a, 1)), a.search_colors.muted);
         auto old = SelectObject(dc, pen);
         Polyline(dc, points, 3);
         SelectObject(dc, old);
@@ -1465,14 +1829,15 @@ static LRESULT paint_bookmark(App& a, NMTVCUSTOMDRAW& draw) {
     text.right = row.right - px(a, 10);
     std::wstring title = a.outline[index].title;
     std::replace(title.begin(), title.end(), L'\t', L' ');
-    label(dc, text, title, selected ? ui::text : ui::muted, selected ? a.selected_font : a.font);
+    label(dc, text, title, selected ? a.search_colors.text : a.search_colors.muted,
+          selected ? a.selected_font : a.font);
     return CDRF_SKIPDEFAULT;
 }
 
 static void paint_toolbar(App& a, HDC dc) {
     auto r = client(a);
-    fill_rect(dc, {0, 0, r.right, px(a, toolbar_height)}, ui::chrome);
-    fill_rect(dc, {0, px(a, toolbar_height) - 1, r.right, px(a, toolbar_height)}, ui::border);
+    fill_rect(dc, {0, 0, r.right, px(a, toolbar_height)}, a.search_colors.footer);
+    fill_rect(dc, {0, px(a, toolbar_height) - 1, r.right, px(a, toolbar_height)}, a.search_colors.border);
     int hot = int(SendMessageW(a.toolbar, TB_GETHOTITEM, 0, 0));
     for (int index = 0; index < SendMessageW(a.toolbar, TB_BUTTONCOUNT, 0, 0); ++index) {
         TBBUTTON button{};
@@ -1485,13 +1850,13 @@ static void paint_toolbar(App& a, HDC dc) {
             rect.left += px(a, 54);
             rect.top = 0;
             rect.bottom = px(a, toolbar_height);
-            label(dc, rect, a.pages.empty() ? L"/ —" : L"/ " + std::to_wstring(a.pages.size()), ui::muted,
-                  a.small_font);
+            label(dc, rect, a.pages.empty() ? L"/ —" : L"/ " + std::to_wstring(a.pages.size()),
+                  a.search_colors.muted, a.small_font);
         } else if (button.idCommand == zoom_slot) {
             continue;
         } else if (button.fsStyle & BTNS_SEP) {
             int x = (rect.left + rect.right) / 2;
-            fill_rect(dc, {x, px(a, 8), x + 1, px(a, 28)}, ui::border);
+            fill_rect(dc, {x, px(a, 8), x + 1, px(a, 28)}, a.search_colors.border);
         } else {
             UINT state = (button.fsState & TBSTATE_ENABLED) ? 0 : CDIS_DISABLED;
             if (button.fsState & TBSTATE_CHECKED)
@@ -1523,6 +1888,25 @@ static RECT span_rect(App& a, Rect bounds) {
     return {rect.left + LONG(std::floor(bounds.x0 * scale)), rect.top + LONG(std::floor(bounds.y0 * scale)),
             rect.left + LONG(std::ceil(bounds.x1 * scale)), rect.top + LONG(std::ceil(bounds.y1 * scale))};
 }
+static void reveal_search_match(App& a) {
+    if (!a.reveal_match || !a.bitmap || a.active_match < 0 || size_t(a.active_match) >= a.matches.size() ||
+        a.matches[size_t(a.active_match)].page != a.page)
+        return;
+    const auto boxes = search_rects(*a.bitmap, a.matches[size_t(a.active_match)]);
+    if (boxes.empty())
+        return;
+    // Show the first fragment even when a phrase crosses several lines.
+    const auto rect = span_rect(a, boxes.front()), vp = viewport(a);
+    const int padding = px(a, 24);
+    if (rect.left < vp.left + padding)
+        a.scroll_x += rect.left - vp.left - padding;
+    else if (rect.right > vp.right - padding)
+        a.scroll_x += rect.right - vp.right + padding;
+    if (rect.top < vp.top + padding || rect.bottom > vp.bottom - padding)
+        a.scroll_y += (rect.top + rect.bottom - vp.top - vp.bottom) / 2;
+    update_scroll(a);
+    a.reveal_match = false;
+}
 static void highlight(HDC dc, RECT rect, uint32_t color) {
     if (rect.right <= rect.left || rect.bottom <= rect.top)
         return;
@@ -1545,22 +1929,15 @@ static void highlight(HDC dc, RECT rect, uint32_t color) {
 static void paint_app(App& a, HDC dc) {
     auto r = client(a);
     auto vp = viewport(a);
-    fill_rect(dc, r, ui::canvas);
+    fill_rect(dc, r, a.search_colors.field);
     paint_toolbar(a, dc);
-    if (a.find_open) {
-        fill_rect(dc, {0, px(a, toolbar_height), r.right, px(a, toolbar_height + 40)}, ui::chrome);
-        label(dc, {px(a, 454), px(a, toolbar_height), r.right - px(a, 12), px(a, toolbar_height + 40)},
-              L"Enter to find · F3 next page · Esc to close", ui::muted, a.small_font);
-        paint_input_frame(a, dc, a.window, a.search);
-    }
-    if (a.show_sidebar && !a.pages.empty()) {
-        fill_rect(dc, {0, vp.top, vp.left, vp.bottom}, ui::chrome);
-        fill_rect(dc, {vp.left - 1, vp.top, vp.left, vp.bottom}, ui::border);
+    if (sidebar_visible(a)) {
+        fill_rect(dc, {0, vp.top, vp.left, vp.bottom}, a.search_colors.footer);
+        fill_rect(dc, {vp.left - 1, vp.top, vp.left, vp.bottom}, a.search_colors.border);
         auto splitter = sidebar_splitter(a);
         int center = (splitter.left + splitter.right) / 2;
-        fill_rect(dc, {center, vp.top, center + 1, vp.bottom}, a.resizing_sidebar ? ui::focus : ui::border);
-        label(dc, {px(a, 18), vp.top, vp.left - px(a, 12), vp.top + px(a, ui::sidebar_header)},
-              a.bookmarks ? L"Bookmarks" : L"Pages", ui::muted, a.small_font);
+        fill_rect(dc, {center, vp.top, center + 1, vp.bottom},
+                  a.resizing_sidebar ? a.search_colors.accent : a.search_colors.border);
     }
     int saved = SaveDC(dc);
     IntersectClipRect(dc, vp.left, vp.top, vp.right, vp.bottom);
@@ -1577,12 +1954,12 @@ static void paint_app(App& a, HDC dc) {
         heading.right = vp.right - px(a, 40);
         heading.top = center - px(a, 67) - height / 2;
         heading.bottom = heading.top + height;
-        label(dc, heading, prompt, ui::text, a.title_font, DT_CENTER | DT_WORDBREAK);
+        label(dc, heading, prompt, a.search_colors.text, a.title_font, DT_CENTER | DT_WORDBREAK);
     } else {
         RECT page = page_rect(a);
         RECT shadow = page;
         OffsetRect(&shadow, px(a, 3), px(a, 5));
-        fill_rect(dc, shadow, ui::shadow);
+        fill_rect(dc, shadow, a.search_colors.border);
         fill_rect(dc, page, RGB(255, 255, 255));
         if (a.bitmap) {
             BITMAPINFO bmi{};
@@ -1602,29 +1979,48 @@ static void paint_app(App& a, HDC dc) {
             StretchDIBits(dc, page.left, page.top, page.right - page.left, page.bottom - page.top, 0, 0,
                           int(a.bitmap->width), int(a.bitmap->height), a.bitmap->pixels.data(), &bmi,
                           DIB_RGB_COLORS, SRCCOPY);
-            auto needle = lower(a.query);
             for (size_t i = 0; i < a.bitmap->text.size(); ++i) {
                 auto& span = a.bitmap->text[i];
                 bool selected =
                     a.selected_all || std::find(a.selected.begin(), a.selected.end(), i) != a.selected.end();
                 if (selected)
                     highlight(dc, span_rect(a, span.bounds), 0x5010224b);
-                else if (!needle.empty() && lower(span.text).find(needle) != std::wstring::npos)
-                    highlight(dc, span_rect(a, span.bounds), 0x60605000);
+            }
+            if (a.find_open) {
+                const auto begin =
+                    std::lower_bound(a.matches.begin(), a.matches.end(), a.page,
+                                     [](const SearchMatch& match, int page) { return match.page < page; });
+                for (auto match = begin; match != a.matches.end() && match->page == a.page; ++match) {
+                    const bool active = int(match - a.matches.begin()) == a.active_match;
+                    for (const auto& bounds : search_rects(*a.bitmap, *match)) {
+                        auto rect = span_rect(a, bounds);
+                        highlight(dc, rect, active ? 0x60605000 : 0x40403800);
+                        if (active) {
+                            InflateRect(&rect, px(a, 1), px(a, 1));
+                            HBRUSH brush = CreateSolidBrush(a.search_colors.accent);
+                            for (int stroke = 0; stroke < std::max(1, px(a, 2)); ++stroke) {
+                                FrameRect(dc, &rect, brush);
+                                InflateRect(&rect, 1, 1);
+                            }
+                            DeleteObject(brush);
+                        }
+                    }
+                }
             }
         } else
-            label(dc, page, L"Rendering…", ui::muted, a.font, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            label(dc, page, L"Rendering…", a.search_colors.muted, a.font,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     RestoreDC(dc, saved);
     RECT status{0, r.bottom - px(a, 30), r.right, r.bottom};
-    fill_rect(dc, status, ui::chrome);
+    fill_rect(dc, status, a.search_colors.footer);
     label(dc, {px(a, 14), status.top, r.right - px(a, 250), status.bottom},
-          a.update_status.empty() ? a.status : a.update_status, ui::muted, a.small_font);
+          a.update_status.empty() ? a.status : a.update_status, a.search_colors.muted, a.small_font);
     if (!a.pages.empty()) {
         std::wstring details =
             L"Page " + std::to_wstring(a.page + 1) + L" of " + std::to_wstring(a.pages.size());
-        label(dc, {r.right - px(a, 240), status.top, r.right - px(a, 14), status.bottom}, details, ui::muted,
-              a.small_font, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        label(dc, {r.right - px(a, 240), status.top, r.right - px(a, 14), status.bottom}, details,
+              a.search_colors.muted, a.small_font, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     }
 }
 static void screenshot(App& a) {
@@ -1637,9 +2033,11 @@ static void screenshot(App& a) {
     require(bitmap != nullptr, "Cannot allocate UI capture");
     auto old = SelectObject(memory, bitmap);
     paint_app(a, memory);
-    for (auto control : {a.page_edit, a.zoom_edit, a.search, a.bookmark_tree}) {
+    for (auto control : {a.page_edit, a.zoom_edit, a.search, a.bookmark_tree, a.sidebar_tabs}) {
         if ((control == a.search && !a.find_open) ||
-            (control == a.bookmark_tree && (!a.show_sidebar || !a.bookmarks || a.pages.empty())))
+            (control == a.bookmark_tree &&
+             (!a.show_sidebar || !a.bookmarks || results_visible(a) || a.pages.empty())) ||
+            (control == a.sidebar_tabs && !sidebar_visible(a)))
             continue;
         RECT rect{};
         GetWindowRect(control, &rect);
@@ -1649,9 +2047,9 @@ static void screenshot(App& a) {
         SendMessageW(control, WM_PRINT, WPARAM(memory), PRF_CLIENT | PRF_NONCLIENT | PRF_ERASEBKGND);
         RestoreDC(memory, saved);
     }
-    if (a.show_sidebar && !a.pages.empty() && !a.bookmarks) {
+    if (a.show_sidebar && !results_visible(a) && !a.pages.empty() && !a.bookmarks) {
         auto vp = viewport(a);
-        int top = vp.top + px(a, ui::sidebar_header);
+        int top = vp.top + a.sidebar_header_height;
         int first = int(SendMessageW(a.sidebar, LB_GETTOPINDEX, 0, 0));
         int count = int(SendMessageW(a.sidebar, LB_GETCOUNT, 0, 0));
         int selected = int(SendMessageW(a.sidebar, LB_GETCURSEL, 0, 0));
@@ -1704,8 +2102,6 @@ static void receive(App& a) {
         }
         if (result.kind == Job::render && result.ticket != a.render_ticket)
             continue;
-        if (result.kind == Job::search && result.ticket != a.search_ticket)
-            continue;
         a.busy = false;
         if (!result.error.empty()) {
             a.status = result.error;
@@ -1743,6 +2139,7 @@ static void receive(App& a) {
         } else if (result.kind == Job::render) {
             a.bitmap = std::move(result.bitmap);
             a.bitmap_scale = result.scale;
+            reveal_search_match(a);
             a.status = std::filesystem::path(a.path).filename().wstring();
             if (a.smoke) {
                 try {
@@ -1752,12 +2149,6 @@ static void receive(App& a) {
                 }
                 PostMessageW(a.window, WM_CLOSE, 0, 0);
             }
-        } else if (result.kind == Job::search) {
-            a.status = result.message;
-            if (result.page >= 0 && a.page != result.page)
-                goto_page(a, result.page);
-            else if (!a.bitmap)
-                request_render(a);
         } else {
             a.status = result.message;
             if (!a.bitmap && !a.pages.empty())
@@ -1857,12 +2248,59 @@ static LRESULT CALLBACK sidebar_proc(HWND window, UINT message, WPARAM wp, LPARA
         InvalidateRect(window, nullptr, FALSE);
     return result;
 }
+static LRESULT CALLBACK sidebar_tabs_proc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id,
+                                          DWORD_PTR data) {
+    auto& a = *reinterpret_cast<App*>(data);
+    switch (message) {
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        const auto dc = BeginPaint(window, &paint);
+        paint_sidebar_tabs(a, dc);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    case WM_PRINTCLIENT:
+        paint_sidebar_tabs(a, HDC(wp));
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_MOUSEMOVE: {
+        TCHITTESTINFO hit{{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, 0};
+        const int hover = TabCtrl_HitTest(window, &hit);
+        if (a.tab_hover != hover) {
+            a.tab_hover = hover;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+        TrackMouseEvent(&tracking);
+        break;
+    }
+    case WM_MOUSELEAVE:
+        a.tab_hover = -1;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) {
+            SetFocus(a.window);
+            return 0;
+        }
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(window, sidebar_tabs_proc, id);
+        break;
+    }
+    const auto result = DefSubclassProc(window, message, wp, lp);
+    if (message == WM_SETFOCUS || message == WM_KILLFOCUS || message == WM_UPDATEUISTATE ||
+        message == WM_KEYDOWN)
+        InvalidateRect(window, nullptr, FALSE);
+    return result;
+}
 static LRESULT CALLBACK search_proc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR,
                                     DWORD_PTR data) {
     auto& a = *reinterpret_cast<App*>(data);
     if (message == WM_KEYDOWN) {
         if (wp == VK_RETURN) {
-            find(a);
+            find(a, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
             return 0;
         }
         if (wp == VK_ESCAPE) {
@@ -1870,7 +2308,7 @@ static LRESULT CALLBACK search_proc(HWND window, UINT message, WPARAM wp, LPARAM
             return 0;
         }
         if (wp == VK_F3) {
-            find(a, true);
+            find(a, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
             return 0;
         }
     }
@@ -1997,8 +2435,8 @@ static void create_toolbar(App& a) {
     require(tips != nullptr, "Cannot create toolbar hints");
     // Use the application colors instead of the system tooltip theme.
     SetWindowTheme(tips, L"", L"");
-    SendMessageW(tips, TTM_SETTIPBKCOLOR, ui::surface, 0);
-    SendMessageW(tips, TTM_SETTIPTEXTCOLOR, ui::text, 0);
+    SendMessageW(tips, TTM_SETTIPBKCOLOR, a.search_colors.field, 0);
+    SendMessageW(tips, TTM_SETTIPTEXTCOLOR, a.search_colors.text, 0);
     SendMessageW(tips, TTM_SETDELAYTIME, TTDT_INITIAL, 400);
     SendMessageW(tips, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
     SendMessageW(tips, TTM_SETDELAYTIME, TTDT_AUTOPOP, 10000);
@@ -2015,16 +2453,82 @@ static void create_toolbar(App& a) {
 static void window_icons(App& a) {
     for (auto [kind, current] : {std::pair{ICON_BIG, &a.icon}, std::pair{ICON_SMALL, &a.small_icon}}) {
         const bool large = kind == ICON_BIG;
-        auto icon = static_cast<HICON>(LoadImageW(
-            a.instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
-            GetSystemMetricsForDpi(large ? SM_CXICON : SM_CXSMICON, a.dpi),
-            GetSystemMetricsForDpi(large ? SM_CYICON : SM_CYSMICON, a.dpi), LR_DEFAULTCOLOR));
+        auto icon = static_cast<HICON>(
+            LoadImageW(a.instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+                       GetSystemMetricsForDpi(large ? SM_CXICON : SM_CXSMICON, a.dpi),
+                       GetSystemMetricsForDpi(large ? SM_CYICON : SM_CYSMICON, a.dpi), LR_DEFAULTCOLOR));
         require(icon != nullptr, "Cannot load application icon");
         SendMessageW(a.window, WM_SETICON, WPARAM(kind), LPARAM(icon));
         if (*current)
             DestroyIcon(*current);
         *current = icon;
     }
+}
+static void refresh_reader_theme(App& a) {
+    a.search_colors = ui::system_dialog_colors();
+    const auto& c = a.search_colors;
+    for (auto brush : {a.edit_background, a.chrome_background, a.results_background})
+        if (brush)
+            DeleteObject(brush);
+    a.edit_background = CreateSolidBrush(c.field);
+    a.chrome_background = CreateSolidBrush(c.footer);
+    a.results_background = CreateSolidBrush(c.body);
+    BOOL dark = c.dark;
+    DwmSetWindowAttribute(a.window, 20, &dark, sizeof(dark));
+    DwmSetWindowAttribute(a.window, DWMWA_CAPTION_COLOR, &c.footer, sizeof(COLORREF));
+    DwmSetWindowAttribute(a.window, DWMWA_TEXT_COLOR, &c.text, sizeof(COLORREF));
+    for (auto control : {a.sidebar, a.search_results, a.page_edit, a.zoom_edit})
+        SetWindowTheme(control, c.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    TreeView_SetBkColor(a.bookmark_tree, c.footer);
+    TreeView_SetTextColor(a.bookmark_tree, c.text);
+    TreeView_SetLineColor(a.bookmark_tree, c.border);
+    ui::refresh_dialog_style(a.find_bar);
+    if (GetMenu(a.window))
+        style_menu(a, GetMenu(a.window), true);
+    RedrawWindow(a.window, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+}
+static void paint_search_result(App& a, const DRAWITEMSTRUCT& item) {
+    const auto& colors = a.search_colors;
+    fill_rect(item.hDC, item.rcItem, colors.body);
+    if (item.itemID >= a.matches.size())
+        return;
+    const auto& match = a.matches[item.itemID];
+    const bool selected = (item.itemState & ODS_SELECTED) != 0;
+    RECT row = item.rcItem;
+    InflateRect(&row, -px(a, 8), -px(a, 2));
+    if (selected) {
+        ui::control(a.painter, item.hDC, row, a.dpi, colors.body, colors.pressed, colors.accent,
+                    GetFocus() == a.search_results ? 1 : 0);
+        RECT line{row.left, row.top + px(a, 4), row.left + px(a, 3), row.bottom - px(a, 4)};
+        fill_rect(item.hDC, line, colors.accent);
+    }
+    row.left += px(a, 10);
+    row.right -= px(a, 8);
+    RECT heading = row;
+    heading.bottom = heading.top + px(a, 21);
+    label(item.hDC, heading, L"Page " + std::to_wstring(match.page + 1), colors.muted, a.search_font,
+          DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    row.top = heading.bottom;
+    const auto font = SelectObject(item.hDC, a.search_font);
+    TEXTMETRICW metrics{};
+    GetTextMetricsW(item.hDC, &metrics);
+    row.bottom = std::min(row.bottom, row.top + 2 * metrics.tmHeight);
+    std::wstring snippet = match.snippet;
+    for (;;) {
+        RECT size = row;
+        DrawTextW(item.hDC, snippet.c_str(), int(snippet.size()), &size,
+                  DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX);
+        if (size.bottom <= row.bottom || snippet.size() <= 1)
+            break;
+        if (snippet.back() == L'…')
+            snippet.pop_back();
+        snippet.pop_back();
+        if (!snippet.empty() && snippet.back() >= 0xd800 && snippet.back() <= 0xdbff)
+            snippet.pop_back();
+        snippet += L'…';
+    }
+    SelectObject(item.hDC, font);
+    label(item.hDC, row, snippet, colors.text, a.search_font, DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
 }
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     auto* ptr = reinterpret_cast<App*>(GetWindowLongPtrW(window, GWLP_USERDATA));
@@ -2039,12 +2543,16 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
     try {
         switch (message) {
         case WM_CREATE: {
-            BOOL dark = TRUE;
-            DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
-            DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &ui::chrome, sizeof(ui::chrome));
-            DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR, &ui::text, sizeof(ui::text));
+            a.search_colors = ui::system_dialog_colors();
             a.dpi = GetDpiForWindow(window);
             window_icons(a);
+            a.sidebar_tabs =
+                CreateWindowExW(0, WC_TABCONTROLW, L"Sidebar views",
+                                WS_CHILD | WS_TABSTOP | TCS_MULTILINE | TCS_FOCUSONBUTTONDOWN, 0, 0, 0, 0,
+                                window, HMENU(INT_PTR(id_sidebar_tabs)), a.instance, nullptr);
+            require(a.sidebar_tabs != nullptr, "Cannot create sidebar tabs");
+            SetWindowTheme(a.sidebar_tabs, L"", L"");
+            SetWindowSubclass(a.sidebar_tabs, sidebar_tabs_proc, 1, DWORD_PTR(&a));
             a.sidebar = CreateWindowExW(0, L"LISTBOX", L"Pages",
                                         WS_CHILD | WS_VSCROLL | LBS_NOTIFY | LBS_NODATA | LBS_OWNERDRAWFIXED |
                                             LBS_NOINTEGRALHEIGHT,
@@ -2056,16 +2564,23 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                                     TVS_FULLROWSELECT | TVS_NOTOOLTIPS | TVS_DISABLEDRAGDROP,
                                 0, 0, 0, 0, window, HMENU(INT_PTR(id_bookmark_tree)), a.instance, nullptr);
             SetWindowTheme(a.bookmark_tree, L"", L"");
-            TreeView_SetBkColor(a.bookmark_tree, ui::chrome);
-            TreeView_SetTextColor(a.bookmark_tree, ui::text);
-            TreeView_SetLineColor(a.bookmark_tree, ui::border);
+            TreeView_SetBkColor(a.bookmark_tree, a.search_colors.footer);
+            TreeView_SetTextColor(a.bookmark_tree, a.search_colors.text);
+            TreeView_SetLineColor(a.bookmark_tree, a.search_colors.border);
             SetWindowSubclass(a.bookmark_tree, sidebar_proc, 1, DWORD_PTR(&a));
-            a.search = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL | WS_TABSTOP, 0, 0, 0, 0,
-                                       window, HMENU(INT_PTR(id_search)), a.instance, nullptr);
+            a.find_bar = CreateDialogParamW(a.instance, MAKEINTRESOURCEW(IDD_FIND_BAR), window, find_bar_proc,
+                                            LPARAM(&a));
+            require(a.find_bar != nullptr, "Cannot create search bar");
+            SetWindowLongPtrW(a.find_bar, GWLP_ID, id_find_bar);
+            a.search = GetDlgItem(a.find_bar, IDC_FIND_TEXT);
             SendMessageW(a.search, EM_SETCUEBANNER, TRUE, LPARAM(L"Find in document"));
             SendMessageW(a.search, EM_LIMITTEXT, 4095, 0);
             SetWindowSubclass(a.search, search_proc, 1, DWORD_PTR(&a));
-            SetWindowSubclass(a.search, input_frame_proc, 2, DWORD_PTR(&a));
+            a.search_results =
+                CreateWindowExW(0, L"LISTBOX", L"Search Results",
+                                WS_CHILD | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_HASSTRINGS |
+                                    LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT,
+                                0, 0, 0, 0, window, HMENU(INT_PTR(id_results)), a.instance, nullptr);
             create_toolbar(a);
             a.welcome_install =
                 CreateWindowExW(0, L"BUTTON", L"Install FastPDF", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0,
@@ -2074,12 +2589,15 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                 CreateWindowExW(0, L"BUTTON", L"Continue portable", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0,
                                 0, 0, 0, window, HMENU(INT_PTR(cmd_portable)), a.instance, nullptr);
             require(a.welcome_install && a.welcome_portable, "Cannot create welcome controls");
-            a.edit_background = CreateSolidBrush(ui::surface);
-            a.chrome_background = CreateSolidBrush(ui::chrome);
+            refresh_reader_theme(a);
             fonts(a);
             DragAcceptFiles(window, TRUE);
             a.worker.window = window;
             a.worker.thread = std::thread(worker_run, std::ref(a.worker));
+            a.search_worker.window = window;
+            a.search_worker.message = search_message;
+            a.search_worker.thread = std::thread(run_search_worker, std::ref(a.search_worker));
+            sync_search(a);
             layout(a);
             return 0;
         }
@@ -2097,13 +2615,17 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                 OffsetRect(&client_rect, -window_rect.left, -window_rect.top);
                 RECT divider{client_rect.left, client_rect.top - 1, client_rect.right, client_rect.top};
                 HDC dc = GetWindowDC(window);
-                fill_rect(dc, divider, ui::border);
+                fill_rect(dc, divider, a.search_colors.border);
                 ReleaseDC(window, dc);
             }
             return result;
         }
         case WM_NOTIFY: {
             auto header = reinterpret_cast<NMHDR*>(lp);
+            if (header->hwndFrom == a.sidebar_tabs && header->code == TCN_SELCHANGE) {
+                select_sidebar_tab(a, TabCtrl_GetCurSel(a.sidebar_tabs));
+                return 0;
+            }
             if (header->hwndFrom == a.bookmark_tree) {
                 if (header->code == NM_CUSTOMDRAW)
                     return paint_bookmark(a, *reinterpret_cast<NMTVCUSTOMDRAW*>(lp));
@@ -2158,7 +2680,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             }
             return 0;
         case WM_TIMER:
-            if (wp == 2)
+            if (wp == 3)
+                start_search(a);
+            else if (wp == 2)
                 poll_update(a);
             else if (wp == 1) {
                 KillTimer(window, 1);
@@ -2176,21 +2700,35 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             request_render(a);
             return 0;
         }
+        case WM_SETTINGCHANGE:
+        case WM_SYSCOLORCHANGE:
+        case WM_THEMECHANGED:
+            refresh_reader_theme(a);
+            return 0;
         case WM_GETMINMAXINFO: {
             auto info = reinterpret_cast<MINMAXINFO*>(lp);
             info->ptMinTrackSize = {px(a, 640), px(a, 480)};
             return 0;
         }
         case WM_CTLCOLORLISTBOX:
-            SetBkColor(HDC(wp), ui::chrome);
+            if (HWND(lp) == a.search_results) {
+                SetBkColor(HDC(wp), a.search_colors.body);
+                SetTextColor(HDC(wp), a.search_colors.text);
+                return LRESULT(a.results_background);
+            }
+            SetBkColor(HDC(wp), a.search_colors.footer);
             return LRESULT(a.chrome_background);
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORSTATIC:
-            SetBkColor(HDC(wp), ui::surface);
-            SetTextColor(HDC(wp), IsWindowEnabled(HWND(lp)) ? ui::text : ui::disabled);
+            SetBkColor(HDC(wp), a.search_colors.field);
+            SetTextColor(HDC(wp), IsWindowEnabled(HWND(lp)) ? a.search_colors.text : a.search_colors.muted);
             return LRESULT(a.edit_background);
         case WM_MEASUREITEM: {
             auto item = reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
+            if (item->CtlID == id_results) {
+                item->itemHeight = UINT(px(a, 72));
+                return TRUE;
+            }
             if (item->CtlType != ODT_MENU || !item->itemData)
                 break;
             const auto& data = *reinterpret_cast<const MenuItem*>(item->itemData);
@@ -2202,16 +2740,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             HDC dc = GetDC(window);
             auto old = SelectObject(dc, a.font);
             RECT bounds{}, shortcut{};
-            DrawTextW(dc, data.title.c_str(), -1, &bounds,
-                      DT_SINGLELINE | DT_CALCRECT);
-            DrawTextW(dc, data.shortcut.c_str(), -1, &shortcut,
-                      DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
+            DrawTextW(dc, data.title.c_str(), -1, &bounds, DT_SINGLELINE | DT_CALCRECT);
+            DrawTextW(dc, data.shortcut.c_str(), -1, &shortcut, DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
             SelectObject(dc, old);
             ReleaseDC(window, dc);
             item->itemWidth = UINT(bounds.right + shortcut.right + px(a, data.bar ? 16 : 64));
-            item->itemHeight = UINT(data.bar
-                ? std::max(bounds.bottom + px(a, 6), LONG(GetSystemMetricsForDpi(SM_CYMENU, a.dpi)))
-                : std::max(bounds.bottom + px(a, 12), LONG(px(a, 30))));
+            item->itemHeight = UINT(
+                data.bar ? std::max(bounds.bottom + px(a, 6), LONG(GetSystemMetricsForDpi(SM_CYMENU, a.dpi)))
+                         : std::max(bounds.bottom + px(a, 12), LONG(px(a, 30))));
             return TRUE;
         }
         case WM_MENUCHAR: {
@@ -2219,9 +2755,8 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             for (int index = 0; index < GetMenuItemCount(menu); ++index) {
                 MENUITEMINFOW item{sizeof(item)};
                 item.fMask = MIIM_FTYPE | MIIM_DATA | MIIM_STATE;
-                if (!GetMenuItemInfoW(menu, UINT(index), TRUE, &item) ||
-                    !(item.fType & MFT_OWNERDRAW) || !item.dwItemData ||
-                    (item.fState & (MFS_DISABLED | MFS_GRAYED)))
+                if (!GetMenuItemInfoW(menu, UINT(index), TRUE, &item) || !(item.fType & MFT_OWNERDRAW) ||
+                    !item.dwItemData || (item.fState & (MFS_DISABLED | MFS_GRAYED)))
                     continue;
                 const auto& title = reinterpret_cast<const MenuItem*>(item.dwItemData)->title;
                 for (size_t i = 0; i + 1 < title.size(); ++i) {
@@ -2237,16 +2772,20 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         }
         case WM_DRAWITEM: {
             auto item = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
+            if (item->CtlID == id_results && item->CtlType == ODT_LISTBOX) {
+                paint_search_result(a, *item);
+                return TRUE;
+            }
             if (item->CtlType == ODT_MENU && item->itemData) {
                 const auto& data = *reinterpret_cast<const MenuItem*>(item->itemData);
                 int saved = SaveDC(item->hDC);
                 bool disabled = (item->itemState & (ODS_DISABLED | ODS_GRAYED)) != 0;
-                COLORREF background = data.bar ? ui::chrome : ui::surface;
+                COLORREF background = data.bar ? a.search_colors.footer : a.search_colors.field;
                 if (!disabled && !data.separator) {
                     if (item->itemState & ODS_SELECTED)
-                        background = ui::selected;
+                        background = a.search_colors.pressed;
                     else if (item->itemState & ODS_HOTLIGHT)
-                        background = ui::hover;
+                        background = a.search_colors.hover;
                 }
                 fill_rect(item->hDC, item->rcItem, background);
                 RECT bounds = item->rcItem;
@@ -2255,7 +2794,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                     bounds.right -= px(a, 12);
                     bounds.top = (bounds.top + bounds.bottom) / 2;
                     bounds.bottom = bounds.top + 1;
-                    fill_rect(item->hDC, bounds, ui::border);
+                    fill_rect(item->hDC, bounds, a.search_colors.border);
                     RestoreDC(item->hDC, saved);
                     return TRUE;
                 }
@@ -2265,21 +2804,24 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                 if (!data.bar) {
                     bounds.left += px(a, 16);
                     bounds.right -= px(a, 16);
-                    label(item->hDC, bounds, data.shortcut, disabled ? ui::disabled : ui::muted,
-                          a.font, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                    label(item->hDC, bounds, data.shortcut,
+                          disabled ? a.search_colors.muted : a.search_colors.muted, a.font,
+                          DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
                 }
-                label(item->hDC, bounds, data.title, disabled ? ui::disabled : ui::text, a.font, flags);
+                label(item->hDC, bounds, data.title, disabled ? a.search_colors.muted : a.search_colors.text,
+                      a.font, flags);
                 RestoreDC(item->hDC, saved);
                 return TRUE;
             }
             if (item->CtlID == cmd_install || item->CtlID == cmd_portable) {
                 const bool focused = (item->itemState & ODS_FOCUS) != 0;
-                const COLORREF fill = (item->itemState & ODS_SELECTED) ? ui::selected : ui::surface;
-                ui::control(a.painter, item->hDC, item->rcItem, a.dpi, ui::canvas, fill,
-                            focused ? ui::focus : ui::border, 1);
+                const COLORREF fill =
+                    (item->itemState & ODS_SELECTED) ? a.search_colors.pressed : a.search_colors.field;
+                ui::control(a.painter, item->hDC, item->rcItem, a.dpi, a.search_colors.field, fill,
+                            focused ? a.search_colors.accent : a.search_colors.border, 1);
                 label(item->hDC, item->rcItem,
-                      item->CtlID == cmd_install ? L"Install FastPDF" : L"Continue portable", ui::text,
-                      a.font, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                      item->CtlID == cmd_install ? L"Install FastPDF" : L"Continue portable",
+                      a.search_colors.text, a.font, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
                 return TRUE;
             }
             if (item->CtlID != id_sidebar || item->itemID == UINT(-1))
@@ -2302,7 +2844,10 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                     (a.update_job.valid() || !a.pending_update.directory.empty() ? MF_GRAYED : MF_ENABLED));
             return 0;
         case WM_COMMAND:
-            if (LOWORD(wp) == id_sidebar && HIWORD(wp) == LBN_SELCHANGE) {
+            if (LOWORD(wp) == id_results && HIWORD(wp) == LBN_SELCHANGE) {
+                a.search_notice.clear();
+                select_match(a, int(SendMessageW(a.search_results, LB_GETCURSEL, 0, 0)));
+            } else if (LOWORD(wp) == id_sidebar && HIWORD(wp) == LBN_SELCHANGE) {
                 int index = int(SendMessageW(a.sidebar, LB_GETCURSEL, 0, 0));
                 if (index >= 0) {
                     goto_page(a, index);
@@ -2517,7 +3062,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             else if (wp == VK_SPACE)
                 scroll(a, SB_VERT, SB_PAGEDOWN);
             else if (wp == VK_F3)
-                find(a, true);
+                find(a, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
             else if (wp == 'R')
                 command(a, cmd_rotate);
             else if (wp == 'F')
@@ -2535,6 +3080,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         case worker_message:
             receive(a);
             return 0;
+        case search_message:
+            receive_search(a);
+            return 0;
         case WM_CLOSE:
             if (a.update_on_exit && !a.pending_update.directory.empty()) {
                 deployment::start_update(a.pending_update, current_session(a), false);
@@ -2551,18 +3099,21 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             DestroyWindow(window);
             return 0;
         case WM_DESTROY:
+            stop_search_worker(a.search_worker);
             a.worker.stop = true;
             a.worker.cancel = true;
             a.worker.ready.notify_all();
             if (a.worker.thread.joinable())
                 a.worker.thread.join();
-            for (auto f : {a.font, a.title_font, a.small_font, a.selected_font})
+            for (auto f : {a.font, a.title_font, a.small_font, a.selected_font, a.search_font})
                 if (f)
                     DeleteObject(f);
             if (a.edit_background)
                 DeleteObject(a.edit_background);
             if (a.chrome_background)
                 DeleteObject(a.chrome_background);
+            if (a.results_background)
+                DeleteObject(a.results_background);
             for (auto icon : {a.icon, a.small_icon})
                 if (icon)
                     DestroyIcon(icon);
@@ -2590,7 +3141,7 @@ struct InstanceLock {
 static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>& arguments) {
     ui::enable_system_dialog_theme();
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_LINK_CLASS |
-                                                        ICC_TREEVIEW_CLASSES};
+                                                        ICC_TREEVIEW_CLASSES | ICC_TAB_CLASSES};
     InitCommonControlsEx(&controls);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const int maintenance = deployment::maintenance_command(arguments);
@@ -2601,7 +3152,7 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
         if (!deployment::installation_present())
             throw std::runtime_error("FastPDF is not installed for this Windows account.");
         if (ui::message_box(nullptr, L"Uninstall FastPDF? Your PDF files will be kept.", L"Uninstall FastPDF",
-                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
+                            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
             deployment::start_uninstall();
         return 0;
     }
@@ -2691,10 +3242,36 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
     }
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (message.message == WM_KEYDOWN && IsWindowEnabled(app.window)) {
+            const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (ctrl && message.wParam == 'F') {
+                if (!app.find_open)
+                    command(app, cmd_search);
+                SetFocus(app.search);
+                SendMessageW(app.search, EM_SETSEL, 0, -1);
+                continue;
+            }
+            if (message.wParam == VK_F3) {
+                if (!app.find_open)
+                    command(app, cmd_search);
+                else
+                    find(app, shift ? -1 : 1);
+                continue;
+            }
+            if (message.wParam == VK_ESCAPE && app.find_open) {
+                command(app, cmd_search);
+                continue;
+            }
+        }
         if (message.message == WM_KEYDOWN && message.wParam == VK_TAB) {
             std::vector<HWND> order{app.window, app.toolbar};
-            for (auto control : {app.page_edit, app.zoom_edit, app.search, app.sidebar, app.bookmark_tree,
-                                 app.welcome_install, app.welcome_portable})
+            for (auto control :
+                 {app.page_edit, app.zoom_edit, app.search, GetDlgItem(app.find_bar, IDC_FIND_PREVIOUS),
+                  GetDlgItem(app.find_bar, IDC_FIND_NEXT), GetDlgItem(app.find_bar, IDC_FIND_RESULTS),
+                  GetDlgItem(app.find_bar, IDC_FIND_OPTIONS), GetDlgItem(app.find_bar, IDC_FIND_CLOSE),
+                  GetDlgItem(app.find_bar, IDC_FIND_STOP), app.sidebar_tabs, app.search_results, app.sidebar,
+                  app.bookmark_tree, app.welcome_install, app.welcome_portable})
                 if (IsWindowVisible(control) && IsWindowEnabled(control))
                     order.push_back(control);
             auto it = std::find(order.begin(), order.end(), GetFocus());

@@ -97,7 +97,11 @@ background services, or tray icons.
 - Open: Ctrl+O or drag a PDF into the window.
 - Pages: Page Up / Page Down, left / right, Home / End; Ctrl+G for a page number.
 - Zoom: Ctrl+mouse wheel or + / −. F fits the page; W fits its width; R rotates it.
-- Find: Ctrl+F; Enter searches; F3 starts the next search from the following page.
+- Find: Ctrl+F. Search starts as you type. Enter or F3 selects the next match;
+  Shift+Enter or Shift+F3 selects the previous match. Escape closes search.
+  Use Results to open the list of matches, or Options to match case, find whole
+  words, or search only the current page. Switch between Pages, Bookmarks, and
+  Results with the sidebar tabs. Switching tabs keeps the search active.
 - Selection: drag over text, then Ctrl+C. Ctrl+A selects the current page's extracted text.
 - Pan: middle-button drag. Scroll: mouse wheel, arrows, Space, or scrollbars.
 - Bookmarks: B or the bookmark icon. Links support document destinations and HTTP, HTTPS, and mail links.
@@ -110,7 +114,8 @@ background services, or tray icons.
 The compact toolbar groups file, page, zoom, and view controls into small icons. Hover over an icon for
 its name and shortcut. Enter a page number or zoom percentage (5–800%) in the toolbar and press Enter;
 Escape cancels the edit. F6 focuses the toolbar, arrow keys move between its buttons, and Tab moves
-between the toolbar, page and zoom fields, search, and page list. The main menus include
+between the toolbar, page and zoom fields, search, sidebar tabs, and visible list.
+Use the arrow keys on the tabs to change the sidebar view. The main menus include
 any actions hidden when the window is narrow. Document controls are disabled
 until a PDF is open.
 
@@ -121,6 +126,8 @@ keeps focus while you navigate with the arrow keys; Escape returns focus to the 
 Bookmarks use a tree with collapsed branches when you open a document. Click an arrow, or use
 the Left and Right keys, to collapse or expand a branch. Drag the right edge of the Bookmarks
 or Pages pane to change its width. The default width is 320 pixels at 100% display scaling.
+The Results tab is available while Find is open. Closing Find returns to the last Pages or
+Bookmarks view. Bookmark branches keep their expanded or collapsed state when you switch tabs.
 
 The UI renders in a worker thread, cancels obsolete render/search requests, caches page bitmaps, and prefetches adjacent pages when idle. Search reads text without rasterizing the page's images and graphics. The current UI displays one page at a time.
 

@@ -1,0 +1,182 @@
+"""Check real search navigation without sending desktop input."""
+import ctypes as c
+from ctypes import wintypes as w
+from pathlib import Path
+import subprocess
+import sys
+
+from search_fixture import search_document
+from ui_toolbar import user, wait_for, find_window, text, enter, rect, CALLBACK
+
+user.ScreenToClient.argtypes = [w.HWND, c.POINTER(w.POINT)]
+
+def visible(control):
+    # The test window stays hidden. Check each child's own visibility flag.
+    return bool(user.GetWindowLongW(control, -16) & 0x10000000)
+
+
+def run(exe, output):
+    output.mkdir(parents=True, exist_ok=True)
+    document = output / "product-guide.pdf"
+    search_document(document)
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = 0
+    process = subprocess.Popen([str(exe), str(document)], startupinfo=startup)
+    window = None
+    try:
+        window = wait_for(lambda: find_window(process.pid), "reader")
+        toolbar = wait_for(lambda: user.GetDlgItem(window, 202), "toolbar")
+        page = wait_for(lambda: user.GetDlgItem(toolbar, 203), "page field")
+        wait_for(lambda: text(page) == "1", "loaded page")
+        tabs, bookmarks, pages = [user.GetDlgItem(window, control) for control in (208, 205, 200)]
+        assert user.SendMessageW(tabs, 0x1304, 0, 0) == 2, "Unexpected tabs before Find"
+        assert visible(bookmarks), "Bookmarks did not open"
+        root = user.SendMessageW(bookmarks, 0x110A, 0, 0)
+        assert root, "Missing bookmark fixture"
+        user.SendMessageW(bookmarks, 0x1102, 2, root)  # Expand the first branch.
+        user.MoveWindow(window, 50, 50, 1000, 700, True)
+        zoom = user.GetDlgItem(toolbar, 204)
+        enter(zoom, "200")
+        wait_for(lambda: text(zoom) == "200%", "zoom")
+        user.SendMessageW(window, 0x111, 11, 0)
+        bar = user.GetDlgItem(window, 206)
+        query, count = user.GetDlgItem(bar, 201), user.GetDlgItem(bar, 1046)
+        assert visible(bookmarks), "Opening Find hid bookmarks"
+        assert user.SendMessageW(tabs, 0x1304, 0, 0) == 3, "Missing Results tab"
+
+        def expect(value):
+            wait_for(lambda: text(count) == value, f"count {value}, currently {text(count)}")
+
+        def command(control):
+            user.SendMessageW(bar, 0x111, control, 0)
+
+        enter(query, "warranty")
+        expect("1 of 8")
+        assert visible(bookmarks), "Search replaced bookmarks without a request"
+        assert text(page) == "1"
+        user.SendMessageW(window, 0x100, 0x72, 0)  # F3
+        expect("2 of 8")
+        assert text(page) == "1", "F3 skipped a match on the same page"
+        command(1041)
+        expect("1 of 8")
+        for number in (2, 3, 4):
+            user.SendMessageW(query, 0x100, 13, 0)
+            expect(f"{number} of 8")
+            assert text(page) == "1", "Enter skipped a match on the same page"
+        user.GetScrollPos.argtypes = [w.HWND, c.c_int]
+        wait_for(lambda: user.GetScrollPos(window, 1) > 0, "scroll to the match near the page bottom")
+        command(1042)
+        expect("5 of 8")
+        wait_for(lambda: text(page) == "2", "next matching page")
+        command(1041)
+        expect("4 of 8")
+        wait_for(lambda: text(page) == "1", "previous matching page")
+        for _ in range(4):
+            command(1041)
+        expect("8 of 8")
+        wait_for(lambda: text(page) == "3", "reverse wrap")
+        command(1042)
+        expect("1 of 8")
+
+        command(1043)
+        results = user.GetDlgItem(window, 207)
+        assert user.SendMessageW(results, 0x18B, 0, 0) == 8, "Missing results"
+        user.SendMessageW(results, 0x186, 5, 0)
+        user.SendMessageW(window, 0x111, 207 | (1 << 16), results)
+        expect("6 of 8")
+        wait_for(lambda: text(page) == "2", "result selection")
+
+        def select_tab(index, control):
+            user.SendMessageW(tabs, 0x1330, index, 0)  # Native tab focus changes selection.
+            wait_for(lambda: user.SendMessageW(tabs, 0x130B, 0, 0) == index, "selected tab")
+            assert visible(control), "Tab did not show its view"
+            assert sum(bool(visible(view)) for view in (pages, bookmarks, results)) == 1
+            assert text(query) == "warranty", "Switching tabs cleared the query"
+            expect("6 of 8")
+            assert text(page) == "2", "Switching tabs changed the page"
+            assert user.SendMessageW(results, 0x188, 0, 0) == 5, "Switching tabs lost the selected match"
+
+        select_tab(1, bookmarks)
+        assert user.SendMessageW(bookmarks, 0x1127, root, 0x20) & 0x20, "Switching tabs collapsed bookmarks"
+        user.SendMessageW(tabs, 0x100, 0x27, 0)  # Right selects Results.
+        assert visible(results), "Arrow-key tab navigation failed"
+        user.SendMessageW(window, 0x111, 10, 0)  # Bookmarks toolbar command from Results.
+        assert visible(bookmarks), "Bookmarks command closed the sidebar from Results"
+        select_tab(0, pages)
+        select_tab(2, results)
+        user.SendMessageW(window, 0x111, 9, 0)
+        assert visible(pages), "Pages command closed the sidebar from Results"
+        select_tab(1, bookmarks)
+        select_tab(2, results)
+        command(1043)
+        assert visible(results), "Results button should keep Results open"
+
+        def options_dialog():
+            matches = []
+            @CALLBACK
+            def visit(hwnd, _):
+                pid = w.DWORD()
+                user.GetWindowThreadProcessId(hwnd, c.byref(pid))
+                if pid.value == process.pid and text(hwnd) == "Search Options":
+                    matches.append(hwnd)
+                return True
+            user.EnumWindows(visit, 0)
+            return matches[0] if matches else None
+
+        user.PostMessageW(bar, 0x111, 1044, 0)
+        dialog = wait_for(options_dialog, "search options")
+        user.SendMessageW(user.GetDlgItem(dialog, 1050), 0xF1, 1, 0)
+        user.SendMessageW(user.GetDlgItem(dialog, 1051), 0xF1, 1, 0)
+        user.PostMessageW(dialog, 0x111, 1, 0)
+        wait_for(lambda: text(count).endswith(" of 6"), "case and whole words")
+
+        user.PostMessageW(bar, 0x111, 1044, 0)
+        dialog = wait_for(options_dialog, "scope options")
+        user.SendMessageW(user.GetDlgItem(dialog, 1052), 0x14E, 1, 0)
+        user.PostMessageW(dialog, 0x111, 1, 0)
+        expect("1 of 2")
+        assert text(page) == "2", "Current page scope changed pages"
+        enter(query, "not in this document")
+        expect("0 matches")
+        enter(query, "warranty")
+        expect("1 of 2")
+        user.SendMessageW(query, 0x100, 27, 0)
+        assert not visible(bar), "Escape did not close search"
+        assert visible(bookmarks), "Closing Find did not restore bookmarks"
+        assert user.SendMessageW(tabs, 0x1304, 0, 0) == 2, "Closing Find kept the Results tab"
+        user.SendMessageW(window, 0x111, 11, 0)
+        expect("1 of 2")
+        assert visible(bookmarks), "Reopening Find replaced bookmarks"
+        for dpi in (96, 144):
+            bounds = w.RECT(50, 50, 50 + 1000 * dpi // 96, 50 + 700 * dpi // 96)
+            user.SendMessageW(window, 0x2E0, dpi | (dpi << 16), c.addressof(bounds))
+            controls = [query, count] + [user.GetDlgItem(bar, i) for i in (1041, 1042, 1043, 1044, 1045)]
+            boxes = [rect(control) for control in controls]
+            assert all(box.left < box.right and box.top < box.bottom for box in boxes)
+            assert all(left.right <= right.left for left, right in zip(boxes, boxes[1:])), "Search controls overlap"
+            assert boxes[-1].right <= rect(bar).right, "Search controls exceed the bar"
+            assert boxes[0].bottom - boxes[0].top >= 16 * dpi // 96, "Search field does not follow DPI"
+            assert rect(tabs).bottom <= rect(bookmarks).top, "Sidebar tabs overlap content"
+            assert rect(tabs).bottom - rect(tabs).top >= 32 * dpi // 96, "Tabs do not follow DPI"
+            width = rect(bookmarks).right - rect(bookmarks).left
+            point = w.POINT(rect(bookmarks).right + 3 * dpi // 96, rect(bookmarks).top + 20 * dpi // 96)
+            assert user.ScreenToClient(window, c.byref(point))
+            user.SendMessageW(window, 0x201, 1, (point.y << 16) | point.x)
+            user.SendMessageW(window, 0x200, 1, point.y << 16)
+            user.SendMessageW(window, 0x202, 0, point.y << 16)
+            assert user.SendMessageW(tabs, 0x132C, 0, 0) > 1, f"Narrow sidebar tabs did not wrap at {dpi} DPI: width {rect(bookmarks).right - rect(bookmarks).left}, before {width}"
+            assert rect(tabs).bottom <= rect(bookmarks).top, "Wrapped tabs overlap content"
+        print("Search navigation, sidebar tabs, bookmark state, options, DPI, and reopen passed")
+    finally:
+        if window:
+            user.PostMessageW(window, 0x10, 0, 0)
+        try:
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+if __name__ == "__main__":
+    run(Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve())

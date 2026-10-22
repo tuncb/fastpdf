@@ -88,6 +88,8 @@ struct CachedImage {
 struct TextSpan {
     std::wstring text;
     Rect bounds;
+    // One box per UTF-16 unit. A ligature can map several units to the same glyph.
+    std::vector<Rect> characters;
 };
 struct Link {
     Rect bounds;

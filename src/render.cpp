@@ -1017,7 +1017,21 @@ static void show_text(Context& c, std::string_view text, const Value& resources,
                  f.ascent * fs / 1000 + c.g.rise};
         if (f.cmap.vertical)
             box = {-fs / 2, advance, fs / 2, fs};
-        c.output->text.push_back({extracted, transformed_box(multiply(c.g.ctm, c.g.text), box)});
+        TextSpan span{extracted, transformed_box(multiply(c.g.ctm, c.g.text), box), {}};
+        double position = 0;
+        for (const auto& glyph : glyphs) {
+            const double next = position +
+                (f.cmap.vertical ? glyph.vadvance : glyph.advance) * fs / 1000 + c.g.char_space +
+                (glyph.code == 32 ? c.g.word_space : 0);
+            Rect glyph_box{std::min(position, next) * c.g.hscale, f.descent * fs / 1000 + c.g.rise,
+                           std::max(position, next) * c.g.hscale, f.ascent * fs / 1000 + c.g.rise};
+            if (f.cmap.vertical)
+                glyph_box = {-fs / 2, std::min(position, next), fs / 2, std::max(position, next)};
+            const auto bounds = transformed_box(multiply(c.g.ctm, c.g.text), glyph_box);
+            span.characters.insert(span.characters.end(), glyph.text.size(), bounds);
+            position = next;
+        }
+        c.output->text.push_back(std::move(span));
     }
     bool fill = c.g.text_mode == 0 || c.g.text_mode == 2 || c.g.text_mode == 4 || c.g.text_mode == 6;
     bool stroke = c.g.text_mode == 1 || c.g.text_mode == 2 || c.g.text_mode == 5 || c.g.text_mode == 6;
