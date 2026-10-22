@@ -348,6 +348,25 @@ def generate(directory):
     add("subpixel_stencil_color_opacity", pdf(base(b"0 0 1 rg /G gs " + inverse_rules,
         b"/ExtGState << /G << /ca .5 >> >>")),
         pixels=[(20, 160, (223, 223, 255)), (60, 199, (223, 223, 255))], tolerance=4)
+    multi_mask = b"BI /W 8 /H 8 /IM true /BPC 1 ID " + bytes(8) + b" EI"
+    add("subpixel_multi_stencil", pdf(base(rules.replace(thin_mask, multi_mask))),
+        pixels=[(20, 160, (191, 191, 191)), (60, 199, (191, 191, 191))], tolerance=4)
+    # Scanned pages can use a white stencil over a slightly smaller black base.
+    # Cover complete edge pixels without stretching the stencil's inner marks.
+    scan_mask = b"BI /W 8 /H 8 /IM true /BPC 1 ID \0\0\0\x18\x18\0\0\0 EI"
+    for phase in ("36", "84"):
+        content = (f"0 g 20.{int(phase) + 6} 20.{int(phase) + 6} 99.88 99.88 re f "
+                   f"1 g q 100 0 0 100 20.{phase} 20.{phase} cm ").encode() + scan_mask + b" Q"
+        pixels = [(20, 150, (255, 255, 255)), (120, 150, (255, 255, 255)),
+                  (70, 99, (255, 255, 255)), (70, 199, (255, 255, 255)),
+                  (70, 150, (0, 0, 0)), (90, 150, (255, 255, 255))]
+        for orientation, matrix, points in [
+            ("normal", b"", pixels),
+            ("reflected", b"-1 0 0 1 300 0 cm ", [(299-x, y, c) for x, y, c in pixels]),
+            ("rotated", b"0 1 -1 0 220 0 cm ", [(y, 219-x, c) for x, y, c in pixels]),
+        ]:
+            add(f"stencil_pixel_bounds_{phase}_{orientation}", pdf(base(matrix + content)),
+                pixels=points, tolerance=2)
     strips = b"".join((f"q 20 {20 + i * .625} 100 .625 re W n "
                        f"100 0 0 .625 20 {20 + i * .625} cm /Im Do Q\n").encode() for i in range(64))
     objects = base(strips, b"/XObject << /Im 6 0 R >>")

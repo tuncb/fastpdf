@@ -870,28 +870,57 @@ static void draw_image(Context& c, const Value& image, const Value& resources,
                     throw;
                 }
             }
-            set_transform(target, multiply(target.g.ctm, {1, 0, 0, -1, 0, 1}));
+            auto image_transform = multiply(target.g.ctm, {1, 0, 0, -1, 0, 1});
+            set_transform(target, image_transform);
             bool interpolate = boolean(get(image, "Interpolate"), true);
             auto antialias = target.canvas->target->GetAntialiasMode();
             // Image sampling still interpolates pixels. Axis-aligned outer
             // edges use pixel centers, so adjacent image tiles meet exactly.
-            // Stencils need fractional coverage: producers use one-pixel masks
+            // Narrow stencils need fractional coverage: producers use masks
             // to draw table rules and figure borders narrower than one pixel.
-            bool aligned = !decoded->stencil &&
+            bool narrow_stencil = decoded->stencil && (width < 1 || height < 1);
+            bool aligned = !narrow_stencil &&
                            ((target.g.ctm.b == 0 && target.g.ctm.c == 0) ||
                             (target.g.ctm.a == 0 && target.g.ctm.d == 0));
+            ID2D1BitmapBrush* edge_brush = nullptr;
+            Rect edge_bounds{};
+            if (aligned && decoded->stencil) {
+                // A scanned page can paint a black base, then cover its white
+                // pixels with a stencil. Cover the complete boundary pixels;
+                // partial edge coverage would expose a gray frame underneath.
+                auto bounds = transformed_box(image_transform, {0, 0, 1, 1});
+                bounds = {std::floor(bounds.x0), std::floor(bounds.y0),
+                          std::ceil(bounds.x1), std::ceil(bounds.y1)};
+                edge_bounds = transformed_box(inverse(image_transform), bounds);
+                auto properties = D2D1::BitmapBrushProperties(
+                    D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+                    interpolate ? D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
+                                : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+                auto result = target.canvas->target->CreateBitmapBrush(
+                    bitmap, properties, D2D1::BrushProperties(target.g.fill_alpha,
+                        D2D1::Matrix3x2F::Scale(1.f / decoded->width, 1.f / decoded->height)), &edge_brush);
+                if (FAILED(result)) {
+                    release(bitmap);
+                    hr(result, "Create stencil edge brush");
+                }
+            }
             if (aligned) {
                 set_rect_clip_antialias(target, D2D1_ANTIALIAS_MODE_ALIASED);
                 target.canvas->target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
             }
-            target.canvas->target->DrawBitmap(bitmap, D2D1::RectF(0, 0, 1, 1), target.g.fill_alpha,
-                                              interpolate ? D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
-                                                          : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+            if (edge_brush)
+                target.canvas->target->FillRectangle(D2D1::RectF(float(edge_bounds.x0), float(edge_bounds.y0),
+                    float(edge_bounds.x1), float(edge_bounds.y1)), edge_brush);
+            else
+                target.canvas->target->DrawBitmap(bitmap, D2D1::RectF(0, 0, 1, 1), target.g.fill_alpha,
+                    interpolate ? D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
+                                : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
             target.canvas->target->SetAntialiasMode(antialias);
             // Vector strokes can lie on a fractional clip boundary. Restore
             // edge coverage so those strokes are not discarded with a pixel.
             if (aligned)
                 set_rect_clip_antialias(target, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            release(edge_brush);
             release(bitmap);
         },
         false, 1, transformed_box(c.g.ctm, {0, 0, 1, 1}), false, image_mask);
