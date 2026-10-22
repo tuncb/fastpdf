@@ -1,6 +1,7 @@
 #pragma once
 #include "render.h"
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -27,6 +28,18 @@ struct SearchMatch {
     std::wstring snippet;
     std::vector<SearchPiece> pieces;
 };
+// Keep each page's allocation intact when it moves from the worker to the UI.
+struct SearchBatch {
+    size_t first = 0;
+    std::vector<SearchMatch> matches;
+};
+struct SearchResults {
+    std::vector<SearchBatch> batches;
+    size_t count = 0;
+};
+void append_search_results(SearchResults& results, std::vector<SearchMatch> matches);
+const SearchMatch& search_result(const SearchResults& results, size_t index);
+const SearchBatch* search_result_page(const SearchResults& results, int page);
 SearchText search_text(const RenderedPage& page);
 std::vector<SearchMatch> search_matches(const SearchText& text, std::wstring_view query,
                                         const SearchOptions& options, int page = 0);
@@ -48,7 +61,10 @@ struct SearchWorker {
     std::mutex mutex;
     std::condition_variable ready;
     std::optional<SearchRequest> request;
-    std::vector<SearchUpdate> updates;
+    std::deque<SearchUpdate> updates;
+    size_t queued_matches = 0;
+    bool notified = false;
+    SearchResults retired;
     std::atomic<bool> cancel = false, stop = false;
     std::thread thread;
     HWND window = nullptr;
@@ -57,5 +73,9 @@ struct SearchWorker {
 void run_search_worker(SearchWorker& worker);
 void submit_search(SearchWorker& worker, SearchRequest request);
 void cancel_search(SearchWorker& worker);
+// Cancel before retiring the current results, and retire before submitting the next query.
+void retire_search_results(SearchWorker& worker, SearchResults& results);
+bool take_search_update(SearchWorker& worker, uint64_t document, uint64_t ticket, SearchUpdate& update);
+bool finish_search_updates(SearchWorker& worker);
 void stop_search_worker(SearchWorker& worker);
 } // namespace pdf

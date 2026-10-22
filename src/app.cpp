@@ -148,7 +148,8 @@ struct App {
     SearchWorker search_worker;
     HWND find_bar = nullptr, search_results = nullptr;
     SearchOptions search_options;
-    std::vector<SearchMatch> matches;
+    SearchResults matches;
+    bool syncing_results = false;
     int active_match = -1, search_start_page = 0, search_checked = 0, search_total = 0;
     bool search_running = false, search_complete = false, search_has_text = false, search_failed = false;
     bool show_results = false, reveal_match = false, search_stopped = false;
@@ -197,6 +198,21 @@ static void label(HDC dc, RECT rect, std::wstring_view text, COLORREF color, HFO
 static void find(App& a, int direction = 1);
 static void start_search(App& a);
 static void sync_search(App& a);
+static void fit_search_results(HWND window) {
+    RECT bounds{};
+    GetClientRect(window, &bounds);
+    if (ListView_GetColumnWidth(window, 0) != bounds.right)
+        ListView_SetColumnWidth(window, 0, bounds.right);
+}
+static void clear_search_results(App& a) {
+    KillTimer(a.window, 4);
+    a.syncing_results = true;
+    a.active_match = -1;
+    ListView_SetItemCountEx(a.search_results, 0, LVSICF_NOSCROLL);
+    fit_search_results(a.search_results);
+    a.syncing_results = false;
+    retire_search_results(a.search_worker, a.matches);
+}
 static void select_match(App& a, int index);
 static void reveal_search_match(App& a);
 static INT_PTR CALLBACK find_bar_proc(HWND window, UINT message, WPARAM wp, LPARAM lp);
@@ -566,7 +582,6 @@ static void fonts(App& a) {
     }
     if (a.search_results) {
         SendMessageW(a.search_results, WM_SETFONT, WPARAM(a.search_font), TRUE);
-        SendMessageW(a.search_results, LB_SETITEMHEIGHT, 0, px(a, 72));
     }
     SendMessageW(a.sidebar_tabs, WM_SETFONT, WPARAM(a.search_font), TRUE);
     TabCtrl_SetPadding(a.sidebar_tabs, px(a, 12), 0);
@@ -642,6 +657,7 @@ static void layout(App& a) {
     }
     MoveWindow(a.search_results, 0, list_top, sidebar_splitter(a).left,
                std::max<LONG>(0, r.bottom - list_top - px(a, 30)), TRUE);
+    fit_search_results(a.search_results);
     if (!results_visible(a) && GetFocus() == a.search_results)
         SetFocus(a.window);
     ShowWindow(a.search_results, results_visible(a) ? SW_SHOW : SW_HIDE);
@@ -763,14 +779,13 @@ static void load_file(App& a, const std::wstring& path, const std::wstring& pass
     cancel_search(a.search_worker);
     KillTimer(a.window, 3);
     ++a.search_ticket;
-    a.matches.clear();
+    clear_search_results(a);
     a.active_match = -1;
     a.search_running = a.search_complete = a.search_stopped = a.search_has_text = false;
     a.search_failed = false;
     a.show_results = a.reveal_match = false;
     a.search_notice.clear();
     SetWindowTextW(a.search, L"");
-    SendMessageW(a.search_results, LB_RESETCONTENT, 0, 0);
     a.query.clear();
     a.page = 0;
     a.rotation = 0;
@@ -1175,24 +1190,18 @@ static void sync_search(App& a) {
     else if (a.search_failed)
         count = a.search_notice.starts_with(L"Invalid regex:") ? L"Invalid regex" : L"Search error";
     else if (a.search_running) {
-        count = std::to_wstring(a.matches.size()) + L" found";
+        count = std::to_wstring(a.matches.count) + L" found";
         status = L"Searching… " + std::to_wstring(a.search_checked) + L" of " +
                  std::to_wstring(a.search_total) + L" pages checked";
     } else if (a.search_stopped) {
-        count = std::to_wstring(a.matches.size()) + L" found";
+        count = std::to_wstring(a.matches.count) + L" found";
         status = L"Search stopped. " + std::to_wstring(a.search_checked) + L" of " +
                  std::to_wstring(a.search_total) + L" pages checked";
-    } else if (!a.matches.empty()) {
-        count = std::to_wstring(a.active_match + 1) + L" of " + std::to_wstring(a.matches.size());
-        int pages = 0, previous = -1;
-        for (const auto& match : a.matches)
-            if (match.page != previous) {
-                ++pages;
-                previous = match.page;
-            }
-        status = std::to_wstring(a.matches.size()) +
-                 (a.matches.size() == 1 ? L" match on " : L" matches on ") + std::to_wstring(pages) +
-                 (pages == 1 ? L" page" : L" pages");
+    } else if (a.matches.count != 0) {
+        count = std::to_wstring(a.active_match + 1) + L" of " + std::to_wstring(a.matches.count);
+        const size_t pages = a.matches.batches.size();
+        status = std::to_wstring(a.matches.count) + (a.matches.count == 1 ? L" match on " : L" matches on ") +
+                 std::to_wstring(pages) + (pages == 1 ? L" page" : L" pages");
     } else if (a.search_complete && !a.search_has_text) {
         count = L"No text";
         status = L"No searchable text detected. These pages may contain scanned images.";
@@ -1207,10 +1216,21 @@ static void sync_search(App& a) {
     CheckDlgButton(a.find_bar, IDC_FIND_CASE, a.search_options.match_case ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(a.find_bar, IDC_FIND_WORDS, a.search_options.whole_words ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(a.find_bar, IDC_FIND_REGEX, a.search_options.regex ? BST_CHECKED : BST_UNCHECKED);
-    EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_PREVIOUS), !a.matches.empty());
-    EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_NEXT), !a.matches.empty());
+    EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_PREVIOUS), a.matches.count != 0);
+    EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_NEXT), a.matches.count != 0);
     ShowWindow(GetDlgItem(a.find_bar, IDC_FIND_STOP), a.search_running ? SW_SHOW : SW_HIDE);
-    SendMessageW(a.search_results, LB_SETCURSEL, WPARAM(a.active_match), 0);
+    const int selected = ListView_GetNextItem(a.search_results, -1, LVNI_SELECTED);
+    if (selected != a.active_match) {
+        a.syncing_results = true;
+        if (selected >= 0)
+            ListView_SetItemState(a.search_results, selected, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        if (a.active_match >= 0) {
+            ListView_SetItemState(a.search_results, a.active_match, LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(a.search_results, a.active_match, FALSE);
+        }
+        a.syncing_results = false;
+    }
     InvalidateRect(a.window, nullptr, FALSE);
 }
 static void start_search(App& a) {
@@ -1220,7 +1240,7 @@ static void start_search(App& a) {
     a.query = search_query(a);
     if (a.search_options.page >= 0)
         a.search_options.page = a.page;
-    a.matches.clear();
+    clear_search_results(a);
     a.active_match = -1;
     a.search_checked = 0;
     a.search_start_page = a.page;
@@ -1229,18 +1249,17 @@ static void start_search(App& a) {
     a.search_complete = a.search_stopped = a.search_has_text = a.reveal_match = false;
     a.search_failed = false;
     a.search_notice.clear();
-    SendMessageW(a.search_results, LB_RESETCONTENT, 0, 0);
     if (a.search_running)
         submit_search(a.search_worker,
                       {a.document, a.search_ticket, a.path, a.password, a.query, a.search_options});
     sync_search(a);
 }
 static void select_match(App& a, int index) {
-    if (index < 0 || size_t(index) >= a.matches.size())
+    if (index < 0 || size_t(index) >= a.matches.count)
         return;
     a.active_match = index;
     a.reveal_match = true;
-    const int page = a.matches[size_t(index)].page;
+    const int page = search_result(a.matches, size_t(index)).page;
     if (a.page != page || !a.bitmap)
         goto_page(a, page);
     else
@@ -1252,11 +1271,11 @@ static void find(App& a, int direction) {
         start_search(a);
         return;
     }
-    if (a.matches.empty())
+    if (a.matches.count == 0)
         return;
     int next = a.active_match + direction;
     a.search_notice.clear();
-    if (next < 0 || size_t(next) >= a.matches.size()) {
+    if (next < 0 || size_t(next) >= a.matches.count) {
         if (a.search_running || a.search_stopped) {
             a.search_notice = a.search_running ? L"Searching for more matches…"
                                                : L"Search stopped. Press Enter to search again.";
@@ -1269,21 +1288,22 @@ static void find(App& a, int direction) {
         }
         a.search_notice = next < 0 ? L"Continued from the end of the document."
                                    : L"Continued from the start of the document.";
-        next = next < 0 ? int(a.matches.size()) - 1 : 0;
+        next = next < 0 ? int(a.matches.count) - 1 : 0;
     }
     select_match(a, next);
 }
 static void receive_search(App& a) {
-    std::vector<SearchUpdate> updates;
-    {
-        std::lock_guard lock(a.search_worker.mutex);
-        updates.swap(a.search_worker.updates);
-    }
+    KillTimer(a.window, 4);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(4);
     int select = -1;
-    SendMessageW(a.search_results, WM_SETREDRAW, FALSE, 0);
-    for (auto& update : updates) {
-        if (update.document != a.document || update.ticket != a.search_ticket || !a.find_open)
-            continue;
+    bool changed = false;
+    // Transfer complete page allocations. Even a page with many matches takes
+    // constant time here; no row strings or match records are copied into the UI.
+    for (int pages = 0; a.find_open && pages < 64; ++pages) {
+        SearchUpdate update;
+        if (!take_search_update(a.search_worker, a.document, a.search_ticket, update))
+            break;
+        changed = true;
         a.search_checked = update.checked;
         a.search_total = update.total;
         a.search_has_text = a.search_has_text || update.has_text;
@@ -1294,22 +1314,27 @@ static void receive_search(App& a) {
             a.search_failed = true;
             a.search_complete = false;
             a.search_stopped = true;
-            a.matches.clear();
+            cancel_search(a.search_worker);
+            clear_search_results(a);
             a.active_match = select = -1;
-            SendMessageW(a.search_results, LB_RESETCONTENT, 0, 0);
-            continue;
+            break;
         }
-        for (auto& match : update.matches) {
-            if (a.active_match < 0 && select < 0 && match.page >= a.search_start_page)
-                select = int(a.matches.size());
-            const auto label = L"Page " + std::to_wstring(match.page + 1) + L": " + match.snippet;
-            SendMessageW(a.search_results, LB_ADDSTRING, 0, LPARAM(label.c_str()));
-            a.matches.push_back(std::move(match));
+        if (!update.matches.empty()) {
+            if (a.active_match < 0 && select < 0 && update.matches.front().page >= a.search_start_page)
+                select = int(a.matches.count);
+            append_search_results(a.matches, std::move(update.matches));
         }
+        if (std::chrono::steady_clock::now() >= deadline)
+            break;
     }
-    SendMessageW(a.search_results, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(a.search_results, nullptr, TRUE);
-    if (a.active_match < 0 && select < 0 && (a.search_complete || a.search_stopped) && !a.matches.empty())
+    if (finish_search_updates(a.search_worker))
+        SetTimer(a.window, 4, 16, nullptr);
+    if (!changed)
+        return;
+    ListView_SetItemCountEx(a.search_results, int(a.matches.count), LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+    fit_search_results(a.search_results);
+    InvalidateRect(a.search_results, nullptr, FALSE);
+    if (a.active_match < 0 && select < 0 && (a.search_complete || a.search_stopped) && a.matches.count != 0)
         select = 0;
     if (select >= 0)
         select_match(a, select);
@@ -1359,11 +1384,10 @@ static INT_PTR CALLBACK find_bar_proc(HWND window, UINT message, WPARAM wp, LPAR
             if (HIWORD(wp) == EN_CHANGE && a->find_open) {
                 cancel_search(a->search_worker);
                 ++a->search_ticket;
-                a->matches.clear();
+                clear_search_results(*a);
                 a->active_match = -1;
                 a->search_running = a->search_complete = a->search_stopped = false;
                 a->search_failed = false;
-                SendMessageW(a->search_results, LB_RESETCONTENT, 0, 0);
                 a->search_notice = L"";
                 SetTimer(a->window, 3, 180, nullptr);
                 sync_search(*a);
@@ -1392,6 +1416,7 @@ static INT_PTR CALLBACK find_bar_proc(HWND window, UINT message, WPARAM wp, LPAR
                 start_search(*a);
             return TRUE;
         case IDC_FIND_STOP:
+            KillTimer(a->window, 4);
             cancel_search(a->search_worker);
             ++a->search_ticket;
             a->search_running = false;
@@ -1608,7 +1633,7 @@ static void command(App& a, int id) {
             cancel_search(a.search_worker);
             ++a.search_ticket;
             a.search_running = false;
-            a.matches.clear();
+            clear_search_results(a);
             a.active_match = -1;
             a.reveal_match = false;
             SetFocus(a.window);
@@ -1925,10 +1950,10 @@ static RECT span_rect(App& a, Rect bounds) {
             rect.left + LONG(std::ceil(bounds.x1 * scale)), rect.top + LONG(std::ceil(bounds.y1 * scale))};
 }
 static void reveal_search_match(App& a) {
-    if (!a.reveal_match || !a.bitmap || a.active_match < 0 || size_t(a.active_match) >= a.matches.size() ||
-        a.matches[size_t(a.active_match)].page != a.page)
+    if (!a.reveal_match || !a.bitmap || a.active_match < 0 || size_t(a.active_match) >= a.matches.count ||
+        search_result(a.matches, size_t(a.active_match)).page != a.page)
         return;
-    const auto boxes = search_rects(*a.bitmap, a.matches[size_t(a.active_match)]);
+    const auto boxes = search_rects(*a.bitmap, search_result(a.matches, size_t(a.active_match)));
     if (boxes.empty())
         return;
     // Show the first fragment even when a phrase crosses several lines.
@@ -2023,12 +2048,10 @@ static void paint_app(App& a, HDC dc) {
                     highlight(dc, span_rect(a, span.bounds), 0x5010224b);
             }
             if (a.find_open) {
-                const auto begin =
-                    std::lower_bound(a.matches.begin(), a.matches.end(), a.page,
-                                     [](const SearchMatch& match, int page) { return match.page < page; });
-                for (auto match = begin; match != a.matches.end() && match->page == a.page; ++match) {
-                    const bool active = int(match - a.matches.begin()) == a.active_match;
-                    for (const auto& bounds : search_rects(*a.bitmap, *match)) {
+                const auto batch = search_result_page(a.matches, a.page);
+                for (size_t i = 0; batch && i < batch->matches.size(); ++i) {
+                    const bool active = int(batch->first + i) == a.active_match;
+                    for (const auto& bounds : search_rects(*a.bitmap, batch->matches[i])) {
                         auto rect = span_rect(a, bounds);
                         highlight(dc, rect, active ? 0x60605000 : 0x40403800);
                         if (active) {
@@ -2273,8 +2296,9 @@ static LRESULT CALLBACK sidebar_proc(HWND window, UINT message, WPARAM wp, LPARA
             SetFocus(a.window);
             return 0;
         }
-        if (wp == VK_F6 || ((GetKeyState(VK_CONTROL) & 0x8000) &&
-                            (wp == 'O' || wp == 'F' || wp == 'G' || wp == 'P' || wp == 'S'))) {
+        if (wp == VK_F3 || wp == VK_F6 ||
+            ((GetKeyState(VK_CONTROL) & 0x8000) &&
+             (wp == 'O' || wp == 'F' || wp == 'G' || wp == 'P' || wp == 'S'))) {
             SendMessageW(a.window, message, wp, lp);
             return 0;
         }
@@ -2515,6 +2539,9 @@ static void refresh_reader_theme(App& a) {
     DwmSetWindowAttribute(a.window, DWMWA_TEXT_COLOR, &c.text, sizeof(COLORREF));
     for (auto control : {a.sidebar, a.search_results, a.page_edit, a.zoom_edit})
         SetWindowTheme(control, c.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    ListView_SetBkColor(a.search_results, c.body);
+    ListView_SetTextBkColor(a.search_results, c.body);
+    ListView_SetTextColor(a.search_results, c.text);
     TreeView_SetBkColor(a.bookmark_tree, c.footer);
     TreeView_SetTextColor(a.bookmark_tree, c.text);
     TreeView_SetLineColor(a.bookmark_tree, c.border);
@@ -2526,9 +2553,9 @@ static void refresh_reader_theme(App& a) {
 static void paint_search_result(App& a, const DRAWITEMSTRUCT& item) {
     const auto& colors = a.search_colors;
     fill_rect(item.hDC, item.rcItem, colors.body);
-    if (item.itemID >= a.matches.size())
+    if (item.itemID >= a.matches.count)
         return;
-    const auto& match = a.matches[item.itemID];
+    const auto& match = search_result(a.matches, item.itemID);
     const bool selected = (item.itemState & ODS_SELECTED) != 0;
     RECT row = item.rcItem;
     InflateRect(&row, -px(a, 8), -px(a, 2));
@@ -2613,10 +2640,16 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             SendMessageW(a.search, EM_LIMITTEXT, 4095, 0);
             SetWindowSubclass(a.search, search_proc, 1, DWORD_PTR(&a));
             a.search_results =
-                CreateWindowExW(0, L"LISTBOX", L"Search Results",
-                                WS_CHILD | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_HASSTRINGS |
-                                    LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT,
+                CreateWindowExW(0, WC_LISTVIEWW, L"Search Results",
+                                WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_NOCOLUMNHEADER |
+                                    LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_OWNERDRAWFIXED,
                                 0, 0, 0, 0, window, HMENU(INT_PTR(id_results)), a.instance, nullptr);
+            require(a.search_results != nullptr, "Cannot create search results");
+            LVCOLUMNW column{};
+            column.mask = LVCF_WIDTH;
+            ListView_InsertColumn(a.search_results, 0, &column);
+            ListView_SetExtendedListViewStyle(a.search_results, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+            SetWindowSubclass(a.search_results, sidebar_proc, 1, DWORD_PTR(&a));
             create_toolbar(a);
             a.welcome_install =
                 CreateWindowExW(0, L"BUTTON", L"Install FastPDF", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0,
@@ -2658,6 +2691,28 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         }
         case WM_NOTIFY: {
             auto header = reinterpret_cast<NMHDR*>(lp);
+            if (header->hwndFrom == a.search_results) {
+                if (header->code == LVN_GETDISPINFOW) {
+                    auto info = reinterpret_cast<NMLVDISPINFOW*>(lp);
+                    if (info->item.mask & LVIF_TEXT) {
+                        std::wstring text;
+                        if (info->item.iItem >= 0 && size_t(info->item.iItem) < a.matches.count) {
+                            const auto& match = search_result(a.matches, size_t(info->item.iItem));
+                            text = L"Page " + std::to_wstring(match.page + 1) + L": " + match.snippet;
+                        }
+                        if (info->item.pszText && info->item.cchTextMax > 0)
+                            lstrcpynW(info->item.pszText, text.c_str(), info->item.cchTextMax);
+                    }
+                } else if (header->code == LVN_ITEMCHANGED && !a.syncing_results) {
+                    const auto change = reinterpret_cast<NMLISTVIEW*>(lp);
+                    if ((change->uChanged & LVIF_STATE) && (change->uNewState & LVIS_SELECTED) &&
+                        change->iItem != a.active_match) {
+                        a.search_notice.clear();
+                        select_match(a, change->iItem);
+                    }
+                }
+                return 0;
+            }
             if (header->hwndFrom == a.sidebar_tabs && header->code == TCN_SELCHANGE) {
                 select_sidebar_tab(a, TabCtrl_GetCurSel(a.sidebar_tabs));
                 return 0;
@@ -2716,7 +2771,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             }
             return 0;
         case WM_TIMER:
-            if (wp == 3)
+            if (wp == 4)
+                receive_search(a);
+            else if (wp == 3)
                 start_search(a);
             else if (wp == 2)
                 poll_update(a);
@@ -2808,7 +2865,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         }
         case WM_DRAWITEM: {
             auto item = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
-            if (item->CtlID == id_results && item->CtlType == ODT_LISTBOX) {
+            if (item->CtlID == id_results && item->CtlType == ODT_LISTVIEW) {
                 paint_search_result(a, *item);
                 return TRUE;
             }
@@ -2880,10 +2937,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                     (a.update_job.valid() || !a.pending_update.directory.empty() ? MF_GRAYED : MF_ENABLED));
             return 0;
         case WM_COMMAND:
-            if (LOWORD(wp) == id_results && HIWORD(wp) == LBN_SELCHANGE) {
-                a.search_notice.clear();
-                select_match(a, int(SendMessageW(a.search_results, LB_GETCURSEL, 0, 0)));
-            } else if (LOWORD(wp) == id_sidebar && HIWORD(wp) == LBN_SELCHANGE) {
+            if (LOWORD(wp) == id_sidebar && HIWORD(wp) == LBN_SELCHANGE) {
                 int index = int(SendMessageW(a.sidebar, LB_GETCURSEL, 0, 0));
                 if (index >= 0) {
                     goto_page(a, index);
@@ -3135,6 +3189,8 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             DestroyWindow(window);
             return 0;
         case WM_DESTROY:
+            cancel_search(a.search_worker);
+            clear_search_results(a);
             stop_search_worker(a.search_worker);
             a.worker.stop = true;
             a.worker.cancel = true;
@@ -3177,7 +3233,8 @@ struct InstanceLock {
 static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>& arguments) {
     ui::enable_system_dialog_theme();
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_LINK_CLASS |
-                                                        ICC_TREEVIEW_CLASSES | ICC_TAB_CLASSES};
+                                                        ICC_TREEVIEW_CLASSES | ICC_TAB_CLASSES |
+                                                        ICC_LISTVIEW_CLASSES};
     InitCommonControlsEx(&controls);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const int maintenance = deployment::maintenance_command(arguments);

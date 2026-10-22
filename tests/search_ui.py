@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 from search_fixture import search_document
+from search_accessibility import result_row
 from ui_toolbar import user, wait_for, find_window, text, enter, rect, CALLBACK
 
 user.ScreenToClient.argtypes = [w.HWND, c.POINTER(w.POINT)]
@@ -81,9 +82,12 @@ def run(exe, output):
 
         command(1043)
         results = user.GetDlgItem(window, 207)
-        assert user.SendMessageW(results, 0x18B, 0, 0) == 8, "Missing results"
-        user.SendMessageW(results, 0x186, 5, 0)
-        user.SendMessageW(window, 0x111, 207 | (1 << 16), results)
+        assert user.SendMessageW(results, 0x1004, 0, 0) == 8, "Missing results"
+        name, _ = result_row(results, 0)
+        assert name.startswith("Page 1:") and "warranty" in name, "Missing accessible result text"
+        user.SendMessageW(results, 0x100, 0x24, 0)  # Home, then Down selects the sixth result.
+        for _ in range(5):
+            user.SendMessageW(results, 0x100, 0x28, 0)
         expect("6 of 8")
         wait_for(lambda: text(page) == "2", "result selection")
 
@@ -95,7 +99,7 @@ def run(exe, output):
             assert text(query) == "warranty", "Switching tabs cleared the query"
             expect("6 of 8")
             assert text(page) == "2", "Switching tabs changed the page"
-            assert user.SendMessageW(results, 0x188, 0, 0) == 5, "Switching tabs lost the selected match"
+            assert user.SendMessageW(results, 0x100C, -1, 2) == 5, "Switching tabs lost the selected match"
 
         select_tab(1, bookmarks)
         assert user.SendMessageW(bookmarks, 0x1127, root, 0x20) & 0x20, "Switching tabs collapsed bookmarks"
@@ -138,7 +142,7 @@ def run(exe, output):
         enter(query, "[")
         expect("Invalid regex")
         assert text(user.GetDlgItem(bar, 1047)).startswith("Invalid regex:"), "Missing inline regex error"
-        assert user.SendMessageW(results, 0x18B, 0, 0) == 0, "Invalid regex kept old results"
+        assert user.SendMessageW(results, 0x1004, 0, 0) == 0, "Invalid regex kept old results"
         assert not user.IsWindowEnabled(user.GetDlgItem(bar, 1042)), "Invalid regex left Next enabled"
         enter(query, r"warranty(?=\s)")
         wait_for(lambda: text(count).endswith(" of 6"), "regex error recovery")
@@ -167,6 +171,13 @@ def run(exe, output):
         for dpi, window_width in ((96, 1000), (96, 640), (144, 1000), (144, 640)):
             bounds = w.RECT(50, 50, 50 + window_width * dpi // 96, 50 + 700 * dpi // 96)
             user.SendMessageW(window, 0x2E0, dpi | (dpi << 16), c.addressof(bounds))
+            command(1043)
+            _, row = result_row(results, 0)
+            assert row[3] == 72 * dpi // 96, f"Result row height does not follow DPI: {row[3]} at {dpi}"
+            assert not (user.GetWindowLongW(results, -16) & 0x100000), "Results have a horizontal scrollbar"
+            user.SendMessageW(tabs, 0x1330, 1, 0)
+            assert visible(bookmarks), "DPI check did not restore bookmarks"
+            expect("1 of 2")
             controls = [query] + [user.GetDlgItem(bar, i) for i in (1050, 1051, 1053)] + [count] + [user.GetDlgItem(bar, i) for i in (1041, 1042, 1043, 1044, 1045)]
             boxes = [rect(control) for control in controls]
             assert all(box.left < box.right and box.top < box.bottom for box in boxes)

@@ -23,6 +23,17 @@ int main() {
         auto matches = search_matches(text, L"warranty", {});
         check(matches.size() == 4, "Every occurrence in one text run is found");
         check(matches[0].offset == 0 && matches[1].offset == 9, "Matches retain distinct offsets");
+        SearchResults results;
+        append_search_results(results, matches);
+        append_search_results(results, {});
+        append_search_results(results, search_matches(text, L"warranty", {}, 3));
+        check(results.count == 8 && results.batches.size() == 2, "Empty pages do not add result rows");
+        check(search_result(results, 3).page == 0 && search_result(results, 4).page == 3 &&
+                  search_result(results, 7).offset == matches[3].offset,
+              "Row lookup preserves order across page batch boundaries");
+        check(search_result_page(results, 0)->first == 0 && search_result_page(results, 3)->first == 4 &&
+                  !search_result_page(results, 1) && !search_result_page(results, 4),
+              "Highlights use only the requested page's batch");
         auto boxes = search_rects(page, matches[1]);
         check(boxes.size() == 1 && boxes[0].x0 == 45 && boxes[0].x1 == 85,
               "Only the matching characters are highlighted");

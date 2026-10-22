@@ -2,8 +2,29 @@
 #include <cwctype>
 #include <chrono>
 #include <regex>
+#include <cassert>
 
 namespace pdf {
+void append_search_results(SearchResults& results, std::vector<SearchMatch> matches) {
+    if (matches.empty())
+        return;
+    const size_t count = matches.size();
+    results.batches.push_back({results.count, std::move(matches)});
+    results.count += count;
+}
+const SearchMatch& search_result(const SearchResults& results, size_t index) {
+    assert(index < results.count);
+    auto batch = std::upper_bound(results.batches.begin(), results.batches.end(), index,
+                                  [](size_t at, const SearchBatch& value) { return at < value.first; });
+    --batch;
+    return batch->matches[index - batch->first];
+}
+const SearchBatch* search_result_page(const SearchResults& results, int page) {
+    auto batch =
+        std::lower_bound(results.batches.begin(), results.batches.end(), page,
+                         [](const SearchBatch& value, int at) { return value.matches.front().page < at; });
+    return batch != results.batches.end() && batch->matches.front().page == page ? &*batch : nullptr;
+}
 static bool space(wchar_t c) {
     return std::iswspace(c) != 0 || c == 0x00a0;
 }
@@ -203,8 +224,8 @@ inline SearchIterator operator-(SearchIterator iterator, ptrdiff_t distance) {
     return iterator -= distance;
 }
 static std::vector<SearchMatch> find_matches(const SearchText& text, const SearchPattern& pattern, int page,
-                                             const std::atomic<bool>* cancel = nullptr) {
-    std::vector<SearchMatch> matches;
+                                             const std::atomic<bool>* cancel = nullptr,
+                                             std::vector<SearchMatch> matches = {}) {
     if (!pattern.expression && pattern.literal.empty())
         return matches;
     const auto haystack = pattern.expression || pattern.options.match_case ? text.text : fold(text.text);
@@ -328,13 +349,24 @@ std::vector<Rect> search_rects(const RenderedPage& page, const SearchMatch& matc
     return result;
 }
 static void publish(SearchWorker& worker, SearchUpdate update) {
+    bool notify = false;
     {
-        std::lock_guard lock(worker.mutex);
+        std::unique_lock lock(worker.mutex);
+        // Backpressure bounds queued pages and matches. A single large page is
+        // always allowed, so it cannot deadlock waiting for a smaller payload.
+        worker.ready.wait(lock, [&] {
+            return worker.cancel || worker.stop || worker.updates.empty() ||
+                   (worker.updates.size() < 32 && worker.queued_matches + update.matches.size() <= 8192);
+        });
         if (worker.cancel || worker.stop)
             return;
+        worker.queued_matches += update.matches.size();
         worker.updates.push_back(std::move(update));
+        notify = !worker.notified;
+        worker.notified = true;
     }
-    PostMessageW(worker.window, worker.message, 0, 0);
+    if (notify)
+        PostMessageW(worker.window, worker.message, 0, 0);
 }
 void run_search_worker(SearchWorker& worker) {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -344,14 +376,40 @@ void run_search_worker(SearchWorker& worker) {
     uint64_t generation = 0;
     std::unordered_map<int, SearchText> cache;
     size_t cache_size = 0;
+    std::vector<SearchMatch> reusable;
     try {
-        while (!worker.stop) {
+        for (;;) {
             SearchRequest request;
+            SearchResults retired;
+            std::deque<SearchUpdate> discarded;
             {
                 std::unique_lock lock(worker.mutex);
-                worker.ready.wait(lock, [&] { return worker.stop || worker.request.has_value(); });
+                worker.ready.wait(lock, [&] {
+                    return worker.stop || worker.request || worker.retired.count ||
+                           (worker.cancel && !worker.updates.empty());
+                });
+                std::swap(retired, worker.retired);
+                if (worker.cancel || worker.stop || worker.request) {
+                    discarded.swap(worker.updates);
+                    worker.queued_matches = 0;
+                }
+            }
+            // Free old matches outside the mutex and on this thread. Keep at
+            // most one modest allocation for the next page, not a whole query.
+            for (auto& batch : retired.batches)
+                if (batch.matches.capacity() > reusable.capacity() && batch.matches.capacity() <= 8192) {
+                    reusable = std::move(batch.matches);
+                    reusable.clear();
+                }
+            retired.batches.clear();
+            discarded.clear();
+            {
+                std::lock_guard lock(worker.mutex);
                 if (worker.stop)
                     break;
+                // A new cancellation can arrive while cleanup is in progress.
+                if (worker.retired.count || (worker.cancel && !worker.updates.empty()) || !worker.request)
+                    continue;
                 request = std::move(*worker.request);
                 worker.request.reset();
                 worker.cancel = false;
@@ -384,7 +442,7 @@ void run_search_worker(SearchWorker& worker) {
                     const auto& text = found == cache.end() ? extracted : found->second;
                     has_text = has_text || !text.text.empty();
                     update.has_text = has_text;
-                    update.matches = find_matches(text, pattern, page, &worker.cancel);
+                    update.matches = find_matches(text, pattern, page, &worker.cancel, std::move(reusable));
                     if (found == cache.end()) {
                         const size_t cost =
                             extracted.text.size() * (sizeof(wchar_t) + sizeof(SearchPosition));
@@ -446,16 +504,51 @@ void submit_search(SearchWorker& worker, SearchRequest request) {
     {
         std::lock_guard lock(worker.mutex);
         worker.cancel = true;
+        worker.notified = false;
         worker.request = std::move(request);
-        worker.updates.clear();
     }
     worker.ready.notify_one();
 }
 void cancel_search(SearchWorker& worker) {
+    {
+        std::lock_guard lock(worker.mutex);
+        worker.cancel = true;
+        worker.notified = false;
+        worker.request.reset();
+    }
+    worker.ready.notify_one();
+}
+void retire_search_results(SearchWorker& worker, SearchResults& results) {
+    if (!results.count)
+        return;
+    {
+        std::lock_guard lock(worker.mutex);
+        // One pending generation is enough: the worker drains it before it can
+        // produce any matches for the next query. Empty clears do not enqueue.
+        assert(!worker.retired.count);
+        std::swap(worker.retired, results);
+    }
+    worker.ready.notify_one();
+}
+bool take_search_update(SearchWorker& worker, uint64_t document, uint64_t ticket, SearchUpdate& update) {
+    {
+        std::lock_guard lock(worker.mutex);
+        if (worker.cancel || worker.updates.empty() || worker.updates.front().document != document ||
+            worker.updates.front().ticket != ticket)
+            return false;
+        worker.queued_matches -= worker.updates.front().matches.size();
+        update = std::move(worker.updates.front());
+        worker.updates.pop_front();
+    }
+    worker.ready.notify_one();
+    return true;
+}
+bool finish_search_updates(SearchWorker& worker) {
     std::lock_guard lock(worker.mutex);
-    worker.cancel = true;
-    worker.request.reset();
-    worker.updates.clear();
+    const bool more = !worker.cancel && !worker.updates.empty();
+    if (!more)
+        worker.notified = false;
+    return more;
 }
 void stop_search_worker(SearchWorker& worker) {
     worker.stop = true;
