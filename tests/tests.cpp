@@ -24,42 +24,56 @@ static pdf::Value object(std::string_view source) {
     return pdf::parse(p);
 }
 static void png_predictors() {
-    constexpr unsigned filters[] = {2, 0, 1, 2, 3, 4, 2, 0, 4, 1};
+    unsigned filters[] = {2, 0, 1, 2, 3, 4, 2, 0, 4, 1};
     for (unsigned columns : {1u, 2u, 3u, 15u, 16u, 17u, 31u, 32u, 33u, 257u})
-        for (unsigned colors : {1u, 3u, 4u}) {
-            size_t row = size_t(columns) * colors;
-            pdf::Bytes expected(row * std::size(filters)), encoded;
-            for (size_t i = 0; i < expected.size(); ++i)
-                expected[i] = uint8_t(i * 61 + i / 7);
-            for (size_t y = 0; y < std::size(filters); ++y) {
-                encoded.push_back(uint8_t(filters[y]));
-                for (size_t x = 0; x < row; ++x) {
-                    int left = x >= colors ? expected[y * row + x - colors] : 0;
-                    int above = y ? expected[(y - 1) * row + x] : 0;
-                    int corner = y && x >= colors ? expected[(y - 1) * row + x - colors] : 0;
-                    int predicted = 0;
-                    if (filters[y] == 1)
-                        predicted = left;
-                    else if (filters[y] == 2)
-                        predicted = above;
-                    else if (filters[y] == 3)
-                        predicted = (left + above) / 2;
-                    else if (filters[y] == 4) {
-                        int p = left + above - corner;
-                        std::array<int, 3> values{left, above, corner};
-                        std::array<int, 3> distances{std::abs(p - left), std::abs(p - above),
-                                                     std::abs(p - corner)};
-                        predicted = values[size_t(std::min_element(distances.begin(), distances.end()) -
-                                                  distances.begin())];
+        for (unsigned colors : {1u, 3u, 4u, 8u, 32u})
+            for (unsigned bits : {1u, 2u, 4u, 8u, 16u})
+                for (unsigned first : {1u, 2u, 3u, 4u}) {
+                    filters[0] = first;
+                    size_t row = (size_t(columns) * colors * bits + 7) / 8;
+                    size_t bpp = (size_t(colors) * bits + 7) / 8;
+                    pdf::Bytes expected(row * std::size(filters)), encoded;
+                    for (size_t i = 0; i < expected.size(); ++i)
+                        expected[i] = uint8_t(i * 61 + i / 7);
+                    // Identical and nearly identical Paeth rows exercise long zero
+                    // runs, including transitions at vector boundaries.
+                    for (size_t y : {5u, 8u}) {
+                        std::copy_n(expected.data() + (y - 1) * row, row, expected.data() + y * row);
+                        if (y == 8)
+                            for (size_t x = 19; x < row; x += 37)
+                                expected[y * row + x] ^= 91;
                     }
-                    encoded.push_back(uint8_t(expected[y * row + x] - predicted));
+                    for (size_t y = 0; y < std::size(filters); ++y) {
+                        encoded.push_back(uint8_t(filters[y]));
+                        for (size_t x = 0; x < row; ++x) {
+                            int left = x >= bpp ? expected[y * row + x - bpp] : 0;
+                            int above = y ? expected[(y - 1) * row + x] : 0;
+                            int corner = y && x >= bpp ? expected[(y - 1) * row + x - bpp] : 0;
+                            int predicted = 0;
+                            if (filters[y] == 1)
+                                predicted = left;
+                            else if (filters[y] == 2)
+                                predicted = above;
+                            else if (filters[y] == 3)
+                                predicted = (left + above) / 2;
+                            else if (filters[y] == 4) {
+                                int p = left + above - corner;
+                                std::array<int, 3> values{left, above, corner};
+                                std::array<int, 3> distances{std::abs(p - left), std::abs(p - above),
+                                                             std::abs(p - corner)};
+                                predicted =
+                                    values[size_t(std::min_element(distances.begin(), distances.end()) -
+                                                  distances.begin())];
+                            }
+                            encoded.push_back(uint8_t(expected[y * row + x] - predicted));
+                        }
+                    }
+                    auto params =
+                        object("<< /Predictor 15 /BitsPerComponent " + std::to_string(bits) + " /Colors " +
+                               std::to_string(colors) + " /Columns " + std::to_string(columns) + " >>");
+                    test(pdf::predictor(encoded, params) == expected,
+                         "Mixed PNG filters preserve rows across vector and scalar boundaries");
                 }
-            }
-            auto params = object("<< /Predictor 15 /BitsPerComponent 8 /Colors " + std::to_string(colors) +
-                                 " /Columns " + std::to_string(columns) + " >>");
-            test(pdf::predictor(encoded, params) == expected,
-                 "Mixed PNG filters preserve rows across vector and scalar boundaries");
-        }
 }
 static void named_destinations() {
     pdf::Document doc;
@@ -135,6 +149,14 @@ int main() {
         test(mq_result == mq_expected, "ITU-T T.88 H.2 arithmetic known answer");
         const uint8_t empty[] = {0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01};
         flate_checksums();
+        // An original complete Huffman tree uses both 15-bit codes. Python
+        // zlib independently verifies its literal and final table entries.
+        auto longest_codes = ascii_hex(
+            view("780105e00190244992244922b1a87964f5ec01000000000000000000000000000000000000000000000000c003"
+                 "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                 "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                 "000000003cfefffeff00420042"));
+        test(string(inflate(longest_codes)) == "A", "Maximum-width DEFLATE Huffman table");
         test(inflate(empty).empty(), "Empty DEFLATE stream");
         Bytes padded_zlib(std::begin(empty), std::end(empty));
         padded_zlib.insert(padded_zlib.end(), 8, 0);

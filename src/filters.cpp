@@ -9,6 +9,18 @@ struct Bits {
     unsigned count = 0;
 };
 static void fill(Bits& b, unsigned n) {
+    if (b.count >= n)
+        return;
+    if (b.data.size() - b.pos >= 8) {
+        uint64_t word;
+        std::memcpy(&word, b.data.data() + b.pos, 8);
+        unsigned bytes = (64 - b.count) / 8;
+        word &= UINT64_MAX >> (64 - bytes * 8);
+        b.bits |= word << b.count;
+        b.count += bytes * 8;
+        b.pos += bytes;
+        return;
+    }
     while (b.count < n && b.pos < b.data.size()) {
         b.bits |= uint64_t(b.data[b.pos++]) << b.count;
         b.count += 8;
@@ -23,13 +35,13 @@ static uint32_t take(Bits& b, unsigned n) {
     return v;
 }
 struct Huffman {
-    std::array<uint16_t, 32768> symbols{};
-    std::array<uint8_t, 32768> lengths{};
+    std::vector<uint16_t> entries;
     unsigned max_bits = 0;
 };
 static std::unique_ptr<Huffman> huffman(std::span<const uint8_t> lengths) {
-    // Each table is 96 KiB. Build it on the heap so exception handling and
-    // nested stream decoders do not exhaust the Windows thread stack.
+    // Store each symbol and bit count together. Allocate only the prefix
+    // width in use, and keep the entries off the Windows thread stack.
+    require(lengths.size() <= 4096, "Huffman alphabet limit exceeded");
     auto table = std::make_unique<Huffman>();
     Huffman& h = *table;
     unsigned counts[16]{}, next[16]{};
@@ -50,6 +62,7 @@ static std::unique_ptr<Huffman> huffman(std::span<const uint8_t> lengths) {
         code = (code + counts[n - 1]) << 1;
         next[n] = code;
     }
+    h.entries.resize(size_t(1) << h.max_bits);
     for (unsigned s = 0; s < lengths.size(); ++s) {
         unsigned n = lengths[s];
         if (!n)
@@ -59,21 +72,19 @@ static std::unique_ptr<Huffman> huffman(std::span<const uint8_t> lengths) {
             r = (r << 1) | (c & 1);
             c >>= 1;
         }
-        for (unsigned i = r; i < (1u << h.max_bits); i += 1u << n) {
-            h.symbols[i] = uint16_t(s);
-            h.lengths[i] = uint8_t(n);
-        }
+        for (unsigned i = r; i < (1u << h.max_bits); i += 1u << n)
+            h.entries[i] = uint16_t(s * 16 + n);
     }
     return table;
 }
 static unsigned symbol(Bits& b, const Huffman& h) {
     fill(b, h.max_bits);
     unsigned index = unsigned(b.bits & ((1u << h.max_bits) - 1));
-    unsigned n = h.lengths[index];
+    unsigned entry = h.entries[index], n = entry & 15;
     require(n && n <= b.count, "Invalid or truncated Huffman symbol");
     b.bits >>= n;
     b.count -= n;
-    return h.symbols[index];
+    return entry >> 4;
 }
 static uint32_t adler32(View data) {
     uint32_t a = 1, b = 0;
@@ -142,8 +153,13 @@ Bytes inflate(View input, size_t limit) {
             unsigned count = take(b, 16), other = take(b, 16);
             require((count ^ 0xffff) == other, "Invalid stored DEFLATE length");
             require(count <= limit - out.size(), "Decompressed stream limit exceeded");
-            for (unsigned i = 0; i < count; ++i)
+            unsigned buffered = std::min(count, b.count / 8);
+            for (unsigned i = 0; i < buffered; ++i)
                 out.push_back(uint8_t(take(b, 8)));
+            size_t remaining = count - buffered;
+            require(remaining <= b.data.size() - b.pos, "Truncated stored DEFLATE block");
+            out.insert(out.end(), b.data.begin() + b.pos, b.data.begin() + b.pos + remaining);
+            b.pos += remaining;
             continue;
         }
         require(type != 3, "Reserved DEFLATE block type");
@@ -445,11 +461,54 @@ Bytes predictor(Bytes data, const Value& params) {
                 data[dst + x] = uint8_t(data[src + x] + data[dst + x - row]);
             continue;
         }
-        for (size_t x = 0; x < row; ++x) {
-            int a = x >= bpp ? data[dst + x - bpp] : 0, b = y ? data[dst + x - row] : 0,
-                c = y && x >= bpp ? data[dst + x - row - bpp] : 0;
-            int prediction = filter == 1 ? a : filter == 3 ? (a + b) / 2 : paeth(a, b, c);
-            data[dst + x] = uint8_t(data[src + x] + prediction);
+        size_t prefix = std::min(row, bpp);
+        if (filter == 1 || (filter == 4 && !y)) {
+            std::memmove(data.data() + dst, data.data() + src, prefix);
+            for (size_t x = prefix; x < row; ++x)
+                data[dst + x] = uint8_t(data[src + x] + data[dst + x - bpp]);
+            continue;
+        }
+        for (size_t x = 0; x < prefix; ++x) {
+            int above = y ? data[dst + x - row] : 0;
+            data[dst + x] = uint8_t(data[src + x] + (filter == 3 ? above / 2 : above));
+        }
+        if (filter == 3) {
+            if (y)
+                for (size_t x = prefix; x < row; ++x)
+                    data[dst + x] =
+                        uint8_t(data[src + x] + (int(data[dst + x - bpp]) + data[dst + x - row]) / 2);
+            else
+                for (size_t x = prefix; x < row; ++x)
+                    data[dst + x] = uint8_t(data[src + x] + data[dst + x - bpp] / 2);
+            continue;
+        }
+        size_t x = prefix;
+        for (; x < std::min(row, size_t(4)); ++x)
+            data[dst + x] = uint8_t(
+                data[src + x] + paeth(data[dst + x - bpp], data[dst + x - row], data[dst + x - row - bpp]));
+        while (x < row) {
+            if (bpp <= 4 && row - x >= 16) {
+                uint32_t left, corner;
+                std::memcpy(&left, data.data() + dst + x - 4, 4);
+                std::memcpy(&corner, data.data() + dst + x - row - 4, 4);
+                if (left == corner) {
+                    auto encoded = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data.data() + src + x));
+                    if (_mm_movemask_epi8(_mm_cmpeq_epi8(encoded, _mm_setzero_si128())) == 0xffff) {
+                        // Equal left and upper-left samples make Paeth choose
+                        // the upper sample. Zero differences keep that equality
+                        // across this block, so the previous row is exact.
+                        auto above =
+                            _mm_loadu_si128(reinterpret_cast<const __m128i*>(data.data() + dst + x - row));
+                        _mm_storeu_si128(reinterpret_cast<__m128i*>(data.data() + dst + x), above);
+                        x += 16;
+                        continue;
+                    }
+                }
+            }
+            size_t end = std::min(row, x + 16);
+            for (; x < end; ++x)
+                data[dst + x] = uint8_t(data[src + x] + paeth(data[dst + x - bpp], data[dst + x - row],
+                                                              data[dst + x - row - bpp]));
         }
     }
     data.resize(rows * row);

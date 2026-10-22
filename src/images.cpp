@@ -672,12 +672,13 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
         }
         out->pixels.resize(size_t(out->width) * out->height * 4);
         if (rgb) {
+            bool identity =
+                low[0] == 0 && high[0] == 1 && low[1] == 0 && high[1] == 1 && low[2] == 0 && high[2] == 1;
             std::array<std::array<uint8_t, 256>, 3> channels{};
             for (unsigned i = 0; i < 3; ++i)
                 for (unsigned sample = 0; sample < 256; ++sample)
-                    channels[i][sample] = uint8_t(unit(low[i] + (high[i] - low[i]) * sample / 255.0) *
-                                                     255 +
-                                                 0.5f);
+                    channels[i][sample] =
+                        uint8_t(unit(low[i] + (high[i] - low[i]) * sample / 255.0) * 255 + 0.5f);
             for (unsigned y = 0; y < out->height; ++y) {
                 if ((y & 127) == 0)
                     check_cancel(d);
@@ -688,24 +689,83 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                     const uint8_t* row0 = decoded.bytes.data() + size_t(y * 2) * row;
                     const uint8_t* row1 =
                         decoded.bytes.data() + size_t(std::min(y * 2 + 1, height - 1)) * row;
-                    for (unsigned x = 0; x < out->width; ++x, destination += 4) {
-                        size_t x0 = size_t(x * 2) * 3, x1 = size_t(std::min(x * 2 + 1, width - 1)) * 3;
-                        for (unsigned c = 0; c < 3; ++c)
-                            destination[2 - c] = uint8_t((unsigned(channels[c][row0[x0 + c]]) +
-                                                          channels[c][row0[x1 + c]] +
-                                                          channels[c][row1[x0 + c]] +
-                                                          channels[c][row1[x1 + c]] + 2) /
-                                                         4);
-                        destination[3] = 255;
-                    }
+                    if (identity)
+                        for (unsigned x = 0; x < out->width; ++x, destination += 4) {
+                            size_t x0 = size_t(x * 2) * 3, x1 = size_t(std::min(x * 2 + 1, width - 1)) * 3;
+                            for (unsigned c = 0; c < 3; ++c)
+                                destination[2 - c] = uint8_t((unsigned(row0[x0 + c]) + row0[x1 + c] +
+                                                              row1[x0 + c] + row1[x1 + c] + 2) /
+                                                             4);
+                            destination[3] = 255;
+                        }
+                    else
+                        for (unsigned x = 0; x < out->width; ++x, destination += 4) {
+                            size_t x0 = size_t(x * 2) * 3, x1 = size_t(std::min(x * 2 + 1, width - 1)) * 3;
+                            for (unsigned c = 0; c < 3; ++c)
+                                destination[2 - c] =
+                                    uint8_t((unsigned(channels[c][row0[x0 + c]]) + channels[c][row0[x1 + c]] +
+                                             channels[c][row1[x0 + c]] + channels[c][row1[x1 + c]] + 2) /
+                                            4);
+                            destination[3] = 255;
+                        }
                 } else {
                     const uint8_t* source = decoded.bytes.data() + size_t(y) * row;
-                    for (unsigned x = 0; x < width; ++x, source += 3, destination += 4) {
-                        destination[0] = channels[2][source[2]];
-                        destination[1] = channels[1][source[1]];
-                        destination[2] = channels[0][source[0]];
-                        destination[3] = 255;
+                    if (identity)
+                        for (unsigned x = 0; x < width; ++x, source += 3, destination += 4) {
+                            destination[0] = source[2];
+                            destination[1] = source[1];
+                            destination[2] = source[0];
+                            destination[3] = 255;
+                        }
+                    else
+                        for (unsigned x = 0; x < width; ++x, source += 3, destination += 4) {
+                            destination[0] = channels[2][source[2]];
+                            destination[1] = channels[1][source[1]];
+                            destination[2] = channels[0][source[0]];
+                            destination[3] = 255;
+                        }
+                }
+            }
+        } else if (n == 4 && bits == 8 && direct->name == "DeviceCMYK") {
+            struct ConvertedSample {
+                uint64_t key = 0;
+                uint32_t pixel = 0;
+            };
+            // Repeated scan and cover colors need one conversion. A bounded
+            // cache also checks the full sample key after a slot collision.
+            std::vector<ConvertedSample> colors(4096);
+            std::array<std::array<double, 256>, 4> channels;
+            for (unsigned c = 0; c < 4; ++c)
+                for (unsigned sample = 0; sample < 256; ++sample)
+                    channels[c][sample] = low[c] + (high[c] - low[c]) * sample / maximum;
+            for (unsigned y = 0; y < height; ++y) {
+                if ((y & 127) == 0)
+                    check_cancel(d);
+                const uint8_t* source = decoded.bytes.data() + size_t(y) * row;
+                uint8_t* destination = out->pixels.data() + size_t(y) * width * 4;
+                for (unsigned x = 0; x < width; ++x, source += 4, destination += 4) {
+                    uint32_t raw;
+                    std::memcpy(&raw, source, 4);
+                    uint32_t slot = ((raw ^ (raw >> 16)) * 2654435761u) >> 20;
+                    auto& cached_color = colors[slot];
+                    uint64_t key = uint64_t(raw) + 1;
+                    if (cached_color.key != key) {
+                        std::array<double, 4> samples;
+                        bool transparent = mask.kind == Kind::array;
+                        for (unsigned c = 0; c < 4; ++c) {
+                            samples[c] = channels[c][source[c]];
+                            transparent = transparent && source[c] >= num(at(mask, 2 * c)) &&
+                                          source[c] <= num(at(mask, 2 * c + 1));
+                        }
+                        auto converted = color(d, space, samples);
+                        cached_color.pixel =
+                            transparent ? 0
+                                        : uint32_t(unit(converted.b) * 255 + 0.5f) |
+                                              (uint32_t(unit(converted.g) * 255 + 0.5f) << 8) |
+                                              (uint32_t(unit(converted.r) * 255 + 0.5f) << 16) | 0xff000000u;
+                        cached_color.key = key;
                     }
+                    std::memcpy(destination, &cached_color.pixel, 4);
                 }
             }
         } else if (n == 3 && bits == 8 && direct->name == "CalRGB") {
@@ -719,8 +779,8 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                     transform[i] = num(at(matrix, i));
             for (unsigned i = 0; i < 3; ++i)
                 for (unsigned sample = 0; sample < 256; ++sample)
-                    channels[i][sample] = std::pow(std::max(0.0, low[i] + (high[i] - low[i]) * sample / maximum),
-                                                   num(at(gamma, i), 1));
+                    channels[i][sample] = std::pow(
+                        std::max(0.0, low[i] + (high[i] - low[i]) * sample / maximum), num(at(gamma, i), 1));
             for (unsigned y = 0; y < height; ++y) {
                 if ((y & 127) == 0)
                     check_cancel(d);
@@ -733,7 +793,8 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
                                          a * transform[2] + b * transform[5] + c * transform[8]);
                     bool transparent = mask.kind == Kind::array;
                     for (unsigned i = 0; transparent && i < 3; ++i)
-                        transparent = source[i] >= num(at(mask, i * 2)) && source[i] <= num(at(mask, i * 2 + 1));
+                        transparent =
+                            source[i] >= num(at(mask, i * 2)) && source[i] <= num(at(mask, i * 2 + 1));
                     destination[0] = transparent ? 0 : uint8_t(unit(converted.b) * 255 + 0.5f);
                     destination[1] = transparent ? 0 : uint8_t(unit(converted.g) * 255 + 0.5f);
                     destination[2] = transparent ? 0 : uint8_t(unit(converted.r) * 255 + 0.5f);

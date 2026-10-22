@@ -468,6 +468,38 @@ def generate(directory):
         add(f"jpeg_cmyk_{inverse}", pdf(objects), pixels=[(52 + 64*i, 90, c) for i, c in enumerate(colors)],
             tolerance=30 if managed else 1)
 
+    cmyk_panels = b"".join(bytes(sample) * 16 for sample in
+                           [(0, 0, 0, 0), (255, 255, 255, 255), (255, 0, 0, 0), (0, 255, 255, 0)]) * 16
+    for variant in ("normal", "mask", "decode"):
+        objects = base(b"0 1 0 rg 20 100 256 64 re f q 256 0 0 64 20 100 cm /I Do Q",
+                       resources=b"/XObject << /I 6 0 R >>")
+        attributes = (b"/Type /XObject /Subtype /Image /Width 64 /Height 16 "
+                      b"/BitsPerComponent 8 /ColorSpace /DeviceCMYK")
+        colors = [(255, 255, 255), (0, 0, 0), (0, 255, 255), (255, 0, 0)]
+        if managed:
+            colors[2:] = [(0, 174, 239), (237, 28, 36)]
+        if variant == "mask":
+            attributes += b" /Mask [0 0 0 0 0 0 0 0]"
+            colors[0] = (0, 255, 0)
+        elif variant == "decode":
+            attributes += b" /Decode [1 0 1 0 1 0 1 0]"
+            colors = [(0, 0, 0), (255, 255, 255)]
+        objects.append(stream(cmyk_panels, attributes, compression=True))
+        add(f"raw_cmyk_{variant}", pdf(objects), pixels=[(52 + 64*i, 90, c) for i, c in enumerate(colors)],
+            tolerance=30 if managed else 1)
+
+    # These two samples share a cache slot. The mask makes the collision
+    # visible without depending on the installed CMYK display profile.
+    objects = base(b"0 1 0 rg 0 0 36 9 re f q 36 0 0 9 0 0 cm /I Do Q",
+                   resources=b"/XObject << /I 6 0 R >>")
+    objects[2] = objects[2].replace(b"[0 0 300 220]", b"[0 0 36 9]")
+    objects.append(stream(bytes([85, 16, 0, 0, 0, 0, 0, 0]) * 2,
+                          b"/Type /XObject /Subtype /Image /Width 4 /Height 1 /BitsPerComponent 8 "
+                          b"/ColorSpace /DeviceCMYK /Mask [85 85 16 16 0 0 0 0]"))
+    add("raw_cmyk_cache_collision", pdf(objects), size=(36, 9),
+        pixels=[(4, 4, (0, 255, 0)), (13, 4, (255, 255, 255)),
+                (22, 4, (0, 255, 0)), (31, 4, (255, 255, 255))])
+
     gray_jpeg = (Path(__file__).parent / "data" / "gray-tints.jpg").read_bytes()
     for inverse in [False, True]:
         objects = base(b"q 160 0 0 80 20 20 cm /Im Do Q", b"/XObject << /Im 6 0 R >>")
