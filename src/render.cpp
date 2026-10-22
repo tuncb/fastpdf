@@ -158,16 +158,31 @@ static void set_transform(Context& c, Matrix m = {}) {
 }
 static void interpret(Context& c, View bytes, const Value& resources, int depth);
 static void draw_form(Context& c, const Value& form, const Value& resources, int depth, bool group = true);
-static void apply_clip(Context& c, const Clip& clip) {
+static void apply_clip(Context& c, const Clip& clip,
+                       D2D1_ANTIALIAS_MODE antialias = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE) {
     set_transform(c);
     if (clip.geometry)
         c.canvas->target->PushLayer(
             D2D1::LayerParameters(D2D1::InfiniteRect(), clip.geometry, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                                   D2D1::Matrix3x2F::Identity(), 1), nullptr);
     else
-        // Fractional coverage at each rectangular clip edge leaves seams
-        // when a producer tiles an image with adjacent narrow strips.
-        c.canvas->target->PushAxisAlignedClip(clip.bounds, D2D1_ANTIALIAS_MODE_ALIASED);
+        c.canvas->target->PushAxisAlignedClip(clip.bounds, antialias);
+}
+static void set_rect_clip_antialias(Context& c, D2D1_ANTIALIAS_MODE antialias) {
+    // Change only the rectangular clips above the last geometry layer. Popping
+    // a geometry layer here would composite earlier drawing into its parent.
+    size_t first = c.clips.size();
+    while (first && !c.clips[first - 1].geometry)
+        --first;
+    if (first == c.clips.size())
+        return;
+    D2D1_MATRIX_3X2_F transform;
+    c.canvas->target->GetTransform(&transform);
+    for (size_t i = c.clips.size(); i > first; --i)
+        c.canvas->target->PopAxisAlignedClip();
+    for (size_t i = first; i < c.clips.size(); ++i)
+        apply_clip(c, c.clips[i], antialias);
+    c.canvas->target->SetTransform(transform);
 }
 static void push_clip(Context& c, Clip clip) {
     require(c.clips.size() < 256, "Graphics clipping depth limit exceeded");
@@ -860,13 +875,23 @@ static void draw_image(Context& c, const Value& image, const Value& resources,
             auto antialias = target.canvas->target->GetAntialiasMode();
             // Image sampling still interpolates pixels. Axis-aligned outer
             // edges use pixel centers, so adjacent image tiles meet exactly.
-            if ((target.g.ctm.b == 0 && target.g.ctm.c == 0) ||
-                (target.g.ctm.a == 0 && target.g.ctm.d == 0))
+            // Stencils need fractional coverage: producers use one-pixel masks
+            // to draw table rules and figure borders narrower than one pixel.
+            bool aligned = !decoded->stencil &&
+                           ((target.g.ctm.b == 0 && target.g.ctm.c == 0) ||
+                            (target.g.ctm.a == 0 && target.g.ctm.d == 0));
+            if (aligned) {
+                set_rect_clip_antialias(target, D2D1_ANTIALIAS_MODE_ALIASED);
                 target.canvas->target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+            }
             target.canvas->target->DrawBitmap(bitmap, D2D1::RectF(0, 0, 1, 1), target.g.fill_alpha,
                                               interpolate ? D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
                                                           : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
             target.canvas->target->SetAntialiasMode(antialias);
+            // Vector strokes can lie on a fractional clip boundary. Restore
+            // edge coverage so those strokes are not discarded with a pixel.
+            if (aligned)
+                set_rect_clip_antialias(target, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             release(bitmap);
         },
         false, 1, transformed_box(c.g.ctm, {0, 0, 1, 1}), false, image_mask);

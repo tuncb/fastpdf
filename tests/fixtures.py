@@ -315,12 +315,47 @@ def generate(directory):
     objects = base(b".001 w 20 50.5 m 220 50.5 l S 0 w 20 80.5 m 220 80.5 l S")
     add("visible_thin_strokes", pdf(objects), pixels=[(100, 169, (204, 204, 204)),
                                                      (100, 139, (204, 204, 204))], tolerance=24)
+    # All four strokes cross fractional clip edges. A whole-pixel clip removes
+    # these edge pixels entirely; antialiased clipping retains their coverage.
+    border_clip = b"20.8 20.8 99.4 99.4 re W n "
+    border = b"1 w 20.8 20.8 99.4 99.4 re S "
+    border_pixels = [(x, y, (219, 219, 219)) for x, y in
+                     [(20, 160), (120, 160), (60, 199), (60, 99)]]
+    border_pixels += [(x, y, (255, 255, 255)) for x, y in
+                      [(19, 160), (121, 160), (60, 200), (60, 98)]]
+    add("border_rectangle_clip", pdf(base(border_clip + border)), pixels=border_pixels, tolerance=4)
+    image = b"q 20 0 0 20 60 60 cm /Im Do Q "
+    for name, content in [("before", image + border), ("after", border + image)]:
+        objects = base(border_clip + content, b"/XObject << /Im 6 0 R >>")
+        objects.append(stream(bytes([255, 0, 0]), b"/Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                              b"/ColorSpace /DeviceRGB /BitsPerComponent 8"))
+        add(f"border_clip_image_{name}", pdf(objects),
+            pixels=border_pixels + [(70, 150, (255, 0, 0))], tolerance=4)
+    objects = base(b"/Fm Do", b"/XObject << /Fm 6 0 R >>")
+    objects.append(stream(border, b"/Type /XObject /Subtype /Form /BBox [20.8 20.8 120.2 120.2]"))
+    add("border_form_bounds", pdf(objects), pixels=border_pixels, tolerance=4)
+    outer_clip = b"10 10 m 130 10 l 140 140 l 10 140 l h W n "
+    objects = base(outer_clip + border_clip + image + border, b"/XObject << /Im 6 0 R >>")
+    objects.append(stream(bytes([255, 0, 0]), b"/Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                          b"/ColorSpace /DeviceRGB /BitsPerComponent 8"))
+    add("border_clip_geometry", pdf(objects), pixels=border_pixels + [(70, 150, (255, 0, 0))], tolerance=4)
+    thin_mask = b"BI /W 1 /H 1 /IM true /BPC 1 ID \x00 EI"
+    rules = b"q .25 0 0 100 20.1 20 cm " + thin_mask + b" Q q 100 0 0 .25 20 20.1 cm " + thin_mask + b" Q"
+    add("subpixel_stencil_rules", pdf(base(rules)),
+        pixels=[(20, 160, (191, 191, 191)), (60, 199, (191, 191, 191)),
+                (19, 160, (255, 255, 255)), (60, 200, (255, 255, 255))], tolerance=4)
+    inverse_rules = rules.replace(b"/BPC 1 ID \x00", b"/BPC 1 /D [1 0] ID \x80")
+    add("subpixel_stencil_color_opacity", pdf(base(b"0 0 1 rg /G gs " + inverse_rules,
+        b"/ExtGState << /G << /ca .5 >> >>")),
+        pixels=[(20, 160, (223, 223, 255)), (60, 199, (223, 223, 255))], tolerance=4)
     strips = b"".join((f"q 20 {20 + i * .625} 100 .625 re W n "
                        f"100 0 0 .625 20 {20 + i * .625} cm /Im Do Q\n").encode() for i in range(64))
     objects = base(strips, b"/XObject << /Im 6 0 R >>")
     objects.append(stream(bytes(16 * 2 * 3), b"/Type /XObject /Subtype /Image /Width 16 /Height 2 "
                           b"/BitsPerComponent 8 /ColorSpace /DeviceRGB"))
     add("image_strip_clips", pdf(objects), pixels=[(50, y, (0, 0, 0)) for y in (165, 167, 169, 171, 173)])
+    objects[4] = stream(outer_clip + strips)
+    add("image_strip_nested_clip", pdf(objects), pixels=[(50, y, (0, 0, 0)) for y in (165, 167, 169, 171, 173)])
     objects[2] = objects[2].replace(b"/XObject", b"/ExtGState << /G << /ca .5 >> >> /XObject")
     objects[4] = stream(b"/G gs " + strips)
     add("image_strip_opacity", pdf(objects), pixels=[(50, y, (128, 128, 128)) for y in (165, 167, 169, 171, 173)], tolerance=1)
