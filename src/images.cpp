@@ -252,7 +252,7 @@ static Bytes fax_tiff(View bytes, unsigned width, unsigned height, const Value& 
     return out;
 }
 static Image wic_decode(Renderer& r, View data, unsigned reduction = 0, unsigned expected_width = 0,
-                        unsigned expected_height = 0, bool cmyk = false) {
+                        unsigned expected_height = 0, bool cmyk = false, bool packed = false) {
     IWICStream* stream = nullptr;
     IWICBitmapDecoder* decoder = nullptr;
     IWICBitmapFrameDecode* frame = nullptr;
@@ -286,12 +286,15 @@ static Image wic_decode(Renderer& r, View data, unsigned reduction = 0, unsigned
             source = scaler;
         }
         hr(r.wic->CreateFormatConverter(&converter), "Create image converter");
-        hr(converter->Initialize(source, cmyk ? GUID_WICPixelFormat32bppCMYK : GUID_WICPixelFormat32bppPBGRA,
+        auto format = packed ? GUID_WICPixelFormatBlackWhite
+                             : cmyk ? GUID_WICPixelFormat32bppCMYK : GUID_WICPixelFormat32bppPBGRA;
+        hr(converter->Initialize(source, format,
                                  WICBitmapDitherTypeNone, nullptr, 0,
                                  WICBitmapPaletteTypeCustom),
            "Convert image pixels");
-        out.pixels.resize(size_t(out.width) * out.height * 4);
-        hr(converter->CopyPixels(nullptr, out.width * 4, UINT(out.pixels.size()), out.pixels.data()),
+        unsigned stride = packed ? (out.width + 7) / 8 : out.width * 4;
+        out.pixels.resize(size_t(stride) * out.height);
+        hr(converter->CopyPixels(nullptr, stride, UINT(out.pixels.size()), out.pixels.data()),
            "Copy decoded pixels");
     } catch (...) {
         release(converter);
@@ -405,6 +408,40 @@ std::shared_ptr<Image> load_image(Renderer& r, Document& d, const Value& input, 
     auto& decode = entry(d, image, "Decode");
     const Value no_mask;
     const auto& mask = entry(d, image, "SMask").has_stream ? no_mask : entry(d, image, "Mask");
+    if (decoded.image_filter == "CCITTFaxDecode" || decoded.image_filter == "CCF") {
+        int columns = integer(get(decoded.params, "Columns"), 1728);
+        require(columns > 0, "Invalid fax column count");
+        unsigned components = stencil ? 1 : unsigned(space.components);
+        if (bits != 1 || components != 1 || unsigned(columns) != width) {
+            // A fax filter produces packed bytes. Its bit columns need not
+            // match the image pixels, for example an eight-bit Indexed image.
+            ProfileTimer codec_timer(r.profiling ? &r.profile.image_codec_ms : nullptr);
+            size_t image_row = (size_t(width) * components * bits + 7) / 8;
+            size_t fax_row = (size_t(columns) + 7) / 8;
+            require(image_row && height <= max_stream / image_row, "Decoded fax sample limit exceeded");
+            size_t rows = (image_row * height + fax_row - 1) / fax_row;
+            require(rows <= UINT_MAX, "Decoded fax row limit exceeded");
+            Bytes samples;
+            if (integer(get(decoded.params, "K")) < 0 && boolean(get(decoded.params, "EncodedByteAlign"))) {
+                auto raw = decode_mmr_aligned(d, decoded.bytes, unsigned(columns), unsigned(rows));
+                samples.resize(fax_row * rows);
+                for (unsigned y = 0; y < rows; ++y) {
+                    check_cancel(d);
+                    for (unsigned x = 0; x < unsigned(columns); ++x)
+                        if (!raw.pixels[size_t(y) * columns + x])
+                            samples[size_t(y) * fax_row + x / 8] |= uint8_t(0x80u >> (x % 8));
+                }
+            } else {
+                auto tiff = fax_tiff(decoded.bytes, unsigned(columns), unsigned(rows), decoded.params);
+                samples = wic_decode(r, tiff, 0, 0, 0, false, true).pixels;
+            }
+            if (boolean(get(decoded.params, "BlackIs1")))
+                for (auto& sample : samples)
+                    sample = uint8_t(~sample);
+            decoded.bytes = std::move(samples);
+            decoded.image_filter.clear();
+        }
+    }
     ProfileTimer convert_timer(r.profiling ? &r.profile.image_convert_ms : nullptr);
     if (!decoded.image_filter.empty()) {
         convert_timer.stop();

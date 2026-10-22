@@ -19,6 +19,9 @@ programs copied from the article collection.
 - `fax-aligned.json` contains ten generated T.6 streams with byte-aligned rows.
   Expected pixel hashes were checked with MuPDF. The codes follow the tables in
   [ITU-T T.4](https://www.itu.int/rec/T-REC-T.4/en).
+- `fax-samples.json` contains generated T.6 streams for four-bit and eight-bit
+  grayscale, RGB, and Indexed samples. It tests fax columns, row boundaries,
+  bit polarity, Decode arrays, and color-key masks. MuPDF checks the samples.
 - `jbig2-generic.json` contains generated arithmetic-coded generic regions.
   Expected pixel hashes were checked with MuPDF.
 

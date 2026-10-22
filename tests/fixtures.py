@@ -404,6 +404,50 @@ def generate(directory):
         objects.append(stream(base64.b64decode(fax['data']), attributes))
         top, bottom = ((255, 0, 0), (255, 255, 255)) if black_is_one else ((255, 255, 255), (255, 0, 0))
         add(f"fax_indexed_{black_is_one}", pdf(objects), pixels=[(25, 32, top), (25, 37, bottom)])
+    # Fax columns describe filter bits, before the image's sample and color
+    # processing. They can contain several bits or color components per pixel.
+    sample_cases = json.loads((Path(__file__).parent / "data" / "fax-samples.json").read_text())
+    for case in sample_cases:
+        variants = ("normal", "black_is_one", "decode") if case["name"] == "gray_False" else ("normal",)
+        for variant in variants:
+            width, height, bits, components = (case[key] for key in ("width", "height", "bits", "components"))
+            # Odd scale factors place each sample center on a device-pixel
+            # center, so the assertions do not depend on interpolation policy.
+            zoom = 1 if width > 100 else 9
+            pw, ph = width * zoom, height * zoom
+            objects = base(f"0 1 0 rg 0 0 {pw} {ph} re f q {pw} 0 0 {ph} 0 0 cm /I Do Q".encode(),
+                           resources=b"/XObject << /I 6 0 R >>")
+            objects[2] = objects[2].replace(b"[0 0 300 220]", f"[0 0 {pw} {ph}]".encode())
+            space = "/DeviceRGB" if components == 3 else "/DeviceGray"
+            if case["name"] == "indexed":
+                space = "[/Indexed /DeviceRGB 1 <ff00000000ff>] /Mask [0 0]"
+            params = f"/K -1 /EncodedByteAlign {str(case['aligned']).lower()}"
+            if not case["omit_columns"]:
+                params += f" /Columns {case['columns']}"
+            if variant == "black_is_one":
+                params += " /BlackIs1 true"
+            attributes = (f"/Type /XObject /Subtype /Image /Width {width} /Height {height} "
+                          f"/BitsPerComponent {bits} /ColorSpace {space} /Filter /CCITTFaxDecode "
+                          f"/DecodeParms << {params} >>")
+            if variant == "decode":
+                attributes += " /Decode [1 0]"
+            objects.append(stream(base64.b64decode(case["data"]), attributes.encode()))
+            raw = base64.b64decode(case["raw"])
+            row_bytes = (width * components * bits + 7) // 8
+            pixels = []
+            for x, y in ((0, 0), (width - 1, 0), (width // 2, 1), (0, 1)):
+                if components == 3:
+                    offset = y * row_bytes + x * 3
+                    expected = tuple(raw[offset:offset + 3])
+                else:
+                    value = (raw[y * row_bytes + x * bits // 8] >> (8 - bits - x * bits % 8)) & ((1 << bits) - 1)
+                    if case["name"] == "indexed":
+                        expected = (0, 255, 0) if value == 0 else (0, 0, 255)
+                    else:
+                        value = round(value * 255 / ((1 << bits) - 1))
+                        expected = (255 - value if variant != "normal" else value,) * 3
+                pixels.append((x * zoom + zoom // 2, y * zoom + zoom // 2, expected))
+            add(f"fax_samples_{case['name']}_{variant}", pdf(objects), size=(pw, ph), pixels=pixels)
     # The JPEG has four constant CMYK panels. Its original JPEG samples have
     # opposite polarity from WIC's normalized CMYK output.
     for inverse in (False, True):
