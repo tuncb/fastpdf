@@ -81,12 +81,16 @@ DialogColors system_dialog_colors() {
 }
 struct DialogStyle {
     HWND window = nullptr;
+    HWND tooltips = nullptr;
+    std::vector<std::pair<HWND, std::wstring>> button_captions;
     DialogColors colors{};
     HBRUSH body = nullptr, footer = nullptr, field = nullptr;
     Painter painter;
     HFONT font = nullptr;
     int footer_top = -1, primary = IDOK;
     ~DialogStyle() {
+        if (tooltips)
+            DestroyWindow(tooltips);
         DeleteObject(body);
         DeleteObject(footer);
         DeleteObject(field);
@@ -328,6 +332,11 @@ static void refresh_style(HWND window, DialogStyle& state) {
     state.body = CreateSolidBrush(state.colors.body);
     state.footer = CreateSolidBrush(state.colors.footer);
     state.field = CreateSolidBrush(state.colors.field);
+    if (state.tooltips) {
+        SetWindowTheme(state.tooltips, L"", L"");
+        SendMessageW(state.tooltips, TTM_SETTIPBKCOLOR, state.colors.body, 0);
+        SendMessageW(state.tooltips, TTM_SETTIPTEXTCOLOR, state.colors.text, 0);
+    }
     BOOL dark = state.colors.dark;
     DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
     DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &state.colors.footer, sizeof(COLORREF));
@@ -341,6 +350,8 @@ static void draw_button(HWND window, DialogStyle& state, const NMCUSTOMDRAW& dra
     const bool radio = kind == BS_RADIOBUTTON || kind == BS_AUTORADIOBUTTON;
     const bool check =
         radio || kind == BS_CHECKBOX || kind == BS_AUTOCHECKBOX || kind == BS_3STATE || kind == BS_AUTO3STATE;
+    const bool toggle = check && (GetWindowLongPtrW(button, GWL_STYLE) & BS_PUSHLIKE);
+    const bool checked = check && SendMessageW(button, BM_GETCHECK, 0, 0) != BST_UNCHECKED;
     const bool enabled = IsWindowEnabled(button) != FALSE;
     const bool pressed = (draw.uItemState & CDIS_SELECTED) != 0;
     const bool focused = (draw.uItemState & CDIS_FOCUS) != 0;
@@ -351,8 +362,7 @@ static void draw_button(HWND window, DialogStyle& state, const NMCUSTOMDRAW& dra
     const int saved = SaveDC(draw.hdc);
     FillRect(draw.hdc, &draw.rc, footer ? state.footer : state.body);
     RECT label = draw.rc;
-    if (check) {
-        const bool checked = SendMessageW(button, BM_GETCHECK, 0, 0) != BST_UNCHECKED;
+    if (check && !toggle) {
         const int size = pixels(window, 16);
         RECT box{draw.rc.left, (draw.rc.top + draw.rc.bottom - size) / 2, draw.rc.left + size,
                  (draw.rc.top + draw.rc.bottom + size) / 2};
@@ -384,21 +394,26 @@ static void draw_button(HWND window, DialogStyle& state, const NMCUSTOMDRAW& dra
         }
         label.left += pixels(window, 25);
     } else {
-        const auto fill = primary && enabled                        ? c.accent
-                          : pressed                                 ? c.pressed
-                          : (draw.uItemState & CDIS_HOT) && enabled ? c.hover
-                                                                    : c.body;
+        const auto fill = (primary || (toggle && checked)) && enabled ? c.accent
+                          : pressed                                   ? c.pressed
+                          : (draw.uItemState & CDIS_HOT) && enabled   ? c.hover
+                                                                      : c.body;
         control(state.painter, draw.hdc, draw.rc, GetDpiForWindow(window), background, fill,
-                (primary || focused) && enabled ? c.accent : c.border, 1);
+                (primary || focused || checked) && enabled ? c.accent : c.border, 1);
     }
     wchar_t caption[256]{};
     GetWindowTextW(button, caption, int(std::size(caption)));
+    for (const auto& [control, caption_text] : state.button_captions)
+        if (control == button) {
+            lstrcpynW(caption, caption_text.c_str(), int(std::size(caption)));
+            break;
+        }
     SelectObject(draw.hdc, HFONT(SendMessageW(button, WM_GETFONT, 0, 0)));
     SetBkMode(draw.hdc, TRANSPARENT);
-    SetTextColor(draw.hdc, !enabled ? c.muted : primary ? c.on_accent : c.text);
+    SetTextColor(draw.hdc, !enabled ? c.muted : primary || (toggle && checked) ? c.on_accent : c.text);
     const auto cues = SendMessageW(button, WM_QUERYUISTATE, 0, 0);
     DrawTextW(draw.hdc, caption, -1, &label,
-              DT_SINGLELINE | DT_VCENTER | (check ? DT_LEFT : DT_CENTER) |
+              DT_SINGLELINE | DT_VCENTER | (check && !toggle ? DT_LEFT : DT_CENTER) |
                   ((cues & UISF_HIDEACCEL) ? DT_HIDEPREFIX : 0));
     if (focused && !(cues & UISF_HIDEFOCUS)) {
         InflateRect(&label, -pixels(window, 3), -pixels(window, 3));
@@ -488,6 +503,12 @@ static LRESULT CALLBACK dialog_proc(HWND window, UINT message, WPARAM wp, LPARAM
     }
     case WM_NOTIFY: {
         const auto draw = reinterpret_cast<const NMCUSTOMDRAW*>(lp);
+        if (draw->hdr.hwndFrom == state.tooltips && draw->hdr.code == TTN_GETDISPINFOW) {
+            auto tip = reinterpret_cast<NMTTDISPINFOW*>(lp);
+            GetWindowTextW(HWND(tip->hdr.idFrom), tip->szText, int(std::size(tip->szText)));
+            tip->lpszText = tip->szText;
+            return 0;
+        }
         if (draw->hdr.code == NM_CUSTOMDRAW && window_class(draw->hdr.hwndFrom, TOOLBARCLASSNAMEW)) {
             if (draw->dwDrawStage == CDDS_PREPAINT) {
                 FillRect(draw->hdc, &draw->rc, state.body);
@@ -520,6 +541,30 @@ void dialog_footer(HWND window, int footer_top) {
         state->footer_top = footer_top;
         InvalidateRect(window, nullptr, TRUE);
     }
+}
+void compact_button(HWND button, const wchar_t* caption) {
+    const auto parent = GetParent(button);
+    const auto state = reinterpret_cast<DialogStyle*>(GetPropW(parent, style_property));
+    if (!state)
+        return;
+    state->button_captions.emplace_back(button, caption);
+    if (!state->tooltips) {
+        state->tooltips = CreateWindowExW(
+            WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT,
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(state->tooltips, TTM_SETDELAYTIME, TTDT_INITIAL, 400);
+        SendMessageW(state->tooltips, TTM_SETDELAYTIME, TTDT_AUTOPOP, 10000);
+        SetWindowTheme(state->tooltips, L"", L"");
+        SendMessageW(state->tooltips, TTM_SETTIPBKCOLOR, state->colors.body, 0);
+        SendMessageW(state->tooltips, TTM_SETTIPTEXTCOLOR, state->colors.text, 0);
+    }
+    TOOLINFOW tool{sizeof(tool)};
+    tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    tool.hwnd = parent;
+    tool.uId = UINT_PTR(button);
+    tool.lpszText = LPSTR_TEXTCALLBACKW;
+    SendMessageW(state->tooltips, TTM_ADDTOOLW, 0, LPARAM(&tool));
+    InvalidateRect(button, nullptr, FALSE);
 }
 void style_dialog(HWND window, int footer_top, int primary, bool center) {
     if (GetPropW(window, style_property))

@@ -150,7 +150,7 @@ struct App {
     SearchOptions search_options;
     std::vector<SearchMatch> matches;
     int active_match = -1, search_start_page = 0, search_checked = 0, search_total = 0;
-    bool search_running = false, search_complete = false, search_has_text = false;
+    bool search_running = false, search_complete = false, search_has_text = false, search_failed = false;
     bool show_results = false, reveal_match = false, search_stopped = false;
     std::wstring search_notice;
     ui::DialogColors search_colors{};
@@ -404,10 +404,15 @@ static RECT client(App& a) {
     GetClientRect(a.window, &r);
     return r;
 }
+static int find_width_units(App& a) {
+    RECT unit{0, 0, 4, 8};
+    MapDialogRect(a.find_bar, &unit);
+    return MulDiv(client(a).right, 4, std::max(1L, unit.right));
+}
 static int find_height(App& a) {
     if (!a.find_open || !a.find_bar)
         return 0;
-    RECT units{0, 0, 0, 36};
+    RECT units{0, 0, 0, find_width_units(a) < 480 ? 54 : 36};
     MapDialogRect(a.find_bar, &units);
     return units.bottom;
 }
@@ -609,21 +614,30 @@ static void layout(App& a) {
     }
     if (a.find_bar) {
         MoveWindow(a.find_bar, 0, px(a, toolbar_height), r.right, find_height(a), TRUE);
-        RECT unit{0, 0, 4, 8};
-        MapDialogRect(a.find_bar, &unit);
-        int width = MulDiv(r.right, 4, std::max(1L, unit.right)), right = width - 12;
+        const int width = find_width_units(a);
+        const bool wrapped = width < 480;
+        const int button_y = wrapped ? 23 : 5, status_y = wrapped ? 43 : 23;
+        int right = width - 12;
         for (auto [id, size] : {std::pair{IDC_FIND_CLOSE, 32},
                                 {IDC_FIND_OPTIONS, 42},
                                 {IDC_FIND_RESULTS, 42},
                                 {IDC_FIND_NEXT, 32},
                                 {IDC_FIND_PREVIOUS, 44}}) {
-            ui::position_dialog_control(a.find_bar, id, {right - size, 5, right, 19});
+            ui::position_dialog_control(a.find_bar, id, {right - size, button_y, right, button_y + 14});
             right -= size + 4;
         }
+        if (wrapped)
+            right = width - 12;
         ui::position_dialog_control(a.find_bar, IDC_FIND_COUNT, {right - 50, 6, right, 18});
-        ui::position_dialog_control(a.find_bar, IDC_FIND_TEXT, {12, 6, std::max(50, right - 56), 18});
-        ui::position_dialog_control(a.find_bar, IDC_FIND_STATUS, {12, 23, width - 50, 33});
-        ui::position_dialog_control(a.find_bar, IDC_FIND_STOP, {width - 42, 22, width - 12, 34});
+        right -= 56;
+        for (int id : {IDC_FIND_REGEX, IDC_FIND_WORDS, IDC_FIND_CASE}) {
+            ui::position_dialog_control(a.find_bar, id, {right - 18, 5, right, 19});
+            right -= 20;
+        }
+        ui::position_dialog_control(a.find_bar, IDC_FIND_TEXT, {12, 6, right - 4, 18});
+        ui::position_dialog_control(a.find_bar, IDC_FIND_STATUS, {12, status_y, width - 50, status_y + 10});
+        ui::position_dialog_control(a.find_bar, IDC_FIND_STOP,
+                                    {width - 42, status_y - 1, width - 12, status_y + 11});
         ShowWindow(a.find_bar, a.find_open ? SW_SHOW : SW_HIDE);
     }
     MoveWindow(a.search_results, 0, list_top, sidebar_splitter(a).left,
@@ -752,6 +766,7 @@ static void load_file(App& a, const std::wstring& path, const std::wstring& pass
     a.matches.clear();
     a.active_match = -1;
     a.search_running = a.search_complete = a.search_stopped = a.search_has_text = false;
+    a.search_failed = false;
     a.show_results = a.reveal_match = false;
     a.search_notice.clear();
     SetWindowTextW(a.search, L"");
@@ -1145,6 +1160,8 @@ static std::wstring search_query(App& a) {
     wchar_t text[4096]{};
     GetWindowTextW(a.search, text, int(std::size(text)));
     std::wstring value = text;
+    if (a.search_options.regex)
+        return value;
     const auto first = value.find_first_not_of(L" \t\r\n");
     return first == std::wstring::npos ? L""
                                        : value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
@@ -1155,6 +1172,8 @@ static void sync_search(App& a) {
     std::wstring count, status;
     if (a.query.empty())
         status = L"Enter text to find.";
+    else if (a.search_failed)
+        count = a.search_notice.starts_with(L"Invalid regex:") ? L"Invalid regex" : L"Search error";
     else if (a.search_running) {
         count = std::to_wstring(a.matches.size()) + L" found";
         status = L"Searching… " + std::to_wstring(a.search_checked) + L" of " +
@@ -1185,6 +1204,9 @@ static void sync_search(App& a) {
         status = a.search_notice;
     SetDlgItemTextW(a.find_bar, IDC_FIND_COUNT, count.c_str());
     SetDlgItemTextW(a.find_bar, IDC_FIND_STATUS, status.c_str());
+    CheckDlgButton(a.find_bar, IDC_FIND_CASE, a.search_options.match_case ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(a.find_bar, IDC_FIND_WORDS, a.search_options.whole_words ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(a.find_bar, IDC_FIND_REGEX, a.search_options.regex ? BST_CHECKED : BST_UNCHECKED);
     EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_PREVIOUS), !a.matches.empty());
     EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_NEXT), !a.matches.empty());
     ShowWindow(GetDlgItem(a.find_bar, IDC_FIND_STOP), a.search_running ? SW_SHOW : SW_HIDE);
@@ -1205,6 +1227,7 @@ static void start_search(App& a) {
     a.search_total = a.search_options.page < 0 ? int(a.pages.size()) : 1;
     a.search_running = !a.query.empty() && !a.pages.empty();
     a.search_complete = a.search_stopped = a.search_has_text = a.reveal_match = false;
+    a.search_failed = false;
     a.search_notice.clear();
     SendMessageW(a.search_results, LB_RESETCONTENT, 0, 0);
     if (a.search_running)
@@ -1267,9 +1290,14 @@ static void receive_search(App& a) {
         a.search_complete = update.complete;
         a.search_running = !update.complete;
         if (!update.error.empty()) {
-            a.search_notice = L"Search could not finish: " + update.error;
+            a.search_notice = update.error;
+            a.search_failed = true;
             a.search_complete = false;
             a.search_stopped = true;
+            a.matches.clear();
+            a.active_match = select = -1;
+            SendMessageW(a.search_results, LB_RESETCONTENT, 0, 0);
+            continue;
         }
         for (auto& match : update.matches) {
             if (a.active_match < 0 && select < 0 && match.page >= a.search_start_page)
@@ -1293,18 +1321,14 @@ static INT_PTR CALLBACK search_options_proc(HWND window, UINT message, WPARAM wp
     if (message == WM_INITDIALOG) {
         a = reinterpret_cast<App*>(lp);
         SetWindowLongPtrW(window, DWLP_USER, lp);
-        CheckDlgButton(window, IDC_FIND_CASE, a->search_options.match_case ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(window, IDC_FIND_WORDS, a->search_options.whole_words ? BST_CHECKED : BST_UNCHECKED);
         SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_ADDSTRING, 0, LPARAM(L"Entire document"));
         SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_ADDSTRING, 0, LPARAM(L"Current page"));
         SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_SETCURSEL, a->search_options.page < 0 ? 0 : 1, 0);
-        ui::style_dialog(window, 87);
+        ui::style_dialog(window, 45);
         return TRUE;
     }
     if (message == WM_COMMAND && a) {
         if (LOWORD(wp) == IDOK) {
-            a->search_options.match_case = IsDlgButtonChecked(window, IDC_FIND_CASE) == BST_CHECKED;
-            a->search_options.whole_words = IsDlgButtonChecked(window, IDC_FIND_WORDS) == BST_CHECKED;
             a->search_options.page =
                 SendDlgItemMessageW(window, IDC_FIND_SCOPE, CB_GETCURSEL, 0, 0) == 1 ? a->page : -1;
             EndDialog(window, IDOK);
@@ -1322,6 +1346,9 @@ static INT_PTR CALLBACK find_bar_proc(HWND window, UINT message, WPARAM wp, LPAR
     if (message == WM_INITDIALOG) {
         SetWindowLongPtrW(window, DWLP_USER, lp);
         ui::style_dialog(window, -1, 0, false);
+        ui::compact_button(GetDlgItem(window, IDC_FIND_CASE), L"Aa");
+        ui::compact_button(GetDlgItem(window, IDC_FIND_WORDS), L"ab");
+        ui::compact_button(GetDlgItem(window, IDC_FIND_REGEX), L".*");
         return TRUE;
     }
     if (!a)
@@ -1335,11 +1362,20 @@ static INT_PTR CALLBACK find_bar_proc(HWND window, UINT message, WPARAM wp, LPAR
                 a->matches.clear();
                 a->active_match = -1;
                 a->search_running = a->search_complete = a->search_stopped = false;
+                a->search_failed = false;
                 SendMessageW(a->search_results, LB_RESETCONTENT, 0, 0);
                 a->search_notice = L"";
                 SetTimer(a->window, 3, 180, nullptr);
                 sync_search(*a);
             }
+            return TRUE;
+        case IDC_FIND_CASE:
+        case IDC_FIND_WORDS:
+        case IDC_FIND_REGEX:
+            a->search_options.match_case = IsDlgButtonChecked(window, IDC_FIND_CASE) == BST_CHECKED;
+            a->search_options.whole_words = IsDlgButtonChecked(window, IDC_FIND_WORDS) == BST_CHECKED;
+            a->search_options.regex = IsDlgButtonChecked(window, IDC_FIND_REGEX) == BST_CHECKED;
+            start_search(*a);
             return TRUE;
         case IDC_FIND_PREVIOUS:
             find(*a, -1);
@@ -3242,6 +3278,18 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
     }
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (message.message == WM_SYSKEYDOWN && app.find_open && IsWindowEnabled(app.window) &&
+            (GetKeyState(VK_MENU) & 0x8000) && !(GetKeyState(VK_CONTROL) & 0x8000)) {
+            const int option = message.wParam == 'C'   ? IDC_FIND_CASE
+                               : message.wParam == 'W' ? IDC_FIND_WORDS
+                               : message.wParam == 'R' ? IDC_FIND_REGEX
+                                                       : 0;
+            if (option) {
+                SendDlgItemMessageW(app.find_bar, option, BM_CLICK, 0, 0);
+                SetFocus(app.search);
+                continue;
+            }
+        }
         if (message.message == WM_KEYDOWN && IsWindowEnabled(app.window)) {
             const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -3267,11 +3315,13 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
         if (message.message == WM_KEYDOWN && message.wParam == VK_TAB) {
             std::vector<HWND> order{app.window, app.toolbar};
             for (auto control :
-                 {app.page_edit, app.zoom_edit, app.search, GetDlgItem(app.find_bar, IDC_FIND_PREVIOUS),
-                  GetDlgItem(app.find_bar, IDC_FIND_NEXT), GetDlgItem(app.find_bar, IDC_FIND_RESULTS),
-                  GetDlgItem(app.find_bar, IDC_FIND_OPTIONS), GetDlgItem(app.find_bar, IDC_FIND_CLOSE),
-                  GetDlgItem(app.find_bar, IDC_FIND_STOP), app.sidebar_tabs, app.search_results, app.sidebar,
-                  app.bookmark_tree, app.welcome_install, app.welcome_portable})
+                 {app.page_edit, app.zoom_edit, app.search, GetDlgItem(app.find_bar, IDC_FIND_CASE),
+                  GetDlgItem(app.find_bar, IDC_FIND_WORDS), GetDlgItem(app.find_bar, IDC_FIND_REGEX),
+                  GetDlgItem(app.find_bar, IDC_FIND_PREVIOUS), GetDlgItem(app.find_bar, IDC_FIND_NEXT),
+                  GetDlgItem(app.find_bar, IDC_FIND_RESULTS), GetDlgItem(app.find_bar, IDC_FIND_OPTIONS),
+                  GetDlgItem(app.find_bar, IDC_FIND_CLOSE), GetDlgItem(app.find_bar, IDC_FIND_STOP),
+                  app.sidebar_tabs, app.search_results, app.sidebar, app.bookmark_tree, app.welcome_install,
+                  app.welcome_portable})
                 if (IsWindowVisible(control) && IsWindowEnabled(control))
                     order.push_back(control);
             auto it = std::find(order.begin(), order.end(), GetFocus());

@@ -7,7 +7,7 @@
 
 namespace pdf {
 struct SearchOptions {
-    bool match_case = false, whole_words = false;
+    bool match_case = false, whole_words = false, regex = false;
     int page = -1;
     bool operator==(const SearchOptions&) const = default;
 };

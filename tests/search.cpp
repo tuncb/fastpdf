@@ -1,5 +1,7 @@
 #include "search.h"
 #include <iostream>
+#include <regex>
+#include <chrono>
 
 using namespace pdf;
 static void check(bool value, const char* description) {
@@ -55,7 +57,63 @@ int main() {
               "Case matching works outside ASCII");
         check(search_matches(text, L" \t ", {}).empty(), "A blank query returns no matches");
         check(search_matches(text, L"absent", {}).empty(), "An absent query returns no matches");
-        std::cout << "Search text, offsets, geometry, word boundaries, and normalization passed\n";
+        options = {};
+        options.regex = true;
+        check(search_matches(text, L"warr[a-z]+", options).size() == 4,
+              "Regex is case insensitive by default");
+        options.match_case = true;
+        check(search_matches(text, L"warranty", options).size() == 3, "Regex respects case");
+        options.whole_words = true;
+        check(search_matches(text, L"war|warranty", options).size() == 2,
+              "Whole-word regex tries the complete alternative");
+        options.match_case = false;
+        check(search_matches(text, L"war|warranty", options).size() == 3, "Regex options combine");
+        options.whole_words = false;
+        check(search_matches(text, L"^warranty", options).size() == 1,
+              "Anchors do not restart at each match");
+        check(search_matches(text, L" warranty ", options).size() == 1, "Regex preserves significant spaces");
+        check(search_matches(text, L"\\b", options).empty(),
+              "Zero-length matches do not loop or add empty results");
+        page.text = {span(L"Code 123 codes 45", 0, 0)};
+        matches = search_matches(search_text(page), L"\\d+", options);
+        check(matches.size() == 2 && matches[0].pieces[0].count == 3 && matches[1].pieces[0].count == 2,
+              "Regex highlights variable-length matches");
+        check(search_matches(search_text(page), L"\\D+", options).size() == 2,
+              "Case-insensitive mode does not change regex escape syntax");
+        check(search_matches(search_text(page), L".*", {}).empty(),
+              "Regex metacharacters remain literal when disabled");
+        page.text = {span(L"serial", 0, 0), span(L"number", 0, 20)};
+        matches = search_matches(search_text(page), L"serial\\s+number", options);
+        check(matches.size() == 1 && matches[0].pieces.size() == 2, "Regex spans normalized text runs");
+        page.text = {span(L"abab xabab ABAB", 0, 0)};
+        options.whole_words = true;
+        check(search_matches(search_text(page), L"(ab)\\1", options).size() == 2,
+              "Whole-word mode preserves capture group numbers");
+        page.text = {span(L"\u00c4PFEL \u00e4pfel \u00e4pfelbaum", 0, 0)};
+        check(search_matches(search_text(page), L"\u00e4pfel", options).size() == 2,
+              "Regex case and whole-word matching handle Unicode");
+        bool invalid = false;
+        try {
+            search_matches(text, L"[", options);
+        } catch (const std::regex_error&) {
+            invalid = true;
+        }
+        check(invalid, "Invalid regex reports an error");
+        page.text = {span(std::wstring(3000, L'a'), 0, 0)};
+        options.whole_words = false;
+        check(search_matches(search_text(page), L"a", options).size() == 3000,
+              "Many simple regex matches do not repeatedly scan the whole page");
+        page.text = {span(std::wstring(5000, L'a') + L'!', 0, 0)};
+        const auto started = std::chrono::steady_clock::now();
+        bool bounded = false;
+        try {
+            search_matches(search_text(page), L"(a+)+$", options);
+        } catch (const std::exception&) {
+            bounded = true;
+        }
+        check(bounded && std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+              "Pathological regex stops within a bounded time");
+        std::cout << "Search text, geometry, regex, case, word boundaries, and execution limits passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

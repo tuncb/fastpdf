@@ -1,5 +1,7 @@
 #include "search.h"
 #include <cwctype>
+#include <chrono>
+#include <regex>
 
 namespace pdf {
 static bool space(wchar_t c) {
@@ -85,23 +87,155 @@ static bool word(wchar_t c) {
     return (kind & (C1_ALPHA | C1_DIGIT)) != 0 || c == L'_' || (c >= 0x0300 && c <= 0x036f) ||
            (c >= 0xd800 && c <= 0xdfff);
 }
-std::vector<SearchMatch> search_matches(const SearchText& text, std::wstring_view query,
-                                        const SearchOptions& options, int page) {
+struct SearchPattern {
+    SearchOptions options;
+    std::wstring literal;
+    std::optional<std::wregex> expression;
+};
+static SearchPattern compile_search(std::wstring_view query, const SearchOptions& options) {
+    SearchPattern pattern;
+    pattern.options = options;
+    if (options.regex) {
+        if (query.size() > 4095 || std::count(query.begin(), query.end(), L'(') > 128)
+            throw std::runtime_error("Regular expression is too large. Use a shorter pattern.");
+        pattern.expression.emplace();
+        // Keep Unicode character classes and case matching independent of the user's locale.
+        pattern.expression->imbue(std::locale("en-US"));
+        auto flags = std::regex_constants::ECMAScript;
+        if (!options.match_case)
+            flags |= std::regex_constants::icase;
+        std::wstring source(query);
+        // Validate the user's expression before adding a boundary assertion.
+        // Otherwise an unmatched '[' could consume brackets from that assertion.
+        pattern.expression->assign(source, flags);
+        if (options.whole_words) {
+            source = L"(?:" + source + L")(?![[:alnum:]_\u0300-\u036f\\uD800-\\uDFFF])";
+            pattern.expression->assign(source, flags);
+        }
+        return pattern;
+    }
     SearchText normalized;
     for (auto c : query)
         append(normalized, c, {});
     while (!normalized.text.empty() && normalized.text.back() == L' ')
         normalized.text.pop_back();
+    pattern.literal = options.match_case ? normalized.text : fold(normalized.text);
+    return pattern;
+}
+struct SearchBudget {
+    std::chrono::steady_clock::time_point deadline;
+    const std::atomic<bool>* cancel = nullptr;
+    size_t steps = 0;
+};
+static void check_budget(SearchBudget& budget) {
+    if ((++budget.steps & 255) != 0)
+        return;
+    if (budget.cancel && *budget.cancel)
+        throw std::runtime_error("Search cancelled.");
+    if (std::chrono::steady_clock::now() > budget.deadline)
+        throw std::runtime_error("Pattern took too long. Use a simpler regular expression.");
+}
+// Checked iterators stop backtracking; constant-time distance avoids rescanning
+// the rest of a page for every match.
+struct SearchIterator {
+    using iterator_category = std::random_access_iterator_tag;
+    using value_type = wchar_t;
+    using difference_type = ptrdiff_t;
+    using pointer = const wchar_t*;
+    using reference = const wchar_t&;
+    const wchar_t* cursor = nullptr;
+    SearchBudget* budget = nullptr;
+    reference operator[](difference_type offset) const {
+        check_budget(*budget);
+        return cursor[offset];
+    }
+};
+inline const wchar_t& operator*(SearchIterator iterator) {
+    check_budget(*iterator.budget);
+    return *iterator.cursor;
+}
+inline SearchIterator& operator++(SearchIterator& iterator) {
+    check_budget(*iterator.budget);
+    ++iterator.cursor;
+    return iterator;
+}
+inline SearchIterator operator++(SearchIterator& iterator, int) {
+    const auto previous = iterator;
+    ++iterator;
+    return previous;
+}
+inline SearchIterator& operator--(SearchIterator& iterator) {
+    check_budget(*iterator.budget);
+    --iterator.cursor;
+    return iterator;
+}
+inline SearchIterator operator--(SearchIterator& iterator, int) {
+    const auto previous = iterator;
+    --iterator;
+    return previous;
+}
+inline bool operator==(SearchIterator left, SearchIterator right) {
+    if (left.budget)
+        check_budget(*left.budget);
+    return left.cursor == right.cursor;
+}
+inline auto operator<=>(SearchIterator left, SearchIterator right) {
+    return left.cursor <=> right.cursor;
+}
+inline ptrdiff_t operator-(SearchIterator left, SearchIterator right) {
+    return left.cursor - right.cursor;
+}
+inline SearchIterator& operator+=(SearchIterator& iterator, ptrdiff_t distance) {
+    check_budget(*iterator.budget);
+    iterator.cursor += distance;
+    return iterator;
+}
+inline SearchIterator& operator-=(SearchIterator& iterator, ptrdiff_t distance) {
+    return iterator += -distance;
+}
+inline SearchIterator operator+(SearchIterator iterator, ptrdiff_t distance) {
+    return iterator += distance;
+}
+inline SearchIterator operator+(ptrdiff_t distance, SearchIterator iterator) {
+    return iterator += distance;
+}
+inline SearchIterator operator-(SearchIterator iterator, ptrdiff_t distance) {
+    return iterator -= distance;
+}
+static std::vector<SearchMatch> find_matches(const SearchText& text, const SearchPattern& pattern, int page,
+                                             const std::atomic<bool>* cancel = nullptr) {
     std::vector<SearchMatch> matches;
-    if (normalized.text.empty())
+    if (!pattern.expression && pattern.literal.empty())
         return matches;
-    auto needle = options.match_case ? normalized.text : fold(normalized.text);
-    auto haystack = options.match_case ? text.text : fold(text.text);
-    for (size_t at = 0; (at = haystack.find(needle, at)) != std::wstring::npos; at += needle.size()) {
-        const size_t end = at + needle.size();
-        if (options.whole_words &&
-            ((at && word(haystack[at - 1])) || (end < haystack.size() && word(haystack[end]))))
+    const auto haystack = pattern.expression || pattern.options.match_case ? text.text : fold(text.text);
+    SearchBudget budget{std::chrono::steady_clock::now() + std::chrono::milliseconds(250), cancel};
+    for (size_t next = 0; next < haystack.size();) {
+        size_t at = 0, end = 0;
+        if (cancel && *cancel)
+            throw std::runtime_error("Search cancelled.");
+        if (pattern.expression) {
+            std::match_results<SearchIterator> result;
+            auto flags = std::regex_constants::match_not_null;
+            if (next)
+                flags |= std::regex_constants::match_prev_avail;
+            if (!std::regex_search(SearchIterator{haystack.data() + next, &budget},
+                                   SearchIterator{haystack.data() + haystack.size(), &budget}, result,
+                                   *pattern.expression, flags))
+                break;
+            at = size_t(result[0].first.cursor - haystack.data());
+            end = size_t(result[0].second.cursor - haystack.data());
+        } else {
+            at = haystack.find(pattern.literal, next);
+            if (at == std::wstring::npos)
+                break;
+            end = at + pattern.literal.size();
+        }
+        next = end;
+        if (pattern.options.whole_words &&
+            ((at && word(haystack[at - 1])) || (end < haystack.size() && word(haystack[end])))) {
+            next = at + 1;
             continue;
+        }
         SearchMatch match;
         match.page = page;
         match.offset = at;
@@ -136,6 +270,34 @@ std::vector<SearchMatch> search_matches(const SearchText& text, std::wstring_vie
         matches.push_back(std::move(match));
     }
     return matches;
+}
+std::vector<SearchMatch> search_matches(const SearchText& text, std::wstring_view query,
+                                        const SearchOptions& options, int page) {
+    return find_matches(text, compile_search(query, options), page);
+}
+static const char* regex_error_message(std::regex_constants::error_type error) {
+    switch (error) {
+    case std::regex_constants::error_brack:
+        return "Invalid regex: check the square brackets.";
+    case std::regex_constants::error_paren:
+        return "Invalid regex: check the parentheses.";
+    case std::regex_constants::error_escape:
+        return "Invalid regex: check the backslash escapes.";
+    case std::regex_constants::error_range:
+        return "Invalid regex: check the character range.";
+    case std::regex_constants::error_backref:
+        return "Invalid regex: check the group reference.";
+    case std::regex_constants::error_badrepeat:
+    case std::regex_constants::error_badbrace:
+    case std::regex_constants::error_brace:
+        return "Invalid regex: check the repetition operator.";
+    case std::regex_constants::error_complexity:
+    case std::regex_constants::error_stack:
+    case std::regex_constants::error_space:
+        return "Pattern is too complex. Use a simpler regular expression.";
+    default:
+        return "Invalid regex: check the expression syntax.";
+    }
 }
 std::vector<Rect> search_rects(const RenderedPage& page, const SearchMatch& match) {
     std::vector<Rect> result;
@@ -198,6 +360,7 @@ void run_search_worker(SearchWorker& worker) {
             update.document = request.document;
             update.ticket = request.ticket;
             try {
+                const auto pattern = compile_search(request.query, request.options);
                 hr(com, "Initialize search thread");
                 if (!renderer.write)
                     init_renderer(renderer);
@@ -221,7 +384,7 @@ void run_search_worker(SearchWorker& worker) {
                     const auto& text = found == cache.end() ? extracted : found->second;
                     has_text = has_text || !text.text.empty();
                     update.has_text = has_text;
-                    update.matches = search_matches(text, request.query, request.options, page);
+                    update.matches = find_matches(text, pattern, page, &worker.cancel);
                     if (found == cache.end()) {
                         const size_t cost =
                             extracted.text.size() * (sizeof(wchar_t) + sizeof(SearchPosition));
@@ -246,6 +409,12 @@ void run_search_worker(SearchWorker& worker) {
                               has_text,
                               {},
                               {}};
+                }
+            } catch (const std::regex_error& e) {
+                if (!worker.cancel && !worker.stop) {
+                    update.error = utf8(regex_error_message(e.code()));
+                    update.complete = true;
+                    publish(worker, std::move(update));
                 }
             } catch (const std::exception& e) {
                 if (!worker.cancel && !worker.stop) {

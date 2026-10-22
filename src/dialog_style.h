@@ -18,6 +18,8 @@ void style_common_dialog(HWND window);
 void refresh_dialog_style(HWND window);
 void dialog_footer(HWND window, int footer_top);
 void position_dialog_control(HWND window, int id, RECT units);
+// Keep the full native control name for accessibility and its tooltip.
+void compact_button(HWND button, const wchar_t* caption);
 int show_prompt(HWND owner, const wchar_t* title, const std::wstring& content,
                 std::span<const TASKDIALOG_BUTTON> buttons, int default_button = IDCANCEL,
                 const wchar_t* checkbox = nullptr, BOOL* checked = nullptr);

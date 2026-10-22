@@ -99,8 +99,9 @@ background services, or tray icons.
 - Zoom: Ctrl+mouse wheel or + / −. F fits the page; W fits its width; R rotates it.
 - Find: Ctrl+F. Search starts as you type. Enter or F3 selects the next match;
   Shift+Enter or Shift+F3 selects the previous match. Escape closes search.
-  Use Results to open the list of matches, or Options to match case, find whole
-  words, or search only the current page. Switch between Pages, Bookmarks, and
+  Use the inline `Aa` (Alt+C), `ab` (Alt+W), and `.*` (Alt+R) toggles for match case,
+  whole word, and regular expressions. Use Results to open the list of matches,
+  or Scope to search only the current page. Switch between Pages, Bookmarks, and
   Results with the sidebar tabs. Switching tabs keeps the search active.
 - Selection: drag over text, then Ctrl+C. Ctrl+A selects the current page's extracted text.
 - Pan: middle-button drag. Scroll: mouse wheel, arrows, Space, or scrollbars.
@@ -128,6 +129,12 @@ the Left and Right keys, to collapse or expand a branch. Drag the right edge of 
 or Pages pane to change its width. The default width is 320 pixels at 100% display scaling.
 The Results tab is available while Find is open. Closing Find returns to the last Pages or
 Bookmarks view. Bookmark branches keep their expanded or collapsed state when you switch tabs.
+
+Regex uses ECMAScript syntax on each page's extracted text. PDF whitespace is normalized,
+so `\s+` can match the space between text runs. Groups, alternatives, character classes,
+lookahead, and backreferences are supported. Lookbehind and newer JavaScript regex features
+are not supported. Zero-length matches are omitted because they contain no text to highlight.
+Invalid or slow expressions show an inline message. Search options remain set when you close Find.
 
 The UI renders in a worker thread, cancels obsolete render/search requests, caches page bitmaps, and prefetches adjacent pages when idle. Search reads text without rasterizing the page's images and graphics. The current UI displays one page at a time.
 

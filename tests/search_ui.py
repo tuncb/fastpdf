@@ -118,18 +118,34 @@ def run(exe, output):
             def visit(hwnd, _):
                 pid = w.DWORD()
                 user.GetWindowThreadProcessId(hwnd, c.byref(pid))
-                if pid.value == process.pid and text(hwnd) == "Search Options":
+                if pid.value == process.pid and text(hwnd) == "Search Scope":
                     matches.append(hwnd)
                 return True
             user.EnumWindows(visit, 0)
             return matches[0] if matches else None
 
-        user.PostMessageW(bar, 0x111, 1044, 0)
-        dialog = wait_for(options_dialog, "search options")
-        user.SendMessageW(user.GetDlgItem(dialog, 1050), 0xF1, 1, 0)
-        user.SendMessageW(user.GetDlgItem(dialog, 1051), 0xF1, 1, 0)
-        user.PostMessageW(dialog, 0x111, 1, 0)
+        def toggle(control):
+            user.SendMessageW(user.GetDlgItem(bar, control), 0xF5, 0, 0)  # BM_CLICK
+
+        toggle(1050)
+        wait_for(lambda: text(count).endswith(" of 7"), "match case toggle")
+        toggle(1051)
         wait_for(lambda: text(count).endswith(" of 6"), "case and whole words")
+        toggle(1053)
+        enter(query, r"warr[a-z]+")
+        wait_for(lambda: text(count).endswith(" of 7"), "regex toggle")
+        assert user.SendMessageW(user.GetDlgItem(bar, 1053), 0xF0, 0, 0) == 1, "Regex toggle is not checked"
+        enter(query, "[")
+        expect("Invalid regex")
+        assert text(user.GetDlgItem(bar, 1047)).startswith("Invalid regex:"), "Missing inline regex error"
+        assert user.SendMessageW(results, 0x18B, 0, 0) == 0, "Invalid regex kept old results"
+        assert not user.IsWindowEnabled(user.GetDlgItem(bar, 1042)), "Invalid regex left Next enabled"
+        enter(query, r"warranty(?=\s)")
+        wait_for(lambda: text(count).endswith(" of 6"), "regex error recovery")
+        toggle(1053)
+        expect("0 matches")
+        enter(query, "warranty")
+        wait_for(lambda: text(count).endswith(" of 6"), "literal mode restored")
 
         user.PostMessageW(bar, 0x111, 1044, 0)
         dialog = wait_for(options_dialog, "scope options")
@@ -148,15 +164,16 @@ def run(exe, output):
         user.SendMessageW(window, 0x111, 11, 0)
         expect("1 of 2")
         assert visible(bookmarks), "Reopening Find replaced bookmarks"
-        for dpi in (96, 144):
-            bounds = w.RECT(50, 50, 50 + 1000 * dpi // 96, 50 + 700 * dpi // 96)
+        for dpi, window_width in ((96, 1000), (96, 640), (144, 1000), (144, 640)):
+            bounds = w.RECT(50, 50, 50 + window_width * dpi // 96, 50 + 700 * dpi // 96)
             user.SendMessageW(window, 0x2E0, dpi | (dpi << 16), c.addressof(bounds))
-            controls = [query, count] + [user.GetDlgItem(bar, i) for i in (1041, 1042, 1043, 1044, 1045)]
+            controls = [query] + [user.GetDlgItem(bar, i) for i in (1050, 1051, 1053)] + [count] + [user.GetDlgItem(bar, i) for i in (1041, 1042, 1043, 1044, 1045)]
             boxes = [rect(control) for control in controls]
             assert all(box.left < box.right and box.top < box.bottom for box in boxes)
-            assert all(left.right <= right.left for left, right in zip(boxes, boxes[1:])), "Search controls overlap"
+            assert all(left.right <= right.left or left.bottom <= right.top for left, right in zip(boxes, boxes[1:])), "Search controls overlap"
             assert boxes[-1].right <= rect(bar).right, "Search controls exceed the bar"
             assert boxes[0].bottom - boxes[0].top >= 16 * dpi // 96, "Search field does not follow DPI"
+            assert boxes[-1].bottom <= rect(user.GetDlgItem(bar, 1047)).top, "Search status overlaps buttons"
             assert rect(tabs).bottom <= rect(bookmarks).top, "Sidebar tabs overlap content"
             assert rect(tabs).bottom - rect(tabs).top >= 32 * dpi // 96, "Tabs do not follow DPI"
             width = rect(bookmarks).right - rect(bookmarks).left
