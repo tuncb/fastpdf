@@ -1,6 +1,7 @@
 #include "deployment.h"
 #include "pdf.h"
 #include "resource.h"
+#include "dialog_style.h"
 #include <bcrypt.h>
 #include <winhttp.h>
 #include <shlobj.h>
@@ -698,7 +699,7 @@ int maintenance_command(const std::vector<std::wstring>& arguments) {
 #ifdef FASTPDF_DEPLOYMENT_TEST
         throw std::runtime_error(error.what());
 #else
-        MessageBoxW(nullptr, pdf::utf8(error.what()).c_str(), L"FastPDF maintenance", MB_OK | MB_ICONERROR);
+        ui::message_box(nullptr, pdf::utf8(error.what()).c_str(), L"FastPDF Maintenance", MB_OK | MB_ICONERROR);
         return 1;
 #endif
     }

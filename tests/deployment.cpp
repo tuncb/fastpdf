@@ -1,6 +1,7 @@
 #include "deployment.h"
 #include "pdf.h"
 #include "installation_dialog.h"
+#include "dialog_style.h"
 #include "resource.h"
 #include <bcrypt.h>
 #include <commctrl.h>
@@ -103,7 +104,8 @@ static std::function<void(HWND)> dialog_action;
 static std::exception_ptr dialog_error;
 static LRESULT CALLBACK installation_hook(int code, WPARAM wp, LPARAM lp) {
     const auto window = HWND(wp);
-    if (code == HCBT_ACTIVATE && dialog_action && GetDlgItem(window, IDC_INSTALL_FOLDER)) {
+    if (code == HCBT_ACTIVATE && dialog_action &&
+        (GetDlgItem(window, IDC_INSTALL_FOLDER) || GetDlgItem(window, IDC_PROMPT_TEXT))) {
         auto action = std::move(dialog_action);
         dialog_action = {};
         try {
@@ -129,11 +131,41 @@ static ui::InstallationAction installation_fixture(ui::InstallationOptions& opti
     return result;
 }
 static void installation_dialog_tests() {
+    RegistrySandbox theme_registry;
+    const auto set_light = [](DWORD light) {
+        HKEY key = nullptr;
+        test(RegCreateKeyExW(HKEY_CURRENT_USER,
+                            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                            0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS,
+             "Create isolated theme settings");
+        const auto result = RegSetValueExW(key, L"AppsUseLightTheme", 0, REG_DWORD,
+                                           reinterpret_cast<const BYTE*>(&light), sizeof(light));
+        RegCloseKey(key);
+        test(result == ERROR_SUCCESS, "Set isolated Windows app theme");
+    };
+    set_light(0);
+    test(ui::system_dialog_colors().dark, "Dialogs follow the Windows dark app theme");
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES};
     test(InitCommonControlsEx(&controls) != FALSE, "Initialize installation controls");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ui::InstallationOptions options{L"C:\\isolated user 文書\\LocalAppData\\Programs\\FastPDF"};
     const auto install = installation_fixture(options, [&](HWND window) {
+        const HDC dc = GetDC(window);
+        auto brush_color = [&](UINT message) {
+            const auto brush = HBRUSH(SendMessageW(window, message, WPARAM(dc), LPARAM(window)));
+            LOGBRUSH info{};
+            test(GetObjectW(brush, sizeof(info), &info) != 0, "Dialog returns a valid theme brush");
+            return info.lbColor;
+        };
+        const auto dark_body = brush_color(WM_CTLCOLORDLG);
+        set_light(1);
+        SendMessageW(window, WM_SETTINGCHANGE, 0, 0);
+        test(!ui::system_dialog_colors().dark && brush_color(WM_CTLCOLORDLG) != dark_body,
+             "An open dialog changes to the Windows light app theme");
+        set_light(0);
+        SendMessageW(window, WM_SETTINGCHANGE, 0, 0);
+        test(brush_color(WM_CTLCOLORDLG) == dark_body, "An open dialog changes back to dark");
+        ReleaseDC(window, dc);
         test(IsDlgButtonChecked(window, IDC_INSTALL_SHORTCUT) == BST_CHECKED,
              "New installations default to a Start menu shortcut");
         test(IsDlgButtonChecked(window, IDC_INSTALL_PDF) == BST_UNCHECKED, "PDF default choice is opt-in");
@@ -157,6 +189,8 @@ static void installation_dialog_tests() {
     options.installed = options.present = true;
     const auto apply = installation_fixture(options, [](HWND window) {
         wchar_t caption[64]{};
+        GetWindowTextW(window, caption, int(std::size(caption)));
+        test(std::wstring_view(caption) == L"FastPDF Installation", "Installation title uses title case");
         GetDlgItemTextW(window, IDOK, caption, int(std::size(caption)));
         test(std::wstring_view(caption) == L"Apply", "Installed reader offers Apply");
         test(GetWindowLongPtrW(GetDlgItem(window, IDC_INSTALL_UNINSTALL), GWL_STYLE) & WS_VISIBLE,
@@ -175,6 +209,45 @@ static void installation_dialog_tests() {
     const auto uninstall = installation_fixture(
         options, [](HWND window) { SendMessageW(window, WM_COMMAND, IDC_INSTALL_UNINSTALL, 0); });
     test(uninstall == ui::InstallationAction::uninstall, "Existing installation can request uninstall");
+    dialog_error = nullptr;
+    dialog_action = [](HWND window) {
+        test(LOWORD(SendMessageW(window, DM_GETDEFID, 0, 0)) == IDCANCEL,
+             "Update prompts keep Cancel as the default action");
+        RECT previous{};
+        for (const int id : {100, 101, 102, IDCANCEL}) {
+            RECT bounds{};
+            GetWindowRect(GetDlgItem(window, id), &bounds);
+            test(bounds.right > bounds.left && bounds.bottom > bounds.top &&
+                     (!previous.right || bounds.left > previous.right),
+                 "Long update action labels have separate buttons");
+            previous = bounds;
+        }
+        SendDlgItemMessageW(window, IDC_PROMPT_CHECK, BM_CLICK, 0, 0);
+        SendMessageW(window, WM_COMMAND, 101, 0);
+    };
+    auto hook = SetWindowsHookExW(WH_CBT, installation_hook, nullptr, GetCurrentThreadId());
+    test(hook != nullptr, "Inspect the shared prompt");
+    BOOL checked = FALSE;
+    const TASKDIALOG_BUTTON choices[] = {{100, L"Restart now"}, {101, L"Install when I close FastPDF"},
+                                         {102, L"Later"}, {IDCANCEL, L"Cancel"}};
+    const int result = ui::show_prompt(nullptr, L"Your Update Is Ready", L"The update is ready.", choices,
+                                       IDCANCEL, L"Remember this choice", &checked);
+    UnhookWindowsHookEx(hook);
+    if (dialog_error)
+        std::rethrow_exception(dialog_error);
+    test(!dialog_action && result == 101 && checked, "Prompts preserve action IDs and checkbox state");
+    dialog_action = [](HWND window) {
+        test(LOWORD(SendMessageW(window, DM_GETDEFID, 0, 0)) == IDNO,
+             "Uninstall confirmations keep No as the default action");
+        SendMessageW(window, WM_CLOSE, 0, 0);
+    };
+    hook = SetWindowsHookExW(WH_CBT, installation_hook, nullptr, GetCurrentThreadId());
+    const int no = ui::message_box(nullptr, L"Keep the test files?", L"Test Confirmation",
+                                    MB_YESNO | MB_DEFBUTTON2);
+    UnhookWindowsHookEx(hook);
+    if (dialog_error)
+        std::rethrow_exception(dialog_error);
+    test(!dialog_action && no == IDNO, "Closing a confirmation does not approve the action");
 }
 static std::wstring environment(const wchar_t* name) {
     std::wstring value(32768, L'\0');

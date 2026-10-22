@@ -19,6 +19,7 @@
 # UI rules
 
 - All ui items should obey theme color schemes.
+- For UI implementation or visual review, read and follow [the FastPDF UI skill](.agents/skills/fastpdf-ui/SKILL.md).
 
 # Writing Style
 

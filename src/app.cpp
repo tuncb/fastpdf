@@ -2,6 +2,7 @@
 #include "resource.h"
 #include "deployment.h"
 #include "installation_dialog.h"
+#include "dialog_style.h"
 #include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -715,9 +716,15 @@ static UINT_PTR CALLBACK file_dialog_hook(HWND window, UINT message, WPARAM, LPA
         const auto& dialog = *reinterpret_cast<OPENFILENAMEW*>(lp);
         SetWindowSubclass(GetParent(window), file_dialog_proc, 1, DWORD_PTR(dialog.lCustData));
     }
+    if (message == WM_NOTIFY && reinterpret_cast<NMHDR*>(lp)->code == CDN_INITDONE)
+        ui::style_common_dialog(GetParent(window));
+    if (message == WM_NOTIFY && (reinterpret_cast<NMHDR*>(lp)->code == CDN_FOLDERCHANGE ||
+                                 reinterpret_cast<NMHDR*>(lp)->code == CDN_TYPECHANGE))
+        ui::refresh_dialog_style(GetParent(window));
     return 0;
 }
 static void choose_file(App& a) {
+    ui::enable_system_dialog_theme();
     wchar_t path[32768]{};
     FileSelection selection;
     OPENFILENAMEW dialog{sizeof(dialog)};
@@ -725,7 +732,8 @@ static void choose_file(App& a) {
     dialog.lpstrFilter = L"PDF documents (*.pdf)\0*.pdf\0All files\0*.*\0";
     dialog.lpstrFile = path;
     dialog.nMaxFile = 32768;
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_ENABLEHOOK;
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_ENABLEHOOK |
+                   OFN_HIDEREADONLY;
     dialog.lpfnHook = file_dialog_hook;
     dialog.lCustData = LPARAM(&selection);
     const bool accepted = GetOpenFileNameW(&dialog) != FALSE;
@@ -752,6 +760,7 @@ static void goto_page(App& a, int page) {
 static INT_PTR CALLBACK password_dialog(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     if (message == WM_INITDIALOG) {
         SetWindowLongPtrW(window, DWLP_USER, lp);
+        ui::style_dialog(window, 45);
         SendDlgItemMessageW(window, IDC_PASSWORD, EM_LIMITTEXT, 1024, 0);
         SetFocus(GetDlgItem(window, IDC_PASSWORD));
         return FALSE;
@@ -768,48 +777,6 @@ static INT_PTR CALLBACK password_dialog(HWND window, UINT message, WPARAM wp, LP
         if (LOWORD(wp) == IDCANCEL) {
             EndDialog(window, IDCANCEL);
             return TRUE;
-        }
-    }
-    return FALSE;
-}
-static void theme_dialog(HWND window, LPARAM context) {
-    SetWindowLongPtrW(window, DWLP_USER, context);
-    BOOL dark = TRUE;
-    DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
-    DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &ui::chrome, sizeof(ui::chrome));
-    DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR, &ui::text, sizeof(ui::text));
-}
-static INT_PTR dialog_theme_message(HWND window, UINT message, WPARAM wp, LPARAM lp) {
-    const auto app = reinterpret_cast<App*>(GetWindowLongPtrW(window, DWLP_USER));
-    if (!app)
-        return FALSE;
-    if (message == WM_CTLCOLORDLG || message == WM_CTLCOLORSTATIC || message == WM_CTLCOLOREDIT) {
-        SetBkColor(HDC(wp), ui::chrome);
-        SetTextColor(HDC(wp), GetDlgCtrlID(HWND(lp)) == IDC_REPOSITORY ? ui::link : ui::text);
-        return reinterpret_cast<INT_PTR>(app->chrome_background);
-    }
-    if (message == WM_NOTIFY) {
-        const auto header = reinterpret_cast<const NMHDR*>(lp);
-        if (header->code == NM_CUSTOMDRAW &&
-            (header->idFrom == IDOK || header->idFrom == IDC_NOTICES ||
-             header->idFrom == IDC_PREVIEW_PREVIOUS || header->idFrom == IDC_PREVIEW_NEXT)) {
-            const auto draw = reinterpret_cast<const NMCUSTOMDRAW*>(lp);
-            if (draw->dwDrawStage == CDDS_PREPAINT) {
-                const bool focused = (draw->uItemState & CDIS_FOCUS) != 0;
-                const auto fill = (draw->uItemState & CDIS_SELECTED) ? ui::selected
-                                  : (draw->uItemState & CDIS_HOT) ? ui::hover : ui::surface;
-                ui::control(app->painter, draw->hdc, draw->rc, GetDpiForWindow(window), ui::chrome, fill,
-                            focused ? ui::focus : ui::border, 1);
-                wchar_t text[128]{};
-                GetWindowTextW(header->hwndFrom, text, int(std::size(text)));
-                UINT flags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
-                if (SendMessageW(window, WM_QUERYUISTATE, 0, 0) & UISF_HIDEACCEL)
-                    flags |= DT_HIDEPREFIX;
-                label(draw->hdc, draw->rc, text, IsWindowEnabled(header->hwndFrom) ? ui::text : ui::disabled,
-                      HFONT(SendMessageW(header->hwndFrom, WM_GETFONT, 0, 0)), flags);
-                SetWindowLongPtrW(window, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
-                return TRUE;
-            }
         }
     }
     return FALSE;
@@ -840,7 +807,8 @@ static void request_print_preview(App& a) {
 }
 static void paint_print_preview(App& a, const DRAWITEMSTRUCT& draw) {
     const int saved = SaveDC(draw.hDC);
-    SetDCBrushColor(draw.hDC, ui::canvas);
+    const auto colors = ui::system_dialog_colors();
+    SetDCBrushColor(draw.hDC, colors.dark ? colors.field : colors.footer);
     FillRect(draw.hDC, &draw.rcItem, HBRUSH(GetStockObject(DC_BRUSH)));
     if (a.preview_bitmap) {
         const auto& image = *a.preview_bitmap;
@@ -861,7 +829,7 @@ static void paint_print_preview(App& a, const DRAWITEMSTRUCT& draw) {
     } else {
         RECT bounds = draw.rcItem;
         InflateRect(&bounds, -12, -12);
-        label(draw.hDC, bounds, a.preview_error.empty() ? L"Loading preview…" : a.preview_error, ui::muted,
+        label(draw.hDC, bounds, a.preview_error.empty() ? L"Loading preview…" : a.preview_error, ui::system_dialog_colors().muted,
               HFONT(SendMessageW(a.print_preview, WM_GETFONT, 0, 0)), DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
     }
     RestoreDC(draw.hDC, saved);
@@ -872,6 +840,7 @@ static INT_PTR CALLBACK print_preview_dialog(HWND window, UINT message, WPARAM w
         a = reinterpret_cast<App*>(lp);
         SetWindowLongPtrW(window, DWLP_USER, lp);
         a->print_preview = window;
+        ui::style_dialog(window, -1, 0, false);
         // The final panel can match the template size, so WM_SIZE is not guaranteed.
         PostMessageW(window, WM_SIZE, 0, 0);
         return TRUE;
@@ -882,18 +851,18 @@ static INT_PTR CALLBACK print_preview_dialog(HWND window, UINT message, WPARAM w
     case WM_SIZE: {
         RECT bounds{};
         GetClientRect(window, &bounds);
-        const int unit = MulDiv(10, int(GetDpiForWindow(window)), 96);
-        const int button_width = unit * 8, button_height = unit * 3;
-        const int bottom = bounds.bottom - unit - button_height;
-        MoveWindow(GetDlgItem(window, IDC_PREVIEW_TITLE), unit, unit,
-                   std::max(1L, bounds.right - unit * 2), unit * 2, TRUE);
-        MoveWindow(GetDlgItem(window, IDC_PREVIEW_IMAGE), unit, unit * 4,
-                   std::max(1L, bounds.right - unit * 2), std::max(1, bottom - unit * 5), TRUE);
-        MoveWindow(GetDlgItem(window, IDC_PREVIEW_PREVIOUS), unit, bottom, button_width, button_height, TRUE);
-        MoveWindow(GetDlgItem(window, IDC_PREVIEW_NEXT), bounds.right - unit - button_width, bottom,
-                   button_width, button_height, TRUE);
-        MoveWindow(GetDlgItem(window, IDC_PREVIEW_PAGE), unit * 2 + button_width, bottom,
-                   std::max(1L, bounds.right - unit * 4 - button_width * 2), button_height, TRUE);
+        RECT units{0, 0, 4, 8};
+        MapDialogRect(window, &units);
+        const int width = MulDiv(bounds.right, 4, units.right);
+        const int footer = MulDiv(bounds.bottom, 8, units.bottom) - 26;
+        ui::dialog_footer(window, footer);
+        ui::position_dialog_control(window, IDC_PREVIEW_TITLE, {12, 9, width - 12, 21});
+        ui::position_dialog_control(window, IDC_PREVIEW_IMAGE, {12, 25, width - 12, footer - 9});
+        ui::position_dialog_control(window, IDC_PREVIEW_PREVIOUS, {12, footer + 6, 62, footer + 20});
+        ui::position_dialog_control(window, IDC_PREVIEW_NEXT,
+                                     {width - 62, footer + 6, width - 12, footer + 20});
+        ui::position_dialog_control(window, IDC_PREVIEW_PAGE,
+                                     {68, footer + 6, width - 68, footer + 20});
         PostMessageW(window, WM_APP, 0, 0);
         return TRUE;
     }
@@ -926,13 +895,14 @@ static INT_PTR CALLBACK print_preview_dialog(HWND window, UINT message, WPARAM w
         break;
     }
     }
-    return dialog_theme_message(window, message, wp, lp);
+    return FALSE;
 }
 static UINT_PTR CALLBACK print_dialog_hook(HWND window, UINT message, WPARAM, LPARAM lp) {
     if (message != WM_INITDIALOG)
         return FALSE;
     const auto dialog = reinterpret_cast<PRINTDLGW*>(lp);
     auto& a = *reinterpret_cast<App*>(dialog->lCustData);
+    ui::style_common_dialog(window);
     a.preview_page = a.page;
     const auto pane = CreateDialogParamW(a.instance, MAKEINTRESOURCEW(IDD_PRINT_PREVIEW), window,
                                          print_preview_dialog, LPARAM(&a));
@@ -963,11 +933,28 @@ static UINT_PTR CALLBACK print_dialog_hook(HWND window, UINT message, WPARAM, LP
                  SWP_NOZORDER | SWP_NOACTIVATE);
     MoveWindow(pane, beside ? client_bounds.right : 0, beside ? 0 : client_bounds.bottom,
                beside ? pane_width : width, beside ? height : height - client_bounds.bottom, TRUE);
+    if (beside) {
+        RECT units{0, 0, 4, 8}, native_units{0, 0, 4, 8};
+        MapDialogRect(pane, &units);
+        MapDialogRect(window, &native_units);
+        const int footer = height - MulDiv(26, units.bottom, 8);
+        ui::dialog_footer(window, MulDiv(footer, 8, native_units.bottom));
+        const int right = client_bounds.right - MulDiv(12, units.right, 4);
+        const int y_button = footer + MulDiv(6, units.bottom, 8);
+        const int button_height = MulDiv(14, units.bottom, 8);
+        const int cancel_width = MulDiv(44, units.right, 4);
+        const int primary_width = MulDiv(50, units.right, 4);
+        MoveWindow(GetDlgItem(window, IDCANCEL), right - cancel_width, y_button,
+                   cancel_width, button_height, TRUE);
+        MoveWindow(GetDlgItem(window, IDOK), right - cancel_width - MulDiv(6, units.right, 4) - primary_width,
+                   y_button, primary_width, button_height, TRUE);
+    }
     return FALSE;
 }
 static INT_PTR CALLBACK licenses_dialog(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     if (message == WM_INITDIALOG) {
-        theme_dialog(window, lp);
+        SetWindowLongPtrW(window, DWLP_USER, lp);
+        ui::style_dialog(window, 302);
         const auto instance = reinterpret_cast<App*>(lp)->instance;
         std::wstring notices;
         for (int id : {IDR_FONT_LICENSE, IDR_UNICODE_LICENSE}) {
@@ -987,17 +974,19 @@ static INT_PTR CALLBACK licenses_dialog(HWND window, UINT message, WPARAM wp, LP
             notices += L"\r\n\r\n";
         }
         SetDlgItemTextW(window, IDC_LICENSES, notices.c_str());
-        return TRUE;
+        SetFocus(GetDlgItem(window, IDOK));
+        return FALSE;
     }
     if (message == WM_COMMAND && (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL)) {
         EndDialog(window, LOWORD(wp));
         return TRUE;
     }
-    return dialog_theme_message(window, message, wp, lp);
+    return FALSE;
 }
 static INT_PTR CALLBACK about_dialog(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     if (message == WM_INITDIALOG) {
-        theme_dialog(window, lp);
+        SetWindowLongPtrW(window, DWLP_USER, lp);
+        ui::style_dialog(window, 43);
         SetDlgItemTextW(window, IDC_ABOUT_VERSION, L"FastPDF " FASTPDF_VERSION_W);
         LITEM link{};
         link.mask = LIF_ITEMINDEX | LIF_STATE;
@@ -1027,12 +1016,13 @@ static INT_PTR CALLBACK about_dialog(HWND window, UINT message, WPARAM wp, LPARA
             return TRUE;
         }
     }
-    return dialog_theme_message(window, message, wp, lp);
+    return FALSE;
 }
 static INT_PTR CALLBACK goto_dialog(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     if (message == WM_INITDIALOG) {
         SetWindowLongPtrW(window, DWLP_USER, lp);
         auto a = reinterpret_cast<App*>(lp);
+        ui::style_dialog(window, 45);
         SetDlgItemInt(window, IDC_PAGE, UINT(a->page + 1), FALSE);
         SendDlgItemMessageW(window, IDC_PAGE, EM_SETSEL, 0, -1);
         return TRUE;
@@ -1110,23 +1100,9 @@ static deployment::Session current_session(const App& a) {
 static int task_dialog(App& a, const wchar_t* title, const std::wstring& content,
                        const std::vector<TASKDIALOG_BUTTON>& buttons, const wchar_t* checkbox = nullptr,
                        BOOL* checked = nullptr) {
-    TASKDIALOGCONFIG dialog{sizeof(dialog)};
-    dialog.hwndParent = a.window;
-    dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_SIZE_TO_CONTENT | TDF_POSITION_RELATIVE_TO_WINDOW;
-    if (checked && *checked)
-        dialog.dwFlags |= TDF_VERIFICATION_FLAG_CHECKED;
-    dialog.dwCommonButtons = TDCBF_CANCEL_BUTTON;
-    dialog.pszWindowTitle = L"FastPDF";
-    dialog.pszMainInstruction = title;
-    dialog.pszContent = content.c_str();
-    dialog.pszVerificationText = checkbox;
-    dialog.cButtons = UINT(buttons.size());
-    dialog.pButtons = buttons.data();
-    dialog.nDefaultButton = IDCANCEL;
-    int pressed = IDCANCEL;
-    if (FAILED(TaskDialogIndirect(&dialog, &pressed, nullptr, checked)))
-        throw std::runtime_error("Cannot open the FastPDF dialog");
-    return pressed;
+    auto choices = buttons;
+    choices.push_back({IDCANCEL, L"Cancel"});
+    return ui::show_prompt(a.window, title, content, choices, IDCANCEL, checkbox, checked);
 }
 static void installation_dialog(App& a) {
     if (a.update_job.valid() || !a.pending_update.directory.empty())
@@ -1145,12 +1121,12 @@ static void installation_dialog(App& a) {
         if (options.default_pdf && !deployment::default_pdf_reader())
             deployment::open_pdf_defaults(a.window);
         else if (a.installed)
-            MessageBoxW(a.window, L"Installation options saved.", L"FastPDF", MB_OK | MB_ICONINFORMATION);
+            ui::message_box(a.window, L"Installation options saved.", L"FastPDF", MB_OK | MB_ICONINFORMATION);
     } else if (result == ui::InstallationAction::open) {
         deployment::open_installed(current_session(a));
         PostMessageW(a.window, WM_CLOSE, 0, 0);
     } else if (result == ui::InstallationAction::uninstall) {
-        if (MessageBoxW(a.window, L"Uninstall FastPDF for your Windows account? Your PDF files will be kept.",
+        if (ui::message_box(a.window, L"Uninstall FastPDF for your Windows account? Your PDF files will be kept.",
                         L"Uninstall FastPDF", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
             deployment::start_uninstall();
             PostMessageW(a.window, WM_CLOSE, 0, 0);
@@ -1159,7 +1135,7 @@ static void installation_dialog(App& a) {
 }
 static void ready_update(App& a) {
     const int result = task_dialog(
-        a, L"Your update is ready",
+        a, L"Your Update Is Ready",
         L"FastPDF " + utf8(a.pending_update.version) +
             L" has been downloaded and verified.\n\nClose other FastPDF windows before installing. "
             L"Restarting will reopen this document at the same page. Protected PDFs may ask for their "
@@ -1210,15 +1186,15 @@ static void poll_update(App& a) {
         deployment::cleanup_download(result.download);
         a.update_status = L"Update canceled.";
     } else if (!result.error.empty()) {
-        MessageBoxW(a.window, result.error.c_str(), L"FastPDF update", MB_OK | MB_ICONERROR);
+        ui::message_box(a.window, result.error.c_str(), L"FastPDF Update", MB_OK | MB_ICONERROR);
     } else if (result.downloading) {
         a.pending_update = std::move(result.download);
         a.update_status = L"Update ready. Help → Check for updates to install.";
         ready_update(a);
     } else if (result.release.version <= deployment::parse_version(FASTPDF_VERSION)) {
-        MessageBoxW(a.window, L"FastPDF " FASTPDF_VERSION_W L" is up to date.", L"FastPDF update",
+        ui::message_box(a.window, L"FastPDF " FASTPDF_VERSION_W L" is up to date.", L"FastPDF Update",
                     MB_OK | MB_ICONINFORMATION);
-    } else if (task_dialog(a, L"A FastPDF update is available",
+    } else if (task_dialog(a, L"A FastPDF Update Is Available",
                            L"Version " + utf8(result.release.tag) + L" is available. Download it now?",
                            {{100, L"Download update"}}) == 100) {
         start_update_job(a, result.release);
@@ -1238,10 +1214,10 @@ static void command(App& a, int id) {
         layout(a);
     } else if (id == cmd_updates) {
         if (!a.installed) {
-            MessageBoxW(a.window,
+            ui::message_box(a.window,
                         L"Install FastPDF to update it here. You can also download a new portable copy from "
                         L"GitHub Releases.",
-                        L"FastPDF updates", MB_OK | MB_ICONINFORMATION);
+                        L"FastPDF Updates", MB_OK | MB_ICONINFORMATION);
             installation_dialog(a);
         } else if (!a.pending_update.directory.empty())
             ready_update(a);
@@ -1285,6 +1261,7 @@ static void command(App& a, int id) {
     } else if (id == cmd_goto && !a.pages.empty())
         DialogBoxParamW(a.instance, MAKEINTRESOURCEW(IDD_GOTO), a.window, goto_dialog, LPARAM(&a));
     else if (id == cmd_print && !a.pages.empty()) {
+        ui::enable_system_dialog_theme();
         PRINTDLGW dialog{sizeof(dialog)};
         dialog.hwndOwner = a.window;
         dialog.Flags = PD_RETURNDC | PD_USEDEVMODECOPIESANDCOLLATE | PD_NOSELECTION | PD_ENABLEPRINTHOOK;
@@ -1743,7 +1720,7 @@ static void receive(App& a) {
                                     LPARAM(&password)) == IDOK)
                     load_file(a, a.path, password);
             } else
-                MessageBoxW(a.window, result.error.c_str(), L"FastPDF", MB_OK | MB_ICONERROR);
+                ui::message_box(a.window, result.error.c_str(), L"FastPDF", MB_OK | MB_ICONERROR);
             continue;
         }
         if (result.kind == Job::open) {
@@ -2599,7 +2576,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             a.exit_code = 4;
             PostMessageW(window, WM_CLOSE, 0, 0);
         } else
-            MessageBoxW(window, a.status.c_str(), L"FastPDF", MB_OK | MB_ICONERROR);
+            ui::message_box(window, a.status.c_str(), L"FastPDF", MB_OK | MB_ICONERROR);
     }
     return DefWindowProcW(window, message, wp, lp);
 }
@@ -2611,6 +2588,11 @@ struct InstanceLock {
     }
 };
 static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>& arguments) {
+    ui::enable_system_dialog_theme();
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_LINK_CLASS |
+                                                        ICC_TREEVIEW_CLASSES};
+    InitCommonControlsEx(&controls);
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const int maintenance = deployment::maintenance_command(arguments);
     if (maintenance >= 0)
         return maintenance;
@@ -2618,15 +2600,11 @@ static int run_app(HINSTANCE instance, int show, const std::vector<std::wstring>
     if (arguments.size() == 1 && arguments[0] == L"--uninstall") {
         if (!deployment::installation_present())
             throw std::runtime_error("FastPDF is not installed for this Windows account.");
-        if (MessageBoxW(nullptr, L"Uninstall FastPDF? Your PDF files will be kept.", L"Uninstall FastPDF",
+        if (ui::message_box(nullptr, L"Uninstall FastPDF? Your PDF files will be kept.", L"Uninstall FastPDF",
                         MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
             deployment::start_uninstall();
         return 0;
     }
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_LINK_CLASS |
-                                                        ICC_TREEVIEW_CLASSES};
-    InitCommonControlsEx(&controls);
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     App app;
     app.instance = instance;
     app.installed = deployment::installed_instance();
@@ -2749,7 +2727,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         LocalFree(raw);
         result = run_app(instance, show, arguments);
     } catch (const std::exception& error) {
-        MessageBoxW(nullptr, utf8(error.what()).c_str(), L"FastPDF", MB_OK | MB_ICONERROR);
+        ui::message_box(nullptr, utf8(error.what()).c_str(), L"FastPDF", MB_OK | MB_ICONERROR);
     }
     CoUninitialize();
     return result;

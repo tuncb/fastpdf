@@ -70,7 +70,12 @@ def find_preview(window):
     @CALLBACK
     def visit(child, _):
         if user.GetDlgCtrlID(child) == 1020:
-            result.append(child)
+            # EnumChildWindows can see a template halfway through its creation.
+            # Wait until the dialog has created its controls and initialized its page.
+            pane = user.GetParent(child)
+            caption = user.GetDlgItem(pane, 1023)
+            if caption and text(caption) and all(user.GetDlgItem(pane, control) for control in (1021, 1022)):
+                result.append(child)
         return True
 
     # The modal print dialog is an owned top-level window, not a reader child.
@@ -98,6 +103,13 @@ def check_pixels(image, color, portrait, output):
     paper_height = max(p // width for p in white) - min(p // width for p in white)
     assert (paper_height > paper_width) == portrait, "Incorrect PDF page rotation"
     capture(image, output)
+
+
+def click_preview(button):
+    # BM_CLICK can fail for an inactive dialog. Send the same BN_CLICKED notification
+    # without taking desktop focus from the user.
+    assert user.IsWindowEnabled(button), "Preview action is disabled"
+    user.SendMessageW(user.GetParent(button), 0x111, user.GetDlgCtrlID(button), button)
 
 
 def run(executable, output):
@@ -149,7 +161,7 @@ def run(executable, output):
                 (2, previous, b"\x00\xff\x00", True),
                 (1, previous, b"\x00\x00\xff", False),
             ):
-                user.SendMessageW(button, 0xF5, 0, 0)
+                click_preview(button)
                 assert text(caption) == f"Page {target} of 3"
                 check_pixels(image, color, portrait, output / f"page-{target}.bmp")
                 assert bool(user.IsWindowEnabled(previous)) == (target != 1)
@@ -159,11 +171,11 @@ def run(executable, output):
                 assert text(user.GetDlgItem(dialog, 0x481)) == "2", "Preview changed the print range"
             # Rapid requests must discard stale results and retain the last page.
             for target in (next_button, next_button, previous, previous, next_button):
-                user.SendMessageW(target, 0xF5, 0, 0)
+                click_preview(target)
             check_pixels(image, b"\x00\xff\x00", True, output / "rapid-navigation.bmp")
             capture(dialog, output / "print-dialog.bmp")
             # Cancel while another preview may still be rendering, then reopen.
-            user.SendMessageW(next_button, 0xF5, 0, 0)
+            click_preview(next_button)
             user.PostMessageW(dialog, 0x111, 2, 0)
             wait_for(lambda: not user.IsWindow(dialog), "Cancel closes print dialog")
             assert text(page) == "2"

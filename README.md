@@ -114,7 +114,9 @@ between the toolbar, page and zoom fields, search, and page list. The main menus
 any actions hidden when the window is narrow. Document controls are disabled
 until a PDF is open.
 
-The reader uses neutral dark surfaces, Segoe UI text, and blue keyboard-focus outlines. The page list
+The reader uses neutral dark surfaces, Segoe UI text, and blue keyboard-focus outlines.
+Dialogs use a shared Segoe UI style and follow the Windows light or dark app theme.
+Open dialogs update their colors when the Windows theme changes. The page list
 keeps focus while you navigate with the arrow keys; Escape returns focus to the document.
 Bookmarks use a tree with collapsed branches when you open a document. Click an arrow, or use
 the Left and Right keys, to collapse or expand a branch. Drag the right edge of the Bookmarks
