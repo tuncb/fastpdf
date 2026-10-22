@@ -2,6 +2,13 @@
 
 Notable changes by release tag, newest first.
 
+## v0.3.0
+
+- Preview pages in the print dialog before printing.
+- Resize sidebars and collapse the bookmarks pane.
+- Use consistent theme-aware styles in dialogs.
+- Search as you type, use regular expressions, and get responsive results on large queries.
+
 ## v0.2.0
 
 - Blue lightning F app icon for the window, taskbar, executable, and Start menu shortcut.
