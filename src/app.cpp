@@ -159,6 +159,7 @@ struct App {
     int find_layout_height = 0, summary_layout_height = 0;
     std::wstring search_notice, search_summary;
     ui::DialogColors search_colors{};
+    bool setting_window_theme = false;
     HBRUSH results_background = nullptr;
     HFONT search_font = nullptr;
     UINT dpi = 96;
@@ -633,15 +634,12 @@ static void layout(App& a) {
     RECT tab_area{0, 0, sidebar_width, px(a, ui::sidebar_header)};
     TabCtrl_AdjustRect(a.sidebar_tabs, FALSE, &tab_area);
     a.sidebar_header_height = std::max(px(a, ui::sidebar_header), int(tab_area.top));
-    MoveWindow(a.sidebar_tabs, 0, top, sidebar_width, a.sidebar_header_height, TRUE);
+    MoveWindow(a.sidebar_tabs, 0, top, sidebar_width, a.sidebar_header_height, FALSE);
     ShowWindow(a.sidebar_tabs, sidebar_visible(a) ? SW_SHOW : SW_HIDE);
-    InvalidateRect(a.sidebar_tabs, nullptr, FALSE);
     int list_top = top + a.sidebar_header_height;
     for (auto control : {a.sidebar, a.bookmark_tree}) {
         MoveWindow(control, 0, list_top, sidebar_splitter(a).left,
-                   std::max<LONG>(0, r.bottom - list_top - px(a, 30)), TRUE);
-        // Custom rows cover the full width, including the area outside native text bounds.
-        InvalidateRect(control, nullptr, FALSE);
+                   std::max<LONG>(0, r.bottom - list_top - px(a, 30)), FALSE);
         bool visible = a.show_sidebar && !results_visible(a) && !a.pages.empty() &&
                        (control == a.bookmark_tree ? a.bookmarks : !a.bookmarks);
         if (!visible && GetFocus() == control)
@@ -684,11 +682,11 @@ static void layout(App& a) {
     }
     a.summary_layout_height = search_summary_height(a);
     MoveWindow(a.results_summary, px(a, 12), list_top + px(a, 8), std::max(0, sidebar_width - px(a, 24)),
-               a.summary_layout_height - px(a, 16), TRUE);
+               a.summary_layout_height - px(a, 16), FALSE);
     ShowWindow(a.results_summary, results_visible(a) ? SW_SHOW : SW_HIDE);
     const int results_top = list_top + a.summary_layout_height;
     MoveWindow(a.search_results, 0, results_top, sidebar_splitter(a).left,
-               std::max<LONG>(0, r.bottom - results_top - px(a, 30)), TRUE);
+               std::max<LONG>(0, r.bottom - results_top - px(a, 30)), FALSE);
     if (!results_visible(a) && GetFocus() == a.search_results)
         SetFocus(a.window);
     ShowWindow(a.search_results, results_visible(a) ? SW_SHOW : SW_HIDE);
@@ -703,6 +701,11 @@ static void layout(App& a) {
     update_scroll(a);
     layout_toolbar(a);
     sync_toolbar(a);
+    // Paint complete rows and scrollbars only after all pane bounds are final.
+    // During a drag, queued mouse moves must not delay the child paints.
+    RedrawWindow(a.window, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN |
+                     (a.resizing_sidebar ? RDW_UPDATENOW : 0));
 }
 static void set_sidebar_hover(App& a, int hover) {
     if (hover == a.sidebar_hover)
@@ -2611,7 +2614,12 @@ static void refresh_reader_theme(App& a) {
     DwmSetWindowAttribute(a.window, 20, &dark, sizeof(dark));
     DwmSetWindowAttribute(a.window, DWMWA_CAPTION_COLOR, &c.footer, sizeof(COLORREF));
     DwmSetWindowAttribute(a.window, DWMWA_TEXT_COLOR, &c.text, sizeof(COLORREF));
-    for (auto control : {a.sidebar, a.search_results, a.page_edit, a.zoom_edit})
+    // The PDF scrollbars are part of the main window's nonclient area.
+    // SetWindowTheme sends WM_THEMECHANGED synchronously to this window.
+    a.setting_window_theme = true;
+    SetWindowTheme(a.window, c.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    a.setting_window_theme = false;
+    for (auto control : {a.sidebar, a.bookmark_tree, a.search_results, a.page_edit, a.zoom_edit})
         SetWindowTheme(control, c.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
     ListView_SetBkColor(a.search_results, c.body);
     ListView_SetTextBkColor(a.search_results, c.body);
@@ -2700,7 +2708,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                                 WS_CHILD | WS_TABSTOP | TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS |
                                     TVS_FULLROWSELECT | TVS_NOTOOLTIPS | TVS_DISABLEDRAGDROP,
                                 0, 0, 0, 0, window, HMENU(INT_PTR(id_bookmark_tree)), a.instance, nullptr);
-            SetWindowTheme(a.bookmark_tree, L"", L"");
+            TreeView_SetExtendedStyle(a.bookmark_tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
             TreeView_SetBkColor(a.bookmark_tree, a.search_colors.footer);
             TreeView_SetTextColor(a.bookmark_tree, a.search_colors.text);
             TreeView_SetLineColor(a.bookmark_tree, a.search_colors.border);
@@ -2871,9 +2879,12 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             request_render(a);
             return 0;
         }
+        case WM_THEMECHANGED:
+            if (a.setting_window_theme)
+                return 0;
+            [[fallthrough]];
         case WM_SETTINGCHANGE:
         case WM_SYSCOLORCHANGE:
-        case WM_THEMECHANGED:
             refresh_reader_theme(a);
             return 0;
         case WM_GETMINMAXINFO: {
@@ -3104,10 +3115,12 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                 int maximum = std::max(0, int(client(a).right) - px(a, ui::document_min_width));
                 int width = std::clamp(int(p.x) + a.splitter_offset,
                                        std::min(px(a, ui::sidebar_min_width), maximum), maximum);
-                a.sidebar_width = MulDiv(width, 96, int(a.dpi));
-                layout(a);
-                SetTimer(window, 1, 120, nullptr);
-                InvalidateRect(window, nullptr, FALSE);
+                const int units = MulDiv(width, 96, int(a.dpi));
+                if (units != a.sidebar_width) {
+                    a.sidebar_width = units;
+                    layout(a);
+                    SetTimer(window, 1, 120, nullptr);
+                }
                 SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                 return 0;
             }
