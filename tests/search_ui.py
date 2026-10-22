@@ -197,7 +197,8 @@ def run(exe, output):
         user.SendMessageW(window, 0x111, 11, 0)
         expect("1 of 2")
         assert visible(bookmarks), "Reopening Find replaced bookmarks"
-        for dpi, window_width in ((96, 1000), (96, 640), (144, 1000), (144, 640), (192, 640)):
+        query_heights = {}
+        for dpi, window_width in ((96, 1000), (96, 640), (144, 1000), (144, 640), (192, 640), (96, 640)):
             bounds = w.RECT(50, 50, 50 + window_width * dpi // 96, 50 + 700 * dpi // 96)
             user.SendMessageW(window, 0x2E0, dpi | (dpi << 16), c.addressof(bounds))
             user.SendMessageW(tabs, 0x1330, 2, 0)
@@ -213,7 +214,9 @@ def run(exe, output):
             assert all(left.right <= right.left or right.right <= left.left or left.bottom <= right.top or right.bottom <= left.top
                        for i, left in enumerate(boxes) for right in boxes[i + 1:]), "Search controls overlap"
             assert boxes[-1].right <= rect(bar).right, "Search controls exceed the bar"
-            assert boxes[0].bottom - boxes[0].top >= 16 * dpi // 96, "Search field does not follow DPI"
+            height = boxes[0].bottom - boxes[0].top
+            assert height >= 16 * dpi // 96, f"Search field is too short: {height} at {dpi} DPI"
+            assert height == query_heights.setdefault(dpi, height), "Returning to a DPI changed the field height"
             assert boxes[-1].bottom <= rect(bar).bottom, "Search buttons exceed the bar"
             assert boxes[0].right < boxes[-1].left, "Query does not leave room for Close"
             assert abs(boxes[0].top + boxes[0].bottom - boxes[-1].top - boxes[-1].bottom) <= 2, "Close is not centered beside the query"
@@ -228,6 +231,8 @@ def run(exe, output):
             user.SendMessageW(window, 0x202, 0, point.y << 16)
             assert user.SendMessageW(tabs, 0x132C, 0, 0) > 1, f"Narrow sidebar tabs did not wrap at {dpi} DPI: width {rect(bookmarks).right - rect(bookmarks).left}, before {width}"
             assert rect(tabs).bottom <= rect(bookmarks).top, "Wrapped tabs overlap content"
+        assert query_heights[96] < query_heights[144] < query_heights[192], \
+            f"Search field height did not scale with DPI: {query_heights}"
         print("Search navigation, sidebar tabs, bookmark state, options, DPI, and reopen passed")
     finally:
         if window:

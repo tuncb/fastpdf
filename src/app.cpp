@@ -432,15 +432,14 @@ static RECT client(App& a) {
     return r;
 }
 static int find_width_units(App& a) {
-    RECT unit{0, 0, 4, 8};
-    MapDialogRect(a.find_bar, &unit);
+    const auto unit = ui::dialog_rect(a.find_bar, {0, 0, 4, 8});
     return MulDiv(client(a).right, 4, std::max(1L, unit.right));
 }
 static int find_height(App& a) {
     if (!a.find_open || !a.find_bar)
         return 0;
-    RECT units{0, 0, 0, (find_width_units(a) < 350 ? 64 : 44) + (a.show_find_status ? 18 : 0)};
-    MapDialogRect(a.find_bar, &units);
+    const auto units = ui::dialog_rect(
+        a.find_bar, {0, 0, 0, (find_width_units(a) < 350 ? 64 : 44) + (a.show_find_status ? 18 : 0)});
     return units.bottom;
 }
 static bool results_visible(const App& a) {
@@ -663,8 +662,8 @@ static void layout(App& a) {
                                     {right - 68, button_y + 1, right - 4, button_y + 13});
         ui::position_dialog_control(a.find_bar, IDC_FIND_SCOPE, {12, 23, 112, 87});
         // A native combo keeps its own closed height; center it within the control row.
-        RECT row{12, 23, 112, 37}, combo{};
-        MapDialogRect(a.find_bar, &row);
+        const auto row = ui::dialog_rect(a.find_bar, {12, 23, 112, 37});
+        RECT combo{};
         const auto scope = GetDlgItem(a.find_bar, IDC_FIND_SCOPE);
         GetWindowRect(scope, &combo);
         SetWindowPos(scope, nullptr, row.left,

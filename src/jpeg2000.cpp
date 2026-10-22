@@ -519,34 +519,36 @@ static void decode_block(const TileComponent& component, Band& band, Block& bloc
         for (int stripe = 0; stripe < height; stripe += 4)
             for (int x = 0; x < width; ++x) {
                 int end = std::min(stripe + 4, height), begin = stripe;
-                if (kind == 2 && end - stripe == 4) {
-                    bool run = true;
-                    for (int y = stripe; y < end; ++y) {
-                        auto& s = samples[size_t(y + 1) * stride + x + 1];
-                        if (flags_for(s, y) & (significant_flag | visited_flag | 255)) {
-                            run = false;
-                            break;
+                if constexpr (kind == 2) {
+                    if (end - stripe == 4) {
+                        bool run = true;
+                        for (int y = stripe; y < end; ++y) {
+                            auto& s = samples[size_t(y + 1) * stride + x + 1];
+                            if (flags_for(s, y) & (significant_flag | visited_flag | 255)) {
+                                run = false;
+                                break;
+                            }
                         }
-                    }
-                    if (run) {
-                        if (!mq_bit(mq, contexts[17]))
-                            continue;
-                        begin += int((mq_bit(mq, contexts[18]) << 1) | mq_bit(mq, contexts[18]));
-                        auto* s = &samples[size_t(begin + 1) * stride + x + 1];
-                        significant(s, flags_for(*s, begin));
-                        ++begin;
+                        if (run) {
+                            if (!mq_bit(mq, contexts[17]))
+                                continue;
+                            begin += int((mq_bit(mq, contexts[18]) << 1) | mq_bit(mq, contexts[18]));
+                            auto* s = &samples[size_t(begin + 1) * stride + x + 1];
+                            significant(s, flags_for(*s, begin));
+                            ++begin;
+                        }
                     }
                 }
                 for (int y = begin; y < end; ++y) {
                     auto& s = samples[size_t(y + 1) * stride + x + 1];
                     uint32_t flags = flags_for(s, y);
-                    if (kind == 0) {
+                    if constexpr (kind == 0) {
                         if (!(flags & significant_flag) && (flags & 255)) {
                             s.flags |= visited_flag;
                             if (mq_bit(mq, contexts[significance[flags & 255]]))
                                 significant(&s, flags);
                         }
-                    } else if (kind == 1) {
+                    } else if constexpr (kind == 1) {
                         if ((flags & (significant_flag | fresh_flag)) == significant_flag) {
                             unsigned context = flags & refined_flag ? 16 : flags & 255 ? 15 : 14;
                             int value = mq_bit(mq, contexts[context]) ? 1 : -1;

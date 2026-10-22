@@ -87,7 +87,7 @@ struct DialogStyle {
     DialogColors colors{};
     HBRUSH body = nullptr, footer = nullptr, field = nullptr;
     Painter painter;
-    HFONT font = nullptr;
+    HFONT font = nullptr, current_font = nullptr;
     int footer_top = -1, primary = IDOK;
     ~DialogStyle() {
         if (tooltips)
@@ -104,14 +104,32 @@ static const UINT refresh_message = RegisterWindowMessageW(L"FastPDF.RefreshDial
 static int pixels(HWND window, int value) {
     return MulDiv(value, int(GetDpiForWindow(window)), 96);
 }
+RECT dialog_rect(HWND window, RECT units) {
+    // MapDialogRect retains the template metrics after WM_SETFONT changes the DPI font.
+    const auto font = HFONT(SendMessageW(window, WM_GETFONT, 0, 0));
+    if (!font) {
+        MapDialogRect(window, &units);
+        return units;
+    }
+    const auto dc = GetDC(window);
+    const auto old = SelectObject(dc, font);
+    SIZE alphabet{};
+    TEXTMETRICW metrics{};
+    GetTextExtentPoint32W(dc, L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", 52, &alphabet);
+    GetTextMetricsW(dc, &metrics);
+    SelectObject(dc, old);
+    ReleaseDC(window, dc);
+    const int width = (alphabet.cx / 26 + 1) / 2;
+    return {MulDiv(units.left, width, 4), MulDiv(units.top, metrics.tmHeight, 8),
+            MulDiv(units.right, width, 4), MulDiv(units.bottom, metrics.tmHeight, 8)};
+}
 void position_dialog_control(HWND window, int id, RECT units) {
-    MapDialogRect(window, &units);
+    units = dialog_rect(window, units);
     MoveWindow(GetDlgItem(window, id), units.left, units.top, units.right - units.left,
                units.bottom - units.top, TRUE);
 }
 static int footer_y(HWND window, const DialogStyle& state) {
-    RECT units{0, 0, 0, state.footer_top};
-    MapDialogRect(window, &units);
+    const auto units = dialog_rect(window, {0, 0, 0, state.footer_top});
     return state.footer_top < 0 ? MAXLONG : units.bottom;
 }
 static bool in_footer(HWND window, HWND child, const DialogStyle& state) {
@@ -514,6 +532,13 @@ static LRESULT CALLBACK dialog_proc(HWND window, UINT message, WPARAM wp, LPARAM
         return 0;
     }
     switch (message) {
+    case WM_SETFONT:
+        state.current_font = HFONT(wp);
+        break;
+    case WM_GETFONT:
+        if (state.current_font)
+            return LRESULT(state.current_font);
+        break;
     case WM_NCDESTROY: {
         const auto result = DefSubclassProc(window, message, wp, lp);
         RemoveWindowSubclass(window, dialog_proc, id);

@@ -13,12 +13,13 @@ struct DialogColors {
 };
 DialogColors system_dialog_colors();
 void enable_system_dialog_theme();
-// Dimensions are dialog units, using the template's Segoe UI 10 font.
+// Dimensions are dialog units, using the dialog's current Segoe UI 10 font.
 // A negative footer keeps the full client area as the body (embedded panels).
 void style_dialog(HWND window, int footer_top, int primary = IDOK, bool center = true);
 void style_common_dialog(HWND window);
 void refresh_dialog_style(HWND window);
 void dialog_footer(HWND window, int footer_top);
+RECT dialog_rect(HWND window, RECT units);
 void position_dialog_control(HWND window, int id, RECT units);
 // Center the native text and caret in single-line edit controls.
 void center_edit_text(HWND window);
