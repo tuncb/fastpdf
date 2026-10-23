@@ -9,6 +9,14 @@ static void check(bool value, const char* message) {
         throw std::runtime_error(message);
 }
 
+static bool same_paint_color(uint32_t actual, uint32_t expected) {
+    // HALFTONE downsampling in ui::control can round each RGB channel by one.
+    for (int shift : {0, 8, 16})
+        if (std::abs(int((actual >> shift) & 0xff) - int((expected >> shift) & 0xff)) > 1)
+            return false;
+    return true;
+}
+
 static void check_result_emphasis(App& app) {
     const auto dc = GetDC(app.window);
     const auto font = SelectObject(dc, app.search_font);
@@ -79,9 +87,14 @@ static void check_bookmark_frame(App& app) {
     const auto selected_color = app.search_colors.pressed;
     const uint32_t selection = (uint32_t(GetRValue(selected_color)) << 16) |
                                (uint32_t(GetGValue(selected_color)) << 8) | GetBValue(selected_color);
-    const bool selection_fits =
-        (painted[size_t(selected_y) * width + width - px(app, 10)] & 0xffffff) == selection &&
-        (painted[size_t(selected_y) * width + width - px(app, 4)] & 0xffffff) == background;
+    const auto selection_pixel = painted[size_t(selected_y) * width + width - px(app, 10)] & 0xffffff;
+    const auto margin_pixel = painted[size_t(selected_y) * width + width - px(app, 4)] & 0xffffff;
+    const bool selection_fits = same_paint_color(selection_pixel, selection) && margin_pixel == background;
+    if (!selection_fits)
+        std::fprintf(
+            stderr,
+            "Bookmark paint: dpi=%u width=%d selection=%06x expected=%06x margin=%06x expected=%06x\n",
+            app.dpi, width, selection_pixel, selection, margin_pixel, background);
     // A resize can erase the background before the next paint is dispatched.
     // The current rows must survive that interval instead of becoming blank.
     SendMessageW(app.bookmark_tree, WM_ERASEBKGND, WPARAM(dc), 0);
@@ -93,6 +106,21 @@ static void check_bookmark_frame(App& app) {
     check(rows_visible, "Bookmark rows are blank after resizing");
     check(selection_fits, "Bookmark selection does not reach the current pane edge with its margin");
     check(preserved, "Resize erased the bookmark rows before repainting");
+}
+
+static void check_bookmark_themes(App& app) {
+    const auto original = app.search_colors;
+    // Exercise both palettes regardless of the desktop theme on the test runner.
+    for (bool dark : {false, true}) {
+        app.search_colors.footer = dark ? ui::chrome : RGB(240, 240, 240);
+        app.search_colors.pressed = dark ? ui::selected : RGB(225, 232, 242);
+        app.search_colors.text = dark ? ui::text : RGB(28, 28, 28);
+        app.search_colors.muted = dark ? ui::muted : RGB(100, 100, 100);
+        TreeView_SetBkColor(app.bookmark_tree, app.search_colors.footer);
+        check_bookmark_frame(app);
+    }
+    app.search_colors = original;
+    TreeView_SetBkColor(app.bookmark_tree, original.footer);
 }
 
 static std::vector<uint32_t> scrollbar_pixels(HWND window, int part, int state) {
@@ -472,7 +500,7 @@ int main() {
                       "Resize changed the bookmark scroll position");
                 check(TreeView_GetSelection(app.bookmark_tree) == selected,
                       "Resize changed the bookmark selection");
-                check_bookmark_frame(app);
+                check_bookmark_themes(app);
                 check_document_scrollbars(app);
             }
             SendMessageW(window, WM_LBUTTONUP, 0, MAKELPARAM(px(app, 317), y));
