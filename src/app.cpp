@@ -19,6 +19,7 @@
 #include <optional>
 #include "ui_style.h"
 #include "search.h"
+#include "page_view.h"
 
 using namespace pdf;
 constexpr UINT worker_message = WM_APP + 1;
@@ -136,7 +137,8 @@ struct App {
     std::vector<HTREEITEM> bookmark_items;
     int sidebar_width = ui::sidebar_width, splitter_offset = 0;
     int sidebar_header_height = ui::sidebar_header, tab_hover = -1;
-    bool resizing_sidebar = false, syncing_bookmarks = false;
+    bool resizing_sidebar = false, resizing_window = false, resize_render_pending = false;
+    bool syncing_bookmarks = false;
     HWND toolbar = nullptr, page_edit = nullptr, zoom_edit = nullptr;
     HWND welcome_install = nullptr, welcome_portable = nullptr;
     HINSTANCE instance = nullptr;
@@ -144,7 +146,8 @@ struct App {
     HFONT font = nullptr, title_font = nullptr, small_font = nullptr, selected_font = nullptr;
     HBRUSH edit_background = nullptr, chrome_background = nullptr;
     std::deque<MenuItem> menu_items;
-    ui::Painter painter;
+    ui::Painter painter, frame;
+    ui::PageView page_view;
     HWND input_hover = nullptr;
     int sidebar_hover = -1;
     Worker worker;
@@ -434,6 +437,25 @@ static RECT client(App& a) {
     GetClientRect(a.window, &r);
     return r;
 }
+static bool live_resize(const App& a) {
+    return a.resizing_sidebar || a.resizing_window;
+}
+static void position_control(HWND window, int x, int y, int width, int height) {
+    RECT current{};
+    GetWindowRect(window, &current);
+    MapWindowPoints(nullptr, GetParent(window), reinterpret_cast<POINT*>(&current), 2);
+    if (current.left == x && current.top == y && current.right - current.left == width &&
+        current.bottom - current.top == height)
+        return;
+    // Layout paints once, after every control has its final bounds.
+    SetWindowPos(window, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+}
+static void show_control(HWND window, bool visible) {
+    if (((GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE) != 0) != visible)
+        SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW |
+                         (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+}
 static int find_width_units(App& a) {
     const auto unit = ui::dialog_rect(a.find_bar, {0, 0, 4, 8});
     return MulDiv(client(a).right, 4, std::max(1L, unit.right));
@@ -500,7 +522,7 @@ static RECT viewport(App& a) {
         r.bottom = std::max(r.top, r.bottom - bar_h);
     return r;
 }
-static void update_scroll(App& a) {
+static void update_scroll(App& a, bool repaint = true) {
     const auto bounds = document_bounds(a);
     auto r = viewport(a);
     auto [w, h] = dimensions(a);
@@ -515,21 +537,22 @@ static void update_scroll(App& a) {
     si.nMax = std::max(0, total_h - 1);
     si.nPage = UINT(height);
     si.nPos = a.scroll_y;
-    SetScrollInfo(a.document_vscroll, SB_CTL, &si, TRUE);
+    SetScrollInfo(a.document_vscroll, SB_CTL, &si, repaint);
     si.nMax = std::max(0, total_w - 1);
     si.nPage = UINT(width);
     si.nPos = a.scroll_x;
-    SetScrollInfo(a.document_hscroll, SB_CTL, &si, TRUE);
-    MoveWindow(a.document_vscroll, r.right, r.top, bounds.right - r.right, r.bottom - r.top, TRUE);
-    MoveWindow(a.document_hscroll, r.left, r.bottom, r.right - r.left, bounds.bottom - r.bottom, TRUE);
-    ShowWindow(a.document_vscroll, r.right < bounds.right ? SW_SHOWNA : SW_HIDE);
-    ShowWindow(a.document_hscroll, r.bottom < bounds.bottom ? SW_SHOWNA : SW_HIDE);
+    SetScrollInfo(a.document_hscroll, SB_CTL, &si, repaint);
+    position_control(a.document_vscroll, r.right, r.top, bounds.right - r.right, r.bottom - r.top);
+    position_control(a.document_hscroll, r.left, r.bottom, r.right - r.left, bounds.bottom - r.bottom);
+    show_control(a.document_vscroll, r.right < bounds.right);
+    show_control(a.document_hscroll, r.bottom < bounds.bottom);
+    if (repaint)
+        for (auto control : {a.document_vscroll, a.document_hscroll})
+            InvalidateRect(control, nullptr, FALSE);
 }
-static void request_render(App& a, bool reset_scroll = false) {
-    if (a.pages.empty()) {
-        sync_toolbar(a);
+static void update_scale(App& a) {
+    if (a.pages.empty())
         return;
-    }
     auto r = document_bounds(a);
     auto [w, h] = dimensions(a);
     double available_w = std::max<LONG>(32, r.right - r.left - px(a, 48)),
@@ -549,6 +572,15 @@ static void request_render(App& a, bool reset_scroll = false) {
     double pixels = w * h * a.scale * a.scale;
     if (pixels > 60'000'000)
         a.scale *= std::sqrt(60'000'000 / pixels);
+}
+static void request_render(App& a, bool reset_scroll = false) {
+    KillTimer(a.window, 1);
+    a.resize_render_pending = false;
+    if (a.pages.empty()) {
+        sync_toolbar(a);
+        return;
+    }
+    update_scale(a);
     if (reset_scroll)
         a.scroll_x = a.scroll_y = 0;
     update_scroll(a);
@@ -652,7 +684,9 @@ static int search_summary_height(App& a) {
 }
 static void layout(App& a) {
     auto r = client(a);
-    a.find_layout_height = find_height(a);
+    const int next_find_height = find_height(a);
+    const bool layout_find = !a.resizing_sidebar || next_find_height != a.find_layout_height;
+    a.find_layout_height = next_find_height;
     int top = px(a, toolbar_height) + a.find_layout_height;
     const int tab_count = a.find_open ? 3 : 2;
     while (TabCtrl_GetItemCount(a.sidebar_tabs) > tab_count)
@@ -664,84 +698,120 @@ static void layout(App& a) {
         item.pszText = const_cast<wchar_t*>(titles[i]);
         TabCtrl_InsertItem(a.sidebar_tabs, i, &item);
     }
-    TabCtrl_SetCurSel(a.sidebar_tabs, results_visible(a) ? 2 : a.bookmarks ? 1 : 0);
+    const int tab = results_visible(a) ? 2 : a.bookmarks ? 1 : 0;
+    if (TabCtrl_GetCurSel(a.sidebar_tabs) != tab)
+        TabCtrl_SetCurSel(a.sidebar_tabs, tab);
     const int sidebar_width = sidebar_splitter(a).left;
-    MoveWindow(a.sidebar_tabs, 0, top, sidebar_width, px(a, ui::sidebar_header), FALSE);
+    position_control(a.sidebar_tabs, 0, top, sidebar_width, a.sidebar_header_height);
     RECT tab_area{0, 0, sidebar_width, px(a, ui::sidebar_header)};
     TabCtrl_AdjustRect(a.sidebar_tabs, FALSE, &tab_area);
     a.sidebar_header_height = std::max(px(a, ui::sidebar_header), int(tab_area.top));
-    MoveWindow(a.sidebar_tabs, 0, top, sidebar_width, a.sidebar_header_height, FALSE);
-    ShowWindow(a.sidebar_tabs, sidebar_visible(a) ? SW_SHOW : SW_HIDE);
+    position_control(a.sidebar_tabs, 0, top, sidebar_width, a.sidebar_header_height);
+    show_control(a.sidebar_tabs, sidebar_visible(a));
     int list_top = top + a.sidebar_header_height;
     for (auto control : {a.sidebar, a.bookmark_tree}) {
-        MoveWindow(control, 0, list_top, sidebar_splitter(a).left,
-                   std::max<LONG>(0, r.bottom - list_top - px(a, 30)), FALSE);
+        position_control(control, 0, list_top, sidebar_width,
+                         std::max<LONG>(0, r.bottom - list_top - px(a, 30)));
         bool visible = a.show_sidebar && !results_visible(a) && !a.pages.empty() &&
                        (control == a.bookmark_tree ? a.bookmarks : !a.bookmarks);
         if (!visible && GetFocus() == control)
             SetFocus(a.window);
-        ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
+        show_control(control, visible);
     }
-    if (a.find_bar) {
-        MoveWindow(a.find_bar, 0, px(a, toolbar_height), r.right, find_height(a), TRUE);
-        const int width = find_width_units(a);
-        const bool wrapped = width < 350;
-        const int button_y = wrapped ? 43 : 23, status_y = button_y + 20;
-        int right = width - 12;
-        for (int id : {IDC_FIND_NEXT, IDC_FIND_PREVIOUS}) {
-            ui::position_dialog_control(a.find_bar, id, {right - 18, button_y, right, button_y + 14});
-            right -= 20;
+    if (a.find_bar && layout_find) {
+        position_control(a.find_bar, 0, px(a, toolbar_height), r.right, find_height(a));
+        if (a.find_open) {
+            const int width = find_width_units(a);
+            const bool wrapped = width < 350;
+            const int button_y = wrapped ? 43 : 23, status_y = button_y + 20;
+            int right = width - 12;
+            for (int id : {IDC_FIND_NEXT, IDC_FIND_PREVIOUS}) {
+                ui::position_dialog_control(a.find_bar, id, {right - 18, button_y, right, button_y + 14});
+                right -= 20;
+            }
+            ui::position_dialog_control(a.find_bar, IDC_FIND_COUNT,
+                                        {right - 68, button_y + 1, right - 4, button_y + 13});
+            ui::position_dialog_control(a.find_bar, IDC_FIND_SCOPE, {12, 23, 112, 87});
+            // A native combo keeps its own closed height; center it within the control row.
+            const auto row = ui::dialog_rect(a.find_bar, {12, 23, 112, 37});
+            RECT combo{};
+            const auto scope = GetDlgItem(a.find_bar, IDC_FIND_SCOPE);
+            GetWindowRect(scope, &combo);
+            SetWindowPos(scope, nullptr, row.left,
+                         row.top + (row.bottom - row.top - (combo.bottom - combo.top)) / 2, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            int left = 120;
+            for (int id : {IDC_FIND_CASE, IDC_FIND_WORDS, IDC_FIND_REGEX}) {
+                ui::position_dialog_control(a.find_bar, id, {left, 23, left + 18, 37});
+                left += 20;
+            }
+            ui::position_dialog_control(a.find_bar, IDC_FIND_TEXT, {12, 6, width - 36, 18});
+            ui::position_dialog_control(a.find_bar, IDC_FIND_CLOSE, {width - 30, 5, width - 12, 19});
+            ui::position_dialog_control(a.find_bar, IDC_FIND_STATUS,
+                                        {12, status_y, width - 50, status_y + 10});
+            ui::position_dialog_control(a.find_bar, IDC_FIND_STOP,
+                                        {width - 42, status_y - 1, width - 12, status_y + 13});
+            ShowWindow(GetDlgItem(a.find_bar, IDC_FIND_STATUS), a.show_find_status ? SW_SHOW : SW_HIDE);
         }
-        ui::position_dialog_control(a.find_bar, IDC_FIND_COUNT,
-                                    {right - 68, button_y + 1, right - 4, button_y + 13});
-        ui::position_dialog_control(a.find_bar, IDC_FIND_SCOPE, {12, 23, 112, 87});
-        // A native combo keeps its own closed height; center it within the control row.
-        const auto row = ui::dialog_rect(a.find_bar, {12, 23, 112, 37});
-        RECT combo{};
-        const auto scope = GetDlgItem(a.find_bar, IDC_FIND_SCOPE);
-        GetWindowRect(scope, &combo);
-        SetWindowPos(scope, nullptr, row.left,
-                     row.top + (row.bottom - row.top - (combo.bottom - combo.top)) / 2, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        int left = 120;
-        for (int id : {IDC_FIND_CASE, IDC_FIND_WORDS, IDC_FIND_REGEX}) {
-            ui::position_dialog_control(a.find_bar, id, {left, 23, left + 18, 37});
-            left += 20;
-        }
-        ui::position_dialog_control(a.find_bar, IDC_FIND_TEXT, {12, 6, width - 36, 18});
-        ui::position_dialog_control(a.find_bar, IDC_FIND_CLOSE, {width - 30, 5, width - 12, 19});
-        ui::position_dialog_control(a.find_bar, IDC_FIND_STATUS, {12, status_y, width - 50, status_y + 10});
-        ui::position_dialog_control(a.find_bar, IDC_FIND_STOP,
-                                    {width - 42, status_y - 1, width - 12, status_y + 13});
-        ShowWindow(GetDlgItem(a.find_bar, IDC_FIND_STATUS), a.show_find_status ? SW_SHOW : SW_HIDE);
-        ShowWindow(a.find_bar, a.find_open ? SW_SHOW : SW_HIDE);
+        show_control(a.find_bar, a.find_open);
     }
     a.summary_layout_height = search_summary_height(a);
-    MoveWindow(a.results_summary, px(a, 12), list_top + px(a, 8), std::max(0, sidebar_width - px(a, 24)),
-               a.summary_layout_height - px(a, 16), FALSE);
-    ShowWindow(a.results_summary, results_visible(a) ? SW_SHOW : SW_HIDE);
+    position_control(a.results_summary, px(a, 12), list_top + px(a, 8),
+                     std::max(0, sidebar_width - px(a, 24)), a.summary_layout_height - px(a, 16));
+    show_control(a.results_summary, results_visible(a));
     const int results_top = list_top + a.summary_layout_height;
-    MoveWindow(a.search_results, 0, results_top, sidebar_splitter(a).left,
-               std::max<LONG>(0, r.bottom - results_top - px(a, 30)), FALSE);
+    position_control(a.search_results, 0, results_top, sidebar_width,
+                     std::max<LONG>(0, r.bottom - results_top - px(a, 30)));
     if (!results_visible(a) && GetFocus() == a.search_results)
         SetFocus(a.window);
-    ShowWindow(a.search_results, results_visible(a) ? SW_SHOW : SW_HIDE);
+    show_control(a.search_results, results_visible(a));
     fit_search_results(a.search_results);
     const auto vp = viewport(a);
     const int midpoint = (vp.left + vp.right) / 2, center = (vp.top + vp.bottom) / 2;
     const bool welcome = !a.installed && !a.portable_choice && a.path.empty() && a.pages.empty();
-    MoveWindow(a.welcome_install, midpoint - px(a, 188), center + px(a, 12), px(a, 180), px(a, 38), TRUE);
-    MoveWindow(a.welcome_portable, midpoint + px(a, 8), center + px(a, 12), px(a, 180), px(a, 38), TRUE);
-    ShowWindow(a.welcome_install, welcome ? SW_SHOW : SW_HIDE);
-    ShowWindow(a.welcome_portable, welcome ? SW_SHOW : SW_HIDE);
-    update_scroll(a);
-    layout_toolbar(a);
+    if (welcome) {
+        position_control(a.welcome_install, midpoint - px(a, 188), center + px(a, 12), px(a, 180), px(a, 38));
+        position_control(a.welcome_portable, midpoint + px(a, 8), center + px(a, 12), px(a, 180), px(a, 38));
+    }
+    show_control(a.welcome_install, welcome);
+    show_control(a.welcome_portable, welcome);
+    update_scroll(a, false);
+    if (!a.resizing_sidebar)
+        layout_toolbar(a);
     sync_toolbar(a);
     // Paint complete rows and scrollbars only after all pane bounds are final.
     // During a drag, queued mouse moves must not delay the child paints.
-    RedrawWindow(a.window, nullptr, nullptr,
-                 RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN |
-                     (a.resizing_sidebar ? RDW_UPDATENOW : 0));
+    RECT redraw = r;
+    if (a.resizing_sidebar) {
+        redraw.top = top;
+        redraw.bottom = std::max(top, int(r.bottom) - px(a, 30));
+    }
+    RedrawWindow(a.window, &redraw, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+    if (live_resize(a)) {
+        // Finish the pane's client area and native scrollbars before the document paint.
+        // Do not invalidate again: each child should paint only once for this layout.
+        for (auto control : {a.bookmark_tree, a.sidebar, a.search_results, a.sidebar_tabs, a.results_summary})
+            if (IsWindowVisible(control))
+                RedrawWindow(control, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
+        RedrawWindow(a.window, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+}
+static void resize_layout(App& a) {
+    const double previous_scale = a.scale;
+    // Fit the cached page before painting. Only PDF rasterization waits for the timer.
+    update_scale(a);
+    if (a.scale != previous_scale) {
+        a.resize_render_pending = true;
+        SetTimer(a.window, 1, 120, nullptr);
+    }
+    layout(a);
+}
+static void finish_resize(App& a) {
+    KillTimer(a.window, 1);
+    if (a.resize_render_pending)
+        request_render(a);
+    // Restore filtered painting even when the PDF scale did not change.
+    RedrawWindow(a.window, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 static void set_sidebar_hover(App& a, int hover) {
     if (hover == a.sidebar_hover)
@@ -1836,6 +1906,14 @@ static std::wstring page_number(const App& a) {
 static std::wstring zoom_percent(const App& a) {
     return a.pages.empty() ? L"—" : std::to_wstring(int(std::lround(a.scale * 72 / a.dpi * 100))) + L"%";
 }
+static void sync_entry(HWND window, const std::wstring& value) {
+    if (GetFocus() == window)
+        return;
+    wchar_t current[32]{};
+    GetWindowTextW(window, current, int(std::size(current)));
+    if (value != current)
+        SetWindowTextW(window, value.c_str());
+}
 static void sync_toolbar(App& a) {
     if (!a.toolbar)
         return;
@@ -1846,29 +1924,30 @@ static void sync_toolbar(App& a) {
             enabled = loaded && a.page > 0;
         if (tool.command == cmd_next)
             enabled = loaded && a.page + 1 < int(a.pages.size());
-        SendMessageW(a.toolbar, TB_ENABLEBUTTON, WPARAM(tool.command), MAKELPARAM(enabled, 0));
+        if ((SendMessageW(a.toolbar, TB_ISBUTTONENABLED, WPARAM(tool.command), 0) != 0) != enabled)
+            SendMessageW(a.toolbar, TB_ENABLEBUTTON, WPARAM(tool.command), MAKELPARAM(enabled, 0));
     }
     for (auto [id, checked] :
          {std::pair{cmd_fit, loaded && a.fit == Fit::page},
           {cmd_width, loaded && a.fit == Fit::width},
           {cmd_search, loaded && a.find_open},
           {cmd_sidebar, loaded && a.show_sidebar && !results_visible(a) && !a.bookmarks},
-          {cmd_bookmarks, loaded && a.show_sidebar && !results_visible(a) && a.bookmarks}})
-        SendMessageW(a.toolbar, TB_CHECKBUTTON, WPARAM(id), MAKELPARAM(checked, 0));
-    EnableWindow(a.page_edit, loaded);
-    EnableWindow(a.zoom_edit, loaded);
-    if (GetFocus() != a.page_edit)
-        SetWindowTextW(a.page_edit, page_number(a).c_str());
-    if (GetFocus() != a.zoom_edit)
-        SetWindowTextW(a.zoom_edit, zoom_percent(a).c_str());
-    InvalidateRect(a.toolbar, nullptr, FALSE);
+          {cmd_bookmarks, loaded && a.show_sidebar && !results_visible(a) && a.bookmarks}}) {
+        if ((SendMessageW(a.toolbar, TB_ISBUTTONCHECKED, WPARAM(id), 0) != 0) != checked)
+            SendMessageW(a.toolbar, TB_CHECKBUTTON, WPARAM(id), MAKELPARAM(checked, 0));
+    }
+    for (auto control : {a.page_edit, a.zoom_edit})
+        if ((IsWindowEnabled(control) != FALSE) != loaded)
+            EnableWindow(control, loaded);
+    sync_entry(a.page_edit, page_number(a));
+    sync_entry(a.zoom_edit, zoom_percent(a));
 }
 
 static void layout_toolbar(App& a) {
     if (!a.toolbar)
         return;
     auto r = client(a);
-    MoveWindow(a.toolbar, 0, 0, r.right, px(a, toolbar_height), TRUE);
+    position_control(a.toolbar, 0, 0, r.right, px(a, toolbar_height));
     SendMessageW(a.toolbar, TB_SETBITMAPSIZE, 0, MAKELPARAM(px(a, 16), px(a, 16)));
     SendMessageW(a.toolbar, TB_SETBUTTONSIZE, 0, MAKELPARAM(px(a, 28), px(a, toolbar_height)));
     SendMessageW(a.toolbar, TB_SETINDENT, px(a, 4), 0);
@@ -1900,8 +1979,8 @@ static void layout_toolbar(App& a) {
     SendMessageW(a.toolbar, TB_GETRECT, page_slot, LPARAM(&page));
     SendMessageW(a.toolbar, TB_GETRECT, zoom_slot, LPARAM(&zoom));
     // Edit controls are toolbar children, so the native control clips and paints them correctly.
-    MoveWindow(a.page_edit, page.left + px(a, 5), px(a, 9), px(a, 42), px(a, 18), TRUE);
-    MoveWindow(a.zoom_edit, zoom.left + px(a, 5), px(a, 9), px(a, 50), px(a, 18), TRUE);
+    position_control(a.page_edit, page.left + px(a, 5), px(a, 9), px(a, 42), px(a, 18));
+    position_control(a.zoom_edit, zoom.left + px(a, 5), px(a, 9), px(a, 50), px(a, 18));
 }
 
 static void paint_toolbar_button(App& a, HDC dc, RECT rect, int id, UINT state) {
@@ -1947,8 +2026,9 @@ static void paint_sidebar_item(App& a, HDC dc, RECT rect, int index, bool select
     COLORREF fill = selected                   ? a.search_colors.pressed
                     : index == a.sidebar_hover ? a.search_colors.hover
                                                : a.search_colors.footer;
-    ui::control(a.painter, dc, row, a.dpi, a.search_colors.footer, fill, a.search_colors.accent,
-                focused ? 2 : 0);
+    if (selected || index == a.sidebar_hover || focused)
+        ui::control(a.painter, dc, row, a.dpi, a.search_colors.footer, fill, a.search_colors.accent,
+                    focused ? 2 : 0);
     rect.left = row.left + px(a, 10);
     rect.right = row.right - px(a, 10);
     std::wstring text = L"Page " + std::to_wstring(index + 1);
@@ -1974,9 +2054,10 @@ static LRESULT paint_bookmark(App& a, NMTVCUSTOMDRAW& draw) {
     InflateRect(&row, -px(a, 8), -px(a, 2));
     bool selected = TreeView_GetSelection(a.bookmark_tree) == item;
     bool focused = selected && GetFocus() == a.bookmark_tree;
-    ui::control(a.painter, dc, row, a.dpi, a.search_colors.footer,
-                selected ? a.search_colors.pressed : a.search_colors.footer, a.search_colors.accent,
-                focused ? 2 : 0);
+    // The row background is already filled. Only a selected row needs a rounded shape.
+    if (selected)
+        ui::control(a.painter, dc, row, a.dpi, a.search_colors.footer, a.search_colors.pressed,
+                    a.search_colors.accent, focused ? 2 : 0);
     if (TreeView_GetChild(a.bookmark_tree, item)) {
         int x = text.left - px(a, 10), y = (text.top + text.bottom) / 2, d = px(a, 3);
         bool expanded = (TreeView_GetItemState(a.bookmark_tree, item, TVIS_EXPANDED) & TVIS_EXPANDED) != 0;
@@ -2006,6 +2087,9 @@ static LRESULT paint_bookmark(App& a, NMTVCUSTOMDRAW& draw) {
 
 static void paint_toolbar(App& a, HDC dc) {
     auto r = client(a);
+    const RECT bounds{0, 0, r.right, px(a, toolbar_height)};
+    if (!RectVisible(dc, &bounds))
+        return;
     fill_rect(dc, {0, 0, r.right, px(a, toolbar_height)}, a.search_colors.footer);
     fill_rect(dc, {0, px(a, toolbar_height) - 1, r.right, px(a, toolbar_height)}, a.search_colors.border);
     int hot = int(SendMessageW(a.toolbar, TB_GETHOTITEM, 0, 0));
@@ -2096,6 +2180,57 @@ static void highlight(HDC dc, RECT rect, uint32_t color) {
     DeleteDC(memory);
     DeleteObject(bitmap);
 }
+static std::vector<ui::PageMark> page_marks(App& a) {
+    std::vector<ui::PageMark> marks;
+    if (!a.bitmap)
+        return marks;
+    for (size_t i = 0; i < a.bitmap->text.size(); ++i)
+        if (a.selected_all || std::find(a.selected.begin(), a.selected.end(), i) != a.selected.end())
+            marks.push_back({span_rect(a, a.bitmap->text[i].bounds), 0x5010224b});
+    if (a.find_open) {
+        const auto batch = search_result_page(a.matches, a.page);
+        for (size_t i = 0; batch && i < batch->matches.size(); ++i) {
+            const bool active = int(batch->first + i) == a.active_match;
+            for (const auto& bounds : search_rects(*a.bitmap, batch->matches[i])) {
+                const auto rect = span_rect(a, bounds);
+                marks.push_back({rect, active ? 0x60605000u : 0x40403800u});
+                if (active) {
+                    const int stroke = std::max(1, px(a, 2));
+                    RECT inner = rect;
+                    InflateRect(&inner, px(a, 1) - 1, px(a, 1) - 1);
+                    const auto c = a.search_colors.accent;
+                    const uint32_t color = 0xff000000u | (uint32_t(GetRValue(c)) << 16) |
+                                           (uint32_t(GetGValue(c)) << 8) | GetBValue(c);
+                    const LONG left = inner.left - stroke, right = inner.right + stroke;
+                    marks.push_back({{left, inner.top - stroke, right, inner.top}, color});
+                    marks.push_back({{left, inner.bottom, right, inner.bottom + stroke}, color});
+                    marks.push_back({{left, inner.top, inner.left, inner.bottom}, color});
+                    marks.push_back({{inner.right, inner.top, right, inner.bottom}, color});
+                }
+            }
+        }
+    }
+    return marks;
+}
+static bool paint_gpu_page(App& a, const RECT& dirty) {
+    if (!a.bitmap || a.pages.empty() || IsIconic(a.window) || !IsWindowVisible(a.window)) {
+        ui::hide_page_view(a.page_view);
+        return false;
+    }
+    const auto vp = viewport(a);
+    RECT intersection{};
+    if (a.page_view.visible && a.page_view.source == a.bitmap && EqualRect(&vp, &a.page_view.bounds) &&
+        !IntersectRect(&intersection, &dirty, &vp))
+        return true;
+    const auto marks = page_marks(a);
+    const ui::PageFrame frame{
+        vp, page_rect(a), {px(a, 3), px(a, 5)}, a.search_colors.field, a.search_colors.border, marks};
+    const bool was_visible = a.page_view.visible;
+    const bool presented = ui::present_page_view(a.page_view, a.window, a.bitmap, frame);
+    if (was_visible && !presented)
+        InvalidateRect(a.window, &vp, FALSE);
+    return presented;
+}
 static void paint_app(App& a, HDC dc) {
     auto r = client(a);
     auto vp = viewport(a);
@@ -2115,73 +2250,58 @@ static void paint_app(App& a, HDC dc) {
     }
     int saved = SaveDC(dc);
     IntersectClipRect(dc, vp.left, vp.top, vp.right, vp.bottom);
-    if (a.pages.empty()) {
-        int center = (vp.top + vp.bottom) / 2;
-        constexpr std::wstring_view prompt = L"Drop a PDF here, or press Ctrl+O to open one.";
-        RECT heading{vp.left + px(a, 40), 0, vp.right - px(a, 40), 0};
-        auto old_font = SelectObject(dc, a.title_font);
-        DrawTextW(dc, prompt.data(), int(prompt.size()), &heading, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
-        SelectObject(dc, old_font);
-        // Keep the original headline's center, allowing the prompt to wrap in narrow windows.
-        int height = heading.bottom - heading.top;
-        heading.left = vp.left + px(a, 40);
-        heading.right = vp.right - px(a, 40);
-        heading.top = center - px(a, 67) - height / 2;
-        heading.bottom = heading.top + height;
-        label(dc, heading, prompt, a.search_colors.text, a.title_font, DT_CENTER | DT_WORDBREAK);
-    } else {
-        RECT page = page_rect(a);
-        RECT shadow = page;
-        OffsetRect(&shadow, px(a, 3), px(a, 5));
-        fill_rect(dc, shadow, a.search_colors.border);
-        fill_rect(dc, page, RGB(255, 255, 255));
-        if (a.bitmap) {
-            BITMAPINFO bmi{};
-            bmi.bmiHeader = {sizeof(BITMAPINFOHEADER),
-                             LONG(a.bitmap->width),
-                             -LONG(a.bitmap->height),
-                             1,
-                             32,
-                             BI_RGB,
-                             0,
-                             0,
-                             0,
-                             0,
-                             0};
-            SetStretchBltMode(dc, HALFTONE);
-            SetBrushOrgEx(dc, 0, 0, nullptr);
-            StretchDIBits(dc, page.left, page.top, page.right - page.left, page.bottom - page.top, 0, 0,
-                          int(a.bitmap->width), int(a.bitmap->height), a.bitmap->pixels.data(), &bmi,
-                          DIB_RGB_COLORS, SRCCOPY);
-            for (size_t i = 0; i < a.bitmap->text.size(); ++i) {
-                auto& span = a.bitmap->text[i];
-                bool selected =
-                    a.selected_all || std::find(a.selected.begin(), a.selected.end(), i) != a.selected.end();
-                if (selected)
-                    highlight(dc, span_rect(a, span.bounds), 0x5010224b);
-            }
-            if (a.find_open) {
-                const auto batch = search_result_page(a.matches, a.page);
-                for (size_t i = 0; batch && i < batch->matches.size(); ++i) {
-                    const bool active = int(batch->first + i) == a.active_match;
-                    for (const auto& bounds : search_rects(*a.bitmap, batch->matches[i])) {
-                        auto rect = span_rect(a, bounds);
-                        highlight(dc, rect, active ? 0x60605000 : 0x40403800);
-                        if (active) {
-                            InflateRect(&rect, px(a, 1), px(a, 1));
-                            HBRUSH brush = CreateSolidBrush(a.search_colors.accent);
-                            for (int stroke = 0; stroke < std::max(1, px(a, 2)); ++stroke) {
-                                FrameRect(dc, &rect, brush);
-                                InflateRect(&rect, 1, 1);
-                            }
-                            DeleteObject(brush);
-                        }
-                    }
-                }
-            }
-        } else
-            label(dc, page, L"Rendering…", a.search_colors.muted, a.font,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (RectVisible(dc, &vp)) {
+        if (a.pages.empty()) {
+            int center = (vp.top + vp.bottom) / 2;
+            constexpr std::wstring_view prompt = L"Drop a PDF here, or press Ctrl+O to open one.";
+            RECT heading{vp.left + px(a, 40), 0, vp.right - px(a, 40), 0};
+            auto old_font = SelectObject(dc, a.title_font);
+            DrawTextW(dc, prompt.data(), int(prompt.size()), &heading,
+                      DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
+            SelectObject(dc, old_font);
+            // Keep the original headline's center, allowing the prompt to wrap in narrow windows.
+            int height = heading.bottom - heading.top;
+            heading.left = vp.left + px(a, 40);
+            heading.right = vp.right - px(a, 40);
+            heading.top = center - px(a, 67) - height / 2;
+            heading.bottom = heading.top + height;
+            label(dc, heading, prompt, a.search_colors.text, a.title_font, DT_CENTER | DT_WORDBREAK);
+        } else {
+            RECT page = page_rect(a);
+            RECT shadow = page;
+            OffsetRect(&shadow, px(a, 3), px(a, 5));
+            fill_rect(dc, shadow, a.search_colors.border);
+            fill_rect(dc, page, RGB(255, 255, 255));
+            if (a.bitmap) {
+                BITMAPINFO bmi{};
+                bmi.bmiHeader = {sizeof(BITMAPINFOHEADER),
+                                 LONG(a.bitmap->width),
+                                 -LONG(a.bitmap->height),
+                                 1,
+                                 32,
+                                 BI_RGB,
+                                 0,
+                                 0,
+                                 0,
+                                 0,
+                                 0};
+                // A filtered full-page resample can exceed a frame budget on the UI thread.
+                // Use the cached raster for immediate feedback; restore filtering on release.
+                SetStretchBltMode(dc, live_resize(a) ? COLORONCOLOR : HALFTONE);
+                SetBrushOrgEx(dc, 0, 0, nullptr);
+                StretchDIBits(dc, page.left, page.top, page.right - page.left, page.bottom - page.top, 0, 0,
+                              int(a.bitmap->width), int(a.bitmap->height), a.bitmap->pixels.data(), &bmi,
+                              DIB_RGB_COLORS, SRCCOPY);
+                for (const auto& mark : page_marks(a))
+                    if ((mark.color >> 24) == 255)
+                        fill_rect(dc, mark.bounds,
+                                  RGB((mark.color >> 16) & 255, (mark.color >> 8) & 255, mark.color & 255));
+                    else
+                        highlight(dc, mark.bounds, mark.color);
+            } else
+                label(dc, page, L"Rendering…", a.search_colors.muted, a.font,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
     }
     RestoreDC(dc, saved);
     RECT status{0, r.bottom - px(a, 30), r.right, r.bottom};
@@ -2194,6 +2314,43 @@ static void paint_app(App& a, HDC dc) {
         label(dc, {r.right - px(a, 240), status.top, r.right - px(a, 14), status.bottom}, details,
               a.search_colors.muted, a.small_font, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     }
+}
+static void paint_window(App& a, HDC dc, const RECT& dirty) {
+    if (IsRectEmpty(&dirty))
+        return;
+    const auto r = client(a);
+    // Memory-DC captures and printing retain the complete CPU paint path.
+    const bool gpu = WindowFromDC(dc) == a.window && paint_gpu_page(a, dirty);
+    const auto vp = viewport(a);
+    const int saved_dc = SaveDC(dc);
+    if (gpu)
+        ExcludeClipRect(dc, vp.left, vp.top, vp.right, vp.bottom);
+    // Grow in blocks, so dragging an edge does not allocate a new bitmap for every pixel.
+    const int width = (std::max(1L, r.right) + 127) / 128 * 128;
+    const int height = (std::max(1L, r.bottom) + 127) / 128 * 128;
+    if (!ui::prepare(a.frame, dc, width, height)) {
+        paint_app(a, dc);
+        RestoreDC(dc, saved_dc);
+        return;
+    }
+    const int saved = SaveDC(a.frame.dc);
+    IntersectClipRect(a.frame.dc, dirty.left, dirty.top, dirty.right, dirty.bottom);
+    if (gpu)
+        ExcludeClipRect(a.frame.dc, vp.left, vp.top, vp.right, vp.bottom);
+    // A memory DC does not inherit WS_CLIPCHILDREN from the paint DC.
+    for (auto child = GetWindow(a.window, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        if (!(GetWindowLongPtrW(child, GWL_STYLE) & WS_VISIBLE))
+            continue;
+        RECT bounds{};
+        GetWindowRect(child, &bounds);
+        MapWindowPoints(nullptr, a.window, reinterpret_cast<POINT*>(&bounds), 2);
+        ExcludeClipRect(a.frame.dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
+    }
+    paint_app(a, a.frame.dc);
+    BitBlt(dc, dirty.left, dirty.top, dirty.right - dirty.left, dirty.bottom - dirty.top, a.frame.dc,
+           dirty.left, dirty.top, SRCCOPY);
+    RestoreDC(a.frame.dc, saved);
+    RestoreDC(dc, saved_dc);
 }
 static void screenshot(App& a) {
     auto r = client(a);
@@ -2883,25 +3040,26 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
         case WM_PAINT: {
             PAINTSTRUCT ps{};
             HDC dc = BeginPaint(window, &ps);
-            auto r = client(a);
-            HDC memory = CreateCompatibleDC(dc);
-            HBITMAP bitmap = CreateCompatibleBitmap(dc, std::max(1L, r.right), std::max(1L, r.bottom));
-            auto old = SelectObject(memory, bitmap);
-            paint_app(a, memory);
-            BitBlt(dc, 0, 0, r.right, r.bottom, memory, 0, 0, SRCCOPY);
-            SelectObject(memory, old);
-            DeleteObject(bitmap);
-            DeleteDC(memory);
+            paint_window(a, dc, ps.rcPaint);
             EndPaint(window, &ps);
             return 0;
         }
         case WM_SIZE:
             if (wp != SIZE_MINIMIZED) {
-                layout(a);
-                if (!a.pages.empty())
-                    SetTimer(window, 1, 120, nullptr);
-                InvalidateRect(window, nullptr, FALSE);
+                resize_layout(a);
             }
+            return 0;
+        case WM_DISPLAYCHANGE:
+            // Reconnect to the graphics device after a display/session change.
+            ui::close_page_view(a.page_view);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        case WM_ENTERSIZEMOVE:
+            a.resizing_window = true;
+            return 0;
+        case WM_EXITSIZEMOVE:
+            a.resizing_window = false;
+            finish_resize(a);
             return 0;
         case WM_TIMER:
             if (wp == 4)
@@ -2912,7 +3070,8 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                 poll_update(a);
             else if (wp == 1) {
                 KillTimer(window, 1);
-                request_render(a);
+                if (a.resize_render_pending)
+                    request_render(a);
             }
             return 0;
         case WM_DPICHANGED: {
@@ -3165,8 +3324,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                 const int units = MulDiv(width, 96, int(a.dpi));
                 if (units != a.sidebar_width) {
                     a.sidebar_width = units;
-                    layout(a);
-                    SetTimer(window, 1, 120, nullptr);
+                    resize_layout(a);
                 }
                 SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                 return 0;
@@ -3200,9 +3358,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             if (a.resizing_sidebar) {
                 a.resizing_sidebar = false;
                 ReleaseCapture();
-                KillTimer(window, 1);
-                request_render(a);
-                InvalidateRect(window, nullptr, FALSE);
+                finish_resize(a);
                 return 0;
             }
             if (a.dragging) {
@@ -3225,7 +3381,10 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             return 0;
         case WM_CAPTURECHANGED:
             a.dragging = a.panning = false;
-            a.resizing_sidebar = false;
+            if (a.resizing_sidebar) {
+                a.resizing_sidebar = false;
+                finish_resize(a);
+            }
             InvalidateRect(window, nullptr, FALSE);
             return 0;
         case WM_SETCURSOR:
@@ -3332,6 +3491,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             DestroyWindow(window);
             return 0;
         case WM_DESTROY:
+            ui::close_page_view(a.page_view);
             cancel_search(a.search_worker);
             clear_search_results(a);
             stop_search_worker(a.search_worker);
@@ -3353,6 +3513,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
                 if (icon)
                     DestroyIcon(icon);
             ui::close(a.painter);
+            ui::close(a.frame);
             PostQuitMessage(a.exit_code);
             return 0;
         }

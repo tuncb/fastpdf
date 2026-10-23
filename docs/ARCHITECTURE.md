@@ -21,6 +21,7 @@ Initialization and cleanup are free functions: `open` / `close`, `init_renderer`
 - `images.cpp`: PDF image samples, color spaces, masks, JPEG/CCITT integration and PNG output.
 - `render.cpp`: PDF graphics state and operators, paths, text, forms, tiling patterns, shading types 1–7, blending/soft masks, stored annotation appearances and basic generated widget appearances.
 - `app.cpp`: native reader, toolbar/sidebar, worker queue, input, selection/search, export and print.
+- `page_view.cpp`: GUI-thread GPU page texture, high-quality scaling and DirectComposition presentation.
 - `cli.cpp`: inspect/render/extract/benchmark tool used by integration checks.
 
 ## Performance decisions
@@ -39,7 +40,25 @@ The coefficient decoder maintains neighbor significance/sign flags in a padded g
 
 GUI rendered-page caching has a 192 MiB budget. Decoded images use a 128 MiB LRU budget including reserved pyramid overhead; individual cached images are limited to 64 MiB. A finer cached image can satisfy a lower-resolution request, and upgrades replace their accounting. Eviction preserves in-flight shared images. API clients can configure `Renderer::image_cache_limit`. Function samples have a 64 MiB cache. Large images can still render without being cached. The GUI prefetches two pages in the navigation direction and one behind, only while no interactive work is waiting.
 
-This implementation uses a software Direct2D surface for predictable offscreen rendering, export, print and testing. It does not yet use display-list replay, GPU presentation, parallel PDF-page rasterization or a persistent document-wide text index. Parallel JPEG 2000 tiles are codec work, not parallel PDF rendering.
+The PDF engine uses a software Direct2D surface for predictable offscreen rendering, export, print and testing. The reader presents its completed page raster through a separate hardware Direct2D device. It does not yet use display-list replay, parallel PDF-page rasterization or a persistent document-wide text index. Parallel JPEG 2000 tiles are codec work, not parallel PDF rendering.
+
+## Resizing the reader
+
+Window and sidebar resizing update the page scale, scroll ranges, and control positions before painting. The current page bitmap stays visible at the new size. A 120 ms idle timer delays only the PDF render. Releasing the mouse, leaving the native resize loop, or losing splitter capture starts any pending render. A resize at a fixed zoom does not need another PDF render.
+
+Windows enters a [modal loop during native move and size operations](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-entersizemove). [Timer messages have low priority](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-timer). Thus, the timer must not control the visible page geometry. During a drag, `RedrawWindow` with `RDW_UPDATENOW` paints the updated parent and child windows before returning. This also prevents queued mouse input from delaying the sidebar paint.
+
+The reader uploads the current immutable page bitmap once to a hardware Direct2D device. All resampling uses `D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC`, during and after the drag. A matching-size draw copies the original pixels. The worker supplies a fresh raster if the scale changed. The PDF renderer and its quality settings do not change.
+
+`PageView` owns the GPU resources on the GUI thread. A DirectComposition surface sits above the parent window's GDI content and below its native child controls. Surface contents, viewport offset and clipping are submitted in one composition commit. The surface grows in 128-pixel blocks and remains allocated when the viewport shrinks. The page stays on the GPU; normal painting does not copy it back to the CPU or wait for a GPU completion fence. Selection and search use the same rectangle list for GPU and GDI painting, including the active match outline and DPI spacing. Mouse and keyboard handling stay on the parent window.
+
+If hardware setup, upload or presentation fails, the reader removes the GPU visual and paints through GDI. That fallback retains the fast `COLORONCOLOR` resize preview and settled `HALFTONE` filter. It waits at least five seconds before another GPU attempt on a subsequent paint. A display change releases the device and permits an immediate retry. The current CPU raster remains available throughout recovery. Memory-DC screenshots and printing continue to use the CPU path.
+
+Pane and toolbar movement suppress intermediate paints. Unchanged control bounds, visibility, toolbar states, and entry text are left in place. A splitter drag skips the toolbar layout and updates the find-bar layout only if its height changes. The window paint buffer grows in 128-pixel blocks and is reused when the window shrinks. Painting clips to the dirty rectangle and excludes child windows. A status-only update therefore does not scale the PDF again.
+
+Sidebar rows fill their background once. Only selected, hovered, or focused rows draw a rounded highlight; plain rows do not create and filter an invisible shape. During live resize, the sidebar client area and its native scrollbars paint before the PDF. The layout invalidates once, then completes the pending child paints before painting the parent. This avoids a second sidebar paint and reduces the delay before the selection and scrollbar reach their new positions.
+
+`sidebar_resize_tests` checks live fit-page and fit-width geometry without dispatching timers, fixed-zoom behavior, capture loss, stale timers, dirty-area painting, buffer reuse, bookmark state, selection width, scrollbar placement, and scrollbar themes at 100%, 150%, and 200% scale. `page_view_tests` reads actual GPU output to check original pixels at 1:1 scale, filtered reduction, clipping, theme backgrounds and selection/search overlays. It also checks live pane bounds, texture/surface reuse, CPU fallback, graphics resource recovery and document unload. GPU checks can be skipped when Windows reports that hardware presentation is unavailable. These are functional checks. They do not measure compositor frame delivery or set a hardware-dependent frame-time limit. A paint benchmark must show the test window to include native child-window paints; a hidden window can measure the parent paint in isolation but misses this sidebar cost.
 
 ## Measuring rendering
 

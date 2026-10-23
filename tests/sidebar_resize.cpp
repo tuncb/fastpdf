@@ -27,8 +27,8 @@ static void check_bookmark_frame(App& app) {
     const std::vector<uint32_t> painted(data, data + count);
     const int row_height = TreeView_GetItemHeight(app.bookmark_tree);
     const auto color = app.search_colors.footer;
-    const uint32_t background = (uint32_t(GetRValue(color)) << 16) |
-                                (uint32_t(GetGValue(color)) << 8) | GetBValue(color);
+    const uint32_t background =
+        (uint32_t(GetRValue(color)) << 16) | (uint32_t(GetGValue(color)) << 8) | GetBValue(color);
     bool rows_visible = true;
     // Check unselected rows so a selection fill cannot mask missing text.
     for (int row = 1; row < 6; ++row) {
@@ -39,6 +39,16 @@ static void check_bookmark_frame(App& app) {
                     ++ink;
         rows_visible = rows_visible && ink > 20;
     }
+    RECT selected{};
+    check(TreeView_GetItemRect(app.bookmark_tree, TreeView_GetSelection(app.bookmark_tree), &selected, TRUE),
+          "Cannot locate the selected bookmark row");
+    const int selected_y = (selected.top + selected.bottom) / 2;
+    const auto selected_color = app.search_colors.pressed;
+    const uint32_t selection = (uint32_t(GetRValue(selected_color)) << 16) |
+                               (uint32_t(GetGValue(selected_color)) << 8) | GetBValue(selected_color);
+    const bool selection_fits =
+        (painted[size_t(selected_y) * width + width - px(app, 10)] & 0xffffff) == selection &&
+        (painted[size_t(selected_y) * width + width - px(app, 4)] & 0xffffff) == background;
     // A resize can erase the background before the next paint is dispatched.
     // The current rows must survive that interval instead of becoming blank.
     SendMessageW(app.bookmark_tree, WM_ERASEBKGND, WPARAM(dc), 0);
@@ -48,6 +58,7 @@ static void check_bookmark_frame(App& app) {
     DeleteObject(bitmap);
     DeleteDC(dc);
     check(rows_visible, "Bookmark rows are blank after resizing");
+    check(selection_fits, "Bookmark selection does not reach the current pane edge with its margin");
     check(preserved, "Resize erased the bookmark rows before repainting");
 }
 
@@ -128,10 +139,152 @@ static void check_document_fit(App& app) {
     check(app.scale == scale, "Fit width changes scale on repeated layout");
     app.fit = Fit::custom;
     app.scale = 4;
+    app.zoom = app.scale * 72 / app.dpi;
     update_scroll(app);
     check(visible(app.document_hscroll) && visible(app.document_vscroll),
           "Zoom did not show both document scrollbars");
     check_document_scrollbars(app);
+}
+
+static void check_fitted_page(App& app) {
+    const auto page = page_rect(app), vp = viewport(app);
+    const int margin = px(app, 24);
+    check(page.left >= vp.left + margin && page.right <= vp.right - margin,
+          "Page width did not fit the current pane before the render timer");
+    if (app.fit == Fit::page)
+        check(page.top >= vp.top + margin && page.bottom <= vp.bottom - margin,
+              "Page height did not fit the current window before the render timer");
+    else
+        // Near the height limit, reserving the vertical bar can make the shorter page fit without it.
+        check(vp.right - vp.left - 2 * margin - (page.right - page.left) <=
+                  GetSystemMetricsForDpi(SM_CXVSCROLL, app.dpi) + 1,
+              "Fit width did not fill the current pane before the render timer");
+    wchar_t zoom[32]{};
+    GetWindowTextW(app.zoom_edit, zoom, int(std::size(zoom)));
+    check(zoom == zoom_percent(app), "Zoom entry is stale during resize");
+}
+
+static void check_live_resize(App& app) {
+    app.sidebar_width = 260;
+    for (auto fit : {Fit::page, Fit::width}) {
+        app.fit = fit;
+        MoveWindow(app.window, 0, 0, px(app, 1100), px(app, 700), FALSE);
+        request_render(app);
+        const auto ticket = app.render_ticket;
+        const double initial_scale = app.scale;
+        SendMessageW(app.window, WM_ENTERSIZEMOVE, 0, 0);
+        check(app.resizing_window, "Native resize loop did not enable the fast preview");
+        for (int width : {700, 1000, 800, 1100}) {
+            MoveWindow(app.window, 0, 0, px(app, width), px(app, 700), FALSE);
+            check_fitted_page(app);
+            if (width == 700)
+                check(app.scale < initial_scale, "Native resize kept the old page scale");
+            check(app.render_ticket == ticket, "Native resize started a render on each size message");
+        }
+        check(app.resize_render_pending, "Native resize did not schedule the final render");
+        SendMessageW(app.window, WM_EXITSIZEMOVE, 0, 0);
+        check(!live_resize(app) && !app.resize_render_pending && app.render_ticket == ticket + 1,
+              "Native resize did not finish with one full-quality render");
+        const auto final_ticket = app.render_ticket;
+        SendMessageW(app.window, WM_TIMER, 1, 0);
+        check(app.render_ticket == final_ticket, "A stale resize timer started a duplicate render");
+        SendMessageW(app.window, WM_ENTERSIZEMOVE, 0, 0);
+        SendMessageW(app.window, WM_EXITSIZEMOVE, 0, 0);
+        check(app.render_ticket == final_ticket, "Moving the window started an unnecessary PDF render");
+    }
+
+    for (bool lose_capture : {false, true}) {
+        app.fit = Fit::width;
+        app.sidebar_width = 260;
+        layout(app);
+        request_render(app);
+        const auto ticket = app.render_ticket;
+        const auto splitter = sidebar_splitter(app);
+        const int y = splitter.top + px(app, 100);
+        SendMessageW(app.window, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(splitter.left + px(app, 2), y));
+        double previous_scale = app.scale;
+        int previous_width = app.sidebar_width;
+        for (int width : {460, 180, 600, 320}) {
+            SendMessageW(app.window, WM_MOUSEMOVE, MK_LBUTTON,
+                         MAKELPARAM(px(app, width) - app.splitter_offset, y));
+            check_fitted_page(app);
+            check(width > previous_width ? app.scale < previous_scale : app.scale > previous_scale,
+                  "Splitter preview did not track the current width");
+            check(app.render_ticket == ticket, "Splitter started a render on each mouse move");
+            previous_scale = app.scale;
+            previous_width = width;
+        }
+        if (lose_capture)
+            ReleaseCapture();
+        else
+            SendMessageW(app.window, WM_LBUTTONUP, 0, 0);
+        check(!live_resize(app) && !app.resize_render_pending && app.render_ticket == ticket + 1,
+              "Splitter release or capture loss did not finish the render");
+        SendMessageW(app.window, WM_TIMER, 1, 0);
+        check(app.render_ticket == ticket + 1, "Splitter left a duplicate render timer");
+    }
+
+    app.fit = Fit::custom;
+    app.zoom = 2;
+    request_render(app);
+    const auto ticket = app.render_ticket;
+    const auto scale = app.scale;
+    SendMessageW(app.window, WM_ENTERSIZEMOVE, 0, 0);
+    MoveWindow(app.window, 0, 0, px(app, 900), px(app, 650), FALSE);
+    SendMessageW(app.window, WM_EXITSIZEMOVE, 0, 0);
+    const auto splitter = sidebar_splitter(app);
+    SendMessageW(app.window, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM(splitter.left + px(app, 2), splitter.top + px(app, 100)));
+    // Search progress can change the find-bar height while the splitter still has capture.
+    app.find_open = true;
+    app.show_find_status = true;
+    layout(app);
+    RECT find_bounds{};
+    GetClientRect(app.find_bar, &find_bounds);
+    check(find_bounds.bottom == find_height(app) && (GetWindowLongPtrW(app.find_bar, GWL_STYLE) & WS_VISIBLE),
+          "Splitter drag blocked a find-bar layout change");
+    app.find_open = app.show_find_status = false;
+    layout(app);
+    SendMessageW(app.window, WM_MOUSEMOVE, MK_LBUTTON,
+                 MAKELPARAM(px(app, 460) - app.splitter_offset, splitter.top + px(app, 100)));
+    SendMessageW(app.window, WM_LBUTTONUP, 0, 0);
+    SendMessageW(app.window, WM_TIMER, 1, 0);
+    check(app.scale == scale && app.render_ticket == ticket && !app.resize_render_pending,
+          "Resize rerendered or rescaled a page at a fixed zoom");
+}
+
+static void check_paint_buffer(App& app) {
+    app.fit = Fit::page;
+    update_scale(app);
+    layout(app);
+    app.bitmap = std::make_shared<RenderedPage>();
+    app.bitmap->width = app.bitmap->height = 16;
+    app.bitmap->pixels.assign(16 * 16 * 4, 255);
+    const auto bounds = client(app), page = page_rect(app);
+    const int x = (page.left + page.right) / 2, y = (page.top + page.bottom) / 2;
+    HDC dc = GetDC(app.window);
+    ui::Painter surface;
+    check(ui::prepare(surface, dc, bounds.right, bounds.bottom), "Cannot create paint test surface");
+    paint_window(app, surface.dc, bounds);
+    const auto buffer = app.frame.bitmap;
+    const auto before = GetPixel(app.frame.dc, x, y);
+    check(before == RGB(255, 255, 255), "Buffered paint did not draw the cached PDF");
+    std::fill(app.bitmap->pixels.begin(), app.bitmap->pixels.end(), uint8_t(0));
+    const RECT status{0, bounds.bottom - px(app, 30), bounds.right, bounds.bottom};
+    paint_window(app, surface.dc, status);
+    check(GetPixel(app.frame.dc, x, y) == before, "Status update repainted the PDF outside the dirty area");
+    paint_window(app, surface.dc, bounds);
+    check(GetPixel(app.frame.dc, x, y) == RGB(0, 0, 0), "Full repaint retained stale PDF pixels");
+    check(app.frame.bitmap == buffer, "Same-size paint allocated a new window buffer");
+    RECT smaller = bounds;
+    smaller.right -= px(app, 100);
+    smaller.bottom -= px(app, 100);
+    MoveWindow(app.window, 0, 0, smaller.right, smaller.bottom, FALSE);
+    paint_window(app, surface.dc, client(app));
+    check(app.frame.bitmap == buffer, "Shrinking the window allocated a new paint buffer");
+    ui::close(surface);
+    ReleaseDC(app.window, dc);
+    app.bitmap.reset();
 }
 
 int main() {
@@ -142,8 +295,8 @@ int main() {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         ui::enable_system_dialog_theme();
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES |
-                                                           ICC_TREEVIEW_CLASSES | ICC_TAB_CLASSES |
-                                                           ICC_LISTVIEW_CLASSES};
+                                                            ICC_TREEVIEW_CLASSES | ICC_TAB_CLASSES |
+                                                            ICC_LISTVIEW_CLASSES};
         check(InitCommonControlsEx(&controls) != FALSE, "Cannot initialize controls");
         WNDCLASSW type{};
         type.lpfnWndProc = window_proc;
@@ -157,8 +310,9 @@ int main() {
         app.pages.resize(3);
         app.show_sidebar = true;
         for (int i = 0; i < 40; ++i)
-            app.outline.push_back({L"Section " + std::to_wstring(i + 1) +
-                                       L" - A long bookmark title for the resize check", 0, 0});
+            app.outline.push_back(
+                {L"Section " + std::to_wstring(i + 1) + L" - A long bookmark title for the resize check", 0,
+                 0});
         rebuild_bookmarks(app);
         update_sidebar(app);
         app.scale = 4;
@@ -199,6 +353,10 @@ int main() {
                 check(tree.right - tree.left == px(app, width) - px(app, ui::splitter_width),
                       "Bookmark width did not follow the splitter");
                 check(tabs.bottom == tree.top, "Tabs and bookmarks no longer align");
+                SCROLLBARINFO scrollbar{sizeof(scrollbar)};
+                check(GetScrollBarInfo(app.bookmark_tree, OBJID_VSCROLL, &scrollbar) &&
+                          scrollbar.rcScrollBar.right == tree.right,
+                      "Bookmark scrollbar did not follow the current pane edge");
                 check(TreeView_GetFirstVisible(app.bookmark_tree) == first,
                       "Resize changed the bookmark scroll position");
                 check(TreeView_GetSelection(app.bookmark_tree) == selected,
@@ -207,9 +365,12 @@ int main() {
                 check_document_scrollbars(app);
             }
             SendMessageW(window, WM_LBUTTONUP, 0, MAKELPARAM(px(app, 317), y));
+            check_live_resize(app);
+            check_paint_buffer(app);
         }
         DestroyWindow(window);
-        std::puts("Reader UI: sidebar resize, PDF scrollbar themes and navigation, and DPI passed");
+        check(!app.frame.dc && !app.frame.bitmap, "Window destruction leaked the paint buffer");
+        std::puts("Reader UI: live resize, paint buffering, sidebar rows, PDF scrollbars, and DPI passed");
         return 0;
     } catch (const std::exception& error) {
         if (window)
