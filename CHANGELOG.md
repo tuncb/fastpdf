@@ -2,6 +2,13 @@
 
 Notable changes by release tag, newest first.
 
+## v0.4.0
+
+- Show surrounding text in search results and display each match in bold.
+- Make large search result lists available through Windows UI Automation.
+- Use GPU rendering to keep PDF pages responsive when resizing the window or sidebar.
+- Open PDFs with the standard Windows file picker.
+
 ## v0.3.0
 
 - Preview pages in the print dialog before printing.
