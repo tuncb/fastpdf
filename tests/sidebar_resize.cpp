@@ -287,6 +287,83 @@ static void check_paint_buffer(App& app) {
     app.bitmap.reset();
 }
 
+static void check_search_updates(App& app) {
+    app.find_open = app.show_results = true;
+    app.query = L"word";
+    app.search_complete = app.search_has_text = true;
+    append_search_results(app.matches, {{0, 0, L"word", {}}});
+    ListView_SetItemCountEx(app.search_results, 1, LVSICF_NOSCROLL);
+    app.active_match = 0;
+    sync_search(app);
+    layout(app);
+    update_scale(app);
+    const auto bounds = document_bounds(app);
+    const auto ticket = app.render_ticket;
+    const auto scale = app.scale;
+    const int height = app.find_layout_height;
+    const auto visible = [](HWND control) {
+        return (GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE) != 0;
+    };
+    const auto stable = [&] {
+        const auto current = document_bounds(app);
+        check(EqualRect(&bounds, &current) && app.find_layout_height == height,
+              "Editing a fast search moved the document pane");
+        check(app.render_ticket == ticket && app.scale == scale,
+              "Editing a fast search rerendered or rescaled the PDF");
+        check(!visible(GetDlgItem(app.find_bar, IDC_FIND_STATUS)) &&
+                  !visible(GetDlgItem(app.find_bar, IDC_FIND_STOP)),
+              "A fast search flashed the progress row");
+    };
+    // Exercise the edit notification, debounce, search start, and completion separately.
+    // The message loop does not run here, so worker timing cannot hide an intermediate resize.
+    for (const auto query : {L"wordzzz", L"word", L""}) {
+        SetWindowTextW(app.search, query);
+        stable();
+        SendMessageW(app.window, WM_TIMER, 3, 0);
+        stable();
+        cancel_search(app.search_worker);
+        app.search_running = false;
+        app.search_complete = app.search_has_text = true;
+        if (app.query == L"word") {
+            append_search_results(app.matches, {{0, 0, L"word", {}}});
+            ListView_SetItemCountEx(app.search_results, 1, LVSICF_NOSCROLL);
+            app.active_match = 0;
+        }
+        sync_search(app);
+        stable();
+        SendMessageW(app.window, WM_TIMER, search_progress_timer, 0);
+        stable();
+    }
+    // A new query must ignore an old timer event, but a slow search still needs Stop.
+    SetWindowTextW(app.search, L"slow search");
+    start_search(app);
+    app.search_progress_after = GetTickCount64() + 60'000;
+    SendMessageW(app.window, WM_TIMER, search_progress_timer, 0);
+    stable();
+    app.search_progress_after = 0;
+    SendMessageW(app.window, WM_TIMER, search_progress_timer, 0);
+    check(visible(GetDlgItem(app.find_bar, IDC_FIND_STATUS)) &&
+              visible(GetDlgItem(app.find_bar, IDC_FIND_STOP)) && app.find_layout_height > height,
+          "A slow search did not show progress and Stop");
+    SendMessageW(app.find_bar, WM_COMMAND, IDC_FIND_STOP, 0);
+    check(!app.search_running && app.search_stopped && visible(GetDlgItem(app.find_bar, IDC_FIND_STATUS)) &&
+              !visible(GetDlgItem(app.find_bar, IDC_FIND_STOP)),
+          "Stop did not preserve the search status");
+    SetWindowTextW(app.search, L"[");
+    start_search(app);
+    cancel_search(app.search_worker);
+    app.search_running = false;
+    app.search_failed = true;
+    app.search_notice = L"Invalid regex: missing closing bracket";
+    sync_search(app);
+    check(visible(GetDlgItem(app.find_bar, IDC_FIND_STATUS)), "Search errors were delayed");
+    SetWindowTextW(app.search, L"");
+    start_search(app);
+    command(app, cmd_search);
+    SendMessageW(app.window, WM_TIMER, search_progress_timer, 0);
+    check(!visible(app.find_bar), "A stale progress timer reopened Find");
+}
+
 int main() {
     App app;
     app.instance = GetModuleHandleW(nullptr);
@@ -367,10 +444,15 @@ int main() {
             SendMessageW(window, WM_LBUTTONUP, 0, MAKELPARAM(px(app, 317), y));
             check_live_resize(app);
             check_paint_buffer(app);
+            for (int width : {1100, 640}) {
+                MoveWindow(window, 0, 0, px(app, width), px(app, 700), FALSE);
+                check_search_updates(app);
+            }
         }
         DestroyWindow(window);
         check(!app.frame.dc && !app.frame.bitmap, "Window destruction leaked the paint buffer");
-        std::puts("Reader UI: live resize, paint buffering, sidebar rows, PDF scrollbars, and DPI passed");
+        std::puts("Reader UI: live resize, search updates, paint buffering, sidebar rows, PDF scrollbars, "
+                  "and DPI passed");
         return 0;
     } catch (const std::exception& error) {
         if (window)

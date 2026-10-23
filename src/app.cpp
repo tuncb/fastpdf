@@ -19,11 +19,14 @@
 #include <optional>
 #include "ui_style.h"
 #include "search.h"
+#include "search_accessibility.h"
 #include "page_view.h"
 
 using namespace pdf;
 constexpr UINT worker_message = WM_APP + 1;
 constexpr UINT search_message = WM_APP + 3;
+constexpr UINT_PTR search_progress_timer = 5;
+constexpr UINT search_progress_delay = 300;
 constexpr int id_sidebar = 200, id_toolbar = 202, id_page = 203, id_zoom = 204;
 constexpr int id_bookmark_tree = 205;
 constexpr int id_find_bar = 206, id_results = 207, id_sidebar_tabs = 208;
@@ -160,6 +163,7 @@ struct App {
     bool search_running = false, search_complete = false, search_has_text = false, search_failed = false;
     bool show_results = false, reveal_match = false, search_stopped = false;
     bool search_enter_pending = true, show_find_status = false;
+    ULONGLONG search_progress_after = 0;
     bool sidebar_before_find = false, bookmarks_before_find = true;
     int find_layout_height = 0, summary_layout_height = 0;
     std::wstring search_notice, search_summary;
@@ -223,9 +227,11 @@ static void fit_search_results(HWND window) {
 }
 static void clear_search_results(App& a) {
     KillTimer(a.window, 4);
+    KillTimer(a.window, search_progress_timer);
     a.syncing_results = true;
     a.active_match = -1;
-    ListView_SetItemCountEx(a.search_results, 0, LVSICF_NOSCROLL);
+    if (ListView_GetItemCount(a.search_results) != 0)
+        ListView_SetItemCountEx(a.search_results, 0, LVSICF_NOSCROLL);
     fit_search_results(a.search_results);
     a.syncing_results = false;
     retire_search_results(a.search_worker, a.matches);
@@ -682,6 +688,22 @@ static int search_summary_height(App& a) {
     ReleaseDC(a.window, dc);
     return std::max(px(a, 18), int(text.bottom)) + px(a, 16);
 }
+static void layout_search_results(App& a) {
+    const auto r = client(a);
+    const int sidebar_width = sidebar_splitter(a).left;
+    const int list_top = px(a, toolbar_height) + a.find_layout_height + a.sidebar_header_height;
+    a.summary_layout_height = search_summary_height(a);
+    position_control(a.results_summary, px(a, 12), list_top + px(a, 8),
+                     std::max(0, sidebar_width - px(a, 24)), a.summary_layout_height - px(a, 16));
+    show_control(a.results_summary, results_visible(a));
+    const int results_top = list_top + a.summary_layout_height;
+    position_control(a.search_results, 0, results_top, sidebar_width,
+                     std::max<LONG>(0, r.bottom - results_top - px(a, 30)));
+    if (!results_visible(a) && GetFocus() == a.search_results)
+        SetFocus(a.window);
+    show_control(a.search_results, results_visible(a));
+    fit_search_results(a.search_results);
+}
 static void layout(App& a) {
     auto r = client(a);
     const int next_find_height = find_height(a);
@@ -755,17 +777,7 @@ static void layout(App& a) {
         }
         show_control(a.find_bar, a.find_open);
     }
-    a.summary_layout_height = search_summary_height(a);
-    position_control(a.results_summary, px(a, 12), list_top + px(a, 8),
-                     std::max(0, sidebar_width - px(a, 24)), a.summary_layout_height - px(a, 16));
-    show_control(a.results_summary, results_visible(a));
-    const int results_top = list_top + a.summary_layout_height;
-    position_control(a.search_results, 0, results_top, sidebar_width,
-                     std::max<LONG>(0, r.bottom - results_top - px(a, 30)));
-    if (!results_visible(a) && GetFocus() == a.search_results)
-        SetFocus(a.window);
-    show_control(a.search_results, results_visible(a));
-    fit_search_results(a.search_results);
+    layout_search_results(a);
     const auto vp = viewport(a);
     const int midpoint = (vp.left + vp.right) / 2, center = (vp.top + vp.bottom) / 2;
     const bool welcome = !a.installed && !a.portable_choice && a.path.empty() && a.pages.empty();
@@ -1362,7 +1374,11 @@ static void sync_search(App& a) {
         a.search_summary += a.search_notice;
         status = a.search_notice;
     }
-    a.show_find_status = a.search_running || a.search_stopped || a.search_failed || !a.search_notice.empty();
+    // Fast searches must not briefly grow the bar and rescale the document.
+    const bool show_progress = a.search_running && GetTickCount64() >= a.search_progress_after;
+    if (!a.search_running)
+        KillTimer(a.window, search_progress_timer);
+    a.show_find_status = show_progress || a.search_stopped || a.search_failed || !a.search_notice.empty();
     SetDlgItemTextW(a.find_bar, IDC_FIND_COUNT, count.c_str());
     SetDlgItemTextW(a.find_bar, IDC_FIND_STATUS, a.show_find_status ? status.c_str() : L"");
     SetWindowTextW(a.results_summary, a.search_summary.c_str());
@@ -1371,12 +1387,20 @@ static void sync_search(App& a) {
     CheckDlgButton(a.find_bar, IDC_FIND_REGEX, a.search_options.regex ? BST_CHECKED : BST_UNCHECKED);
     EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_PREVIOUS), a.matches.count != 0);
     EnableWindow(GetDlgItem(a.find_bar, IDC_FIND_NEXT), a.matches.count != 0);
-    ShowWindow(GetDlgItem(a.find_bar, IDC_FIND_STOP), a.search_running ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(a.find_bar, IDC_FIND_STOP),
+               a.search_running && a.show_find_status ? SW_SHOW : SW_HIDE);
     const bool resized = a.find_layout_height != find_height(a);
-    if (resized || a.summary_layout_height != search_summary_height(a)) {
+    if (resized) {
         layout(a);
-        if (resized)
-            request_render(a);
+        request_render(a);
+    } else if (a.summary_layout_height != search_summary_height(a)) {
+        // A wrapped summary changes only the Results pane, not the find bar or PDF.
+        layout_search_results(a);
+        if (results_visible(a)) {
+            RECT redraw{0, px(a, toolbar_height) + a.find_layout_height + a.sidebar_header_height,
+                        sidebar_splitter(a).left, client(a).bottom - px(a, 30)};
+            RedrawWindow(a.window, &redraw, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+        }
     }
     const int selected = ListView_GetNextItem(a.search_results, -1, LVNI_SELECTED);
     if (selected != a.active_match) {
@@ -1391,7 +1415,8 @@ static void sync_search(App& a) {
         a.syncing_results = false;
     }
     fit_search_results(a.search_results);
-    InvalidateRect(a.window, nullptr, FALSE);
+    const auto bounds = document_bounds(a);
+    InvalidateRect(a.window, &bounds, FALSE);
 }
 static void start_search(App& a) {
     KillTimer(a.window, 3);
@@ -1410,9 +1435,12 @@ static void start_search(App& a) {
     a.search_failed = false;
     a.search_enter_pending = true;
     a.search_notice.clear();
-    if (a.search_running)
+    if (a.search_running) {
+        a.search_progress_after = GetTickCount64() + search_progress_delay;
+        SetTimer(a.window, search_progress_timer, search_progress_delay, nullptr);
         submit_search(a.search_worker,
                       {a.document, a.search_ticket, a.path, a.password, a.query, a.search_options});
+    }
     sync_search(a);
 }
 static void select_match(App& a, int index) {
@@ -1510,7 +1538,9 @@ static void receive_search(App& a) {
         SetTimer(a.window, 4, 16, nullptr);
     if (!changed)
         return;
-    ListView_SetItemCountEx(a.search_results, int(a.matches.count), LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+    if (ListView_GetItemCount(a.search_results) != int(a.matches.count))
+        ListView_SetItemCountEx(a.search_results, int(a.matches.count),
+                                LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
     fit_search_results(a.search_results);
     InvalidateRect(a.search_results, nullptr, FALSE);
     if (a.active_match < 0 && select < 0 && (a.search_complete || a.search_stopped) && a.matches.count != 0)
@@ -2940,6 +2970,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             ListView_InsertColumn(a.search_results, 0, &column);
             ListView_SetExtendedListViewStyle(a.search_results, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
             SetWindowSubclass(a.search_results, sidebar_proc, 1, DWORD_PTR(&a));
+            require(ui::enable_search_accessibility(a.search_results), "Cannot create search accessibility");
             create_toolbar(a);
             a.welcome_install =
                 CreateWindowExW(0, L"BUTTON", L"Install FastPDF", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0,
@@ -3062,7 +3093,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             finish_resize(a);
             return 0;
         case WM_TIMER:
-            if (wp == 4)
+            if (wp == search_progress_timer) {
+                if (!a.find_open || !a.search_running)
+                    KillTimer(window, search_progress_timer);
+                else if (GetTickCount64() >= a.search_progress_after) {
+                    KillTimer(window, search_progress_timer);
+                    sync_search(a);
+                }
+            } else if (wp == 4)
                 receive_search(a);
             else if (wp == 3)
                 start_search(a);

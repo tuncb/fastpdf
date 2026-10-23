@@ -28,7 +28,7 @@ def fixture(path):
     path.write_bytes(pdf(objects))
 
 
-def run(exe, output, worker_test):
+def run(exe, output, worker_test, uia_test):
     output.mkdir(parents=True, exist_ok=True)
     path = output / "many-results.pdf"
     fixture(path)
@@ -69,7 +69,7 @@ def run(exe, output, worker_test):
             send(query, 0xC, 0, c.addressof(buffer))
             send(query, 0x100, 13)
 
-        for _ in range(2):
+        for iteration in range(2):
             search("word")
             wait_for(lambda: read(count) == "1 of 85800", "all large-search results", 30)
             assert send(results, 0x1004) == 85800
@@ -81,7 +81,36 @@ def run(exe, output, worker_test):
             assert read(count) == "1 of 85800" and read(page) == "1"
             user.PostMessageW(window, 0x100, 0x72, 0)
             wait_for(lambda: read(count) == "2 of 85800", "queued F3", 1)
-            search("absent")
+            if iteration == 0:
+                log_path = output / "uia.txt"
+                with log_path.open("w") as log:
+                    client = subprocess.Popen([str(uia_test), str(results), "85800"],
+                                              stdout=log, stderr=log)
+                    try:
+                        def client_ready():
+                            report = log_path.read_text()
+                            assert client.poll() is None, report
+                            return "ready" in report
+
+                        wait_for(client_ready, "UI Automation client", 20)
+                        assert read(count) == "85800 of 85800" and read(page) == "241"
+                        send(results, 0x100, 0x24)  # Return to page 1 for the next search.
+                        send(query, 0xB1, 4, 4)  # Put the caret at the end before typing.
+                        start = time.perf_counter()
+                        user.PostMessageW(query, 0x102, ord("x"), 0)  # WM_CHAR through the UI queue.
+                        wait_for(lambda: read(query) == "wordx", "typing during accessibility reads", 1)
+                        elapsed = (time.perf_counter() - start) * 1000
+                        wait_for(lambda: read(count) == "0 matches", "live no-match query", 5)
+                        client.wait(timeout=10)
+                        assert client.returncode == 0, log_path.read_text()
+                        print(log_path.read_text().strip())
+                        print(f"Queued edit during UI Automation reads: {elapsed:.1f} ms")
+                    finally:
+                        if client.poll() is None:
+                            client.kill()
+                            client.wait()
+            else:
+                search("absent")
             wait_for(lambda: read(count) == "0 matches", "replace a large result set", 30)
             assert send(results, 0x1004) == 0
 
@@ -122,4 +151,4 @@ def run(exe, output, worker_test):
 
 
 if __name__ == "__main__":
-    run(*(Path(value).resolve() for value in sys.argv[1:4]))
+    run(*(Path(value).resolve() for value in sys.argv[1:5]))
