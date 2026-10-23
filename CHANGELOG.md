@@ -2,6 +2,10 @@
 
 Notable changes by release tag, newest first.
 
+## v0.4.2
+
+Maintenance release. No notable application changes.
+
 ## v0.4.1
 
 Maintenance release. No notable application changes.

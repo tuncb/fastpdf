@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FastPDF VERSION 0.4.1 LANGUAGES CXX)
+project(FastPDF VERSION 0.4.2 LANGUAGES CXX)
 if(NOT WIN32)
   message(FATAL_ERROR "FastPDF uses the Windows SDK. Build on Windows 10 or newer.")
 endif()
