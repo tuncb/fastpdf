@@ -27,6 +27,7 @@ struct SearchMatch {
     size_t offset = 0;
     std::wstring snippet;
     std::vector<SearchPiece> pieces;
+    size_t snippet_match_offset = 0, snippet_match_length = 0;
 };
 // Keep each page's allocation intact when it moves from the worker to the UI.
 struct SearchBatch {

@@ -260,20 +260,23 @@ static std::vector<SearchMatch> find_matches(const SearchText& text, const Searc
         SearchMatch match;
         match.page = page;
         match.offset = at;
-        size_t first = at > 32 ? at - 32 : 0, last = std::min(text.text.size(), end + 56);
-        // Keep context within the surrounding text runs, so headings and footers
-        // do not appear in a result for an unrelated sentence.
-        while (first < at && text.positions[first].span != text.positions[at].span)
-            ++first;
-        while (last > end && text.positions[last - 1].span != text.positions[end - 1].span)
-            --last;
+        // PDF text runs can contain only one word or glyph. Use nearby page
+        // text for context, including text from other runs and lines.
+        size_t first = at > 32 ? at - 32 : 0, last = end + std::min(size_t{80}, text.text.size() - end);
         while (first && first < at && !space(text.text[first - 1]))
             ++first;
-        const bool clipped_start = first && text.positions[first - 1].span == text.positions[first].span;
-        const bool clipped_end =
-            last < text.text.size() && text.positions[last].span == text.positions[last - 1].span;
+        while (last < text.text.size() && last > end && !space(text.text[last]))
+            --last;
+        while (first < at && space(text.text[first]))
+            ++first;
+        while (last > end && space(text.text[last - 1]))
+            --last;
+        const bool clipped_end = text.text.find_first_not_of(L' ', last) != std::wstring::npos;
         match.snippet =
-            (clipped_start ? L"…" : L"") + text.text.substr(first, last - first) + (clipped_end ? L"…" : L"");
+            (first ? L"… " : L"") + text.text.substr(first, last - first) +
+            (clipped_end ? L" …" : L"");
+        match.snippet_match_offset = at - first + (first ? 2 : 0);
+        match.snippet_match_length = end - at;
         for (size_t i = at; i < end; ++i) {
             const auto p = text.positions[i];
             if (p.span == SIZE_MAX)

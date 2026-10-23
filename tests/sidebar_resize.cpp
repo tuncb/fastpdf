@@ -9,6 +9,39 @@ static void check(bool value, const char* message) {
         throw std::runtime_error(message);
 }
 
+static void check_result_emphasis(App& app) {
+    const auto dc = GetDC(app.window);
+    const auto font = SelectObject(dc, app.search_font);
+    TEXTMETRICW metrics{};
+    GetTextMetricsW(dc, &metrics);
+    SelectObject(dc, font);
+    ReleaseDC(app.window, dc);
+    SearchMatch match;
+    match.snippet = L"The warranty covers defects in materials and workmanship from the date of delivery.";
+    match.snippet_match_offset = 4;
+    match.snippet_match_length = 8;
+    for (int width : {130, 300}) {
+        const RECT row{0, 0, px(app, width), 2 * metrics.tmHeight};
+        auto* layout = search_result_layout(app, match, row, metrics);
+        for (UINT32 index : {0u, 4u, 11u, 12u}) {
+            DWRITE_FONT_WEIGHT weight{};
+            const auto result = layout->GetFontWeight(index, &weight);
+            check(SUCCEEDED(result) && weight == (index >= 4 && index < 12 ? DWRITE_FONT_WEIGHT_BOLD
+                                                                        : DWRITE_FONT_WEIGHT_NORMAL),
+                  "Only the matched result text must be bold");
+        }
+        DWRITE_TEXT_METRICS text_metrics{};
+        check(SUCCEEDED(layout->GetMetrics(&text_metrics)) && text_metrics.lineCount >= 2,
+              "Emphasized result text did not wrap");
+        DWRITE_TRIMMING trimming{};
+        IDWriteInlineObject* ellipsis = nullptr;
+        check(SUCCEEDED(layout->GetTrimming(&trimming, &ellipsis)) && ellipsis,
+              "Emphasized result text lost its overflow ellipsis");
+        release(ellipsis);
+        release(layout);
+    }
+}
+
 static void check_bookmark_frame(App& app) {
     RECT bounds{};
     GetClientRect(app.bookmark_tree, &bounds);
@@ -402,6 +435,7 @@ int main() {
         for (UINT dpi : {96u, 144u, 192u}) {
             app.dpi = dpi;
             fonts(app);
+            check_result_emphasis(app);
             MoveWindow(window, 0, 0, px(app, 1100), px(app, 700), FALSE);
             layout(app);
             check_document_fit(app);

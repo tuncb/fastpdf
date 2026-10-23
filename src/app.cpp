@@ -172,6 +172,9 @@ struct App {
     bool setting_window_theme = false;
     HBRUSH results_background = nullptr;
     HFONT search_font = nullptr;
+    IDWriteFactory* search_write = nullptr;
+    ID2D1Factory* search_d2d = nullptr;
+    ID2D1DCRenderTarget* search_target = nullptr;
     UINT dpi = 96;
     uint64_t document = 0, ticket = 0, render_ticket = 0, search_ticket = 0;
     std::wstring path, password, status = L"Open a PDF to begin", query;
@@ -2821,6 +2824,82 @@ static void refresh_reader_theme(App& a) {
         style_menu(a, GetMenu(a.window), true);
     RedrawWindow(a.window, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
 }
+static IDWriteTextLayout* search_result_layout(App& a, const SearchMatch& match, RECT row,
+                                               const TEXTMETRICW& metrics) {
+    if (!a.search_write)
+        hr(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                               reinterpret_cast<IUnknown**>(&a.search_write)),
+           "Create result text factory");
+    IDWriteTextFormat* format = nullptr;
+    IDWriteTextLayout* layout = nullptr;
+    IDWriteInlineObject* ellipsis = nullptr;
+    try {
+        hr(a.search_write->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                                            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                            float(MulDiv(10, int(a.dpi), 72)), L"", &format),
+           "Create result text format");
+        hr(format->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, float(metrics.tmHeight),
+                                  float(metrics.tmAscent)), "Set result line spacing");
+        hr(a.search_write->CreateEllipsisTrimmingSign(format, &ellipsis), "Create result ellipsis");
+        const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+        hr(format->SetTrimming(&trimming, ellipsis), "Set result trimming");
+        hr(a.search_write->CreateTextLayout(match.snippet.data(), UINT32(match.snippet.size()), format,
+                                            float(row.right - row.left), float(row.bottom - row.top),
+                                            &layout), "Lay out result text");
+        const size_t start = std::min(match.snippet_match_offset, match.snippet.size());
+        const size_t count = std::min(match.snippet_match_length, match.snippet.size() - start);
+        if (count)
+            hr(layout->SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, {UINT32(start), UINT32(count)}),
+               "Emphasize result match");
+    } catch (...) {
+        release(ellipsis);
+        release(format);
+        release(layout);
+        throw;
+    }
+    release(ellipsis);
+    release(format);
+    return layout;
+}
+static bool paint_result_text(App& a, HDC dc, RECT row, const SearchMatch& match,
+                              const TEXTMETRICW& metrics, COLORREF background) {
+    if (row.right <= row.left || row.bottom <= row.top)
+        return true;
+    IDWriteTextLayout* layout = nullptr;
+    ID2D1SolidColorBrush* brush = nullptr;
+    const auto color = [](COLORREF value) {
+        return D2D1::ColorF(GetRValue(value) / 255.f, GetGValue(value) / 255.f, GetBValue(value) / 255.f);
+    };
+    try {
+        layout = search_result_layout(a, match, row, metrics);
+        if (!a.search_d2d)
+            hr(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &a.search_d2d),
+               "Create result drawing factory");
+        if (!a.search_target) {
+            // The native row bounds and font size are already in physical pixels.
+            const auto properties = D2D1::RenderTargetProperties(
+                D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96, 96);
+            hr(a.search_d2d->CreateDCRenderTarget(&properties, &a.search_target),
+               "Create result drawing target");
+        }
+        hr(a.search_target->BindDC(dc, &row), "Bind result drawing target");
+        hr(a.search_target->CreateSolidColorBrush(color(a.search_colors.text), &brush),
+           "Create result text brush");
+        a.search_target->BeginDraw();
+        a.search_target->Clear(color(background));
+        a.search_target->DrawTextLayout(D2D1::Point2F(0, 0), layout, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        hr(a.search_target->EndDraw(), "Draw result text");
+    } catch (...) {
+        release(brush);
+        release(layout);
+        release(a.search_target);
+        return false;
+    }
+    release(brush);
+    release(layout);
+    return true;
+}
 static void paint_search_result(App& a, const DRAWITEMSTRUCT& item) {
     const auto& colors = a.search_colors;
     fill_rect(item.hDC, item.rcItem, colors.body);
@@ -2846,7 +2925,12 @@ static void paint_search_result(App& a, const DRAWITEMSTRUCT& item) {
     const auto font = SelectObject(item.hDC, a.search_font);
     TEXTMETRICW metrics{};
     GetTextMetricsW(item.hDC, &metrics);
+    SelectObject(item.hDC, font);
     row.bottom = std::min(row.bottom, row.top + 2 * metrics.tmHeight);
+    if (paint_result_text(a, item.hDC, row, match, metrics, selected ? colors.pressed : colors.body))
+        return;
+    // Keep the result readable if the drawing target is temporarily unavailable.
+    SelectObject(item.hDC, a.search_font);
     std::wstring snippet = match.snippet;
     for (;;) {
         RECT size = row;
@@ -3491,6 +3575,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM
             DestroyWindow(window);
             return 0;
         case WM_DESTROY:
+            release(a.search_target);
+            release(a.search_d2d);
+            release(a.search_write);
             ui::close_page_view(a.page_view);
             cancel_search(a.search_worker);
             clear_search_results(a);

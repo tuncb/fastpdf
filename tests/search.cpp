@@ -53,6 +53,52 @@ int main() {
         boxes = search_rects(page, matches[0]);
         check(boxes.size() == 2 && boxes[0].y0 == 0 && boxes[1].y0 == 20,
               "Cross-line highlights stay on each line");
+        page.text = {span(L"The", 0, 0), span(L"warranty", 20, 0), span(L"covers", 65, 0),
+                     span(L"defects in materials", 100, 0),
+                     span(L"and workmanship from the date of delivery.", 0, 20)};
+        matches = search_matches(search_text(page), L"warranty", {});
+        check(matches.size() == 1 && matches[0].snippet ==
+                  L"The warranty covers defects in materials and workmanship from the date of delivery.",
+              "Result context includes nearby words across PDF runs and lines");
+        check(matches[0].pieces.size() == 1 && matches[0].pieces[0].span == 1 &&
+                  matches[0].pieces[0].count == 8,
+              "Extra context does not expand the matching highlight");
+        check(matches[0].snippet.substr(matches[0].snippet_match_offset,
+                                       matches[0].snippet_match_length) == L"warranty",
+              "Snippet emphasis points to the actual match across text runs");
+        const std::wstring passage =
+            L"This introduction has enough words to clip the beginning before the warranty "
+            L"covers defects in materials and workmanship from the date of delivery. "
+            L"Additional conditions apply to every claim.";
+        page.text = {span(passage, 0, 0)};
+        matches = search_matches(search_text(page), L"warranty", {});
+        const auto context = matches[0].snippet;
+        check(context.substr(matches[0].snippet_match_offset, matches[0].snippet_match_length) == L"warranty",
+              "Snippet emphasis accounts for the leading ellipsis");
+        check(context == L"… clip the beginning before the warranty covers defects in materials and "
+                             L"workmanship from the date of delivery. …",
+              "Long context ends at word boundaries and marks omitted text");
+        page.text.clear();
+        for (size_t i = 0; i < passage.size(); ++i)
+            page.text.push_back(span(passage.substr(i, 1), double(i) * 5, 0));
+        matches = search_matches(search_text(page), L"warranty", {});
+        check(matches.size() == 1 && matches[0].snippet == context,
+              "Snippet text does not depend on how a PDF splits its glyphs into runs");
+        page.text = {span(L"warranty ", 0, 0)};
+        matches = search_matches(search_text(page), L"warranty", {});
+        check(matches[0].snippet == L"warranty", "A page with one word needs no ellipses");
+        page.text = {span(L"Warranty covers warranty claims", 0, 0)};
+        matches = search_matches(search_text(page), L"warranty", {});
+        check(matches.size() == 2 && matches[0].snippet_match_offset == 0 &&
+                  matches[1].snippet_match_offset == 16 && matches[0].snippet_match_length == 8 &&
+                  matches[1].snippet_match_length == 8,
+              "Each result emphasizes its own occurrence with the original case");
+        SearchOptions snippet_regex;
+        snippet_regex.regex = true;
+        matches = search_matches(search_text(page), L"warranty\\s+\\w+", snippet_regex);
+        check(matches.size() == 2 && matches[0].snippet_match_length == 15 &&
+                  matches[1].snippet_match_length == 15,
+              "Regex emphasis spans the matched text rather than the query pattern");
         // Ableton's manual splits this word into A, b, l, e, and ton, with small
         // kerning gaps. Every fragment used to get its own overlapping outline.
         const std::vector<TextSpan> fragments{span(L"A", 10, 20), span(L"b", 15.08, 20),
