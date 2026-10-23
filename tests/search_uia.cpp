@@ -33,6 +33,8 @@ static int count_children(IUIAutomationElement* root, IUIAutomationCondition* co
     return count;
 }
 int wmain(int argc, wchar_t** argv) {
+    // Keep the last completed check in CI logs even if a system UIA call crashes.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     require(argc == 3, "Expected results HWND and total count");
     const HWND window = reinterpret_cast<HWND>(_wcstoui64(argv[1], nullptr, 10));
     const int total = _wtoi(argv[2]);
@@ -117,6 +119,7 @@ int wmain(int argc, wchar_t** argv) {
         const int count = count_children(root, condition);
         ++scans;
         if (!count) {
+            std::puts("Query cleared; checking the stale result");
             BSTR stale_name = nullptr;
             const auto hr = last->get_CurrentName(&stale_name);
             SysFreeString(stale_name);
@@ -128,6 +131,7 @@ int wmain(int argc, wchar_t** argv) {
             condition->Release();
             root->Release();
             automation->Release();
+            std::puts("UI Automation interfaces released");
             CoUninitialize();
             return 0;
         }

@@ -102,7 +102,9 @@ def run(exe, output, worker_test, uia_test):
                         elapsed = (time.perf_counter() - start) * 1000
                         wait_for(lambda: read(count) == "0 matches", "live no-match query", 5)
                         client.wait(timeout=10)
-                        assert client.returncode == 0, log_path.read_text()
+                        assert client.returncode == 0, (
+                            f"UI Automation client exited with 0x{client.returncode & 0xffffffff:08x}:\n"
+                            + log_path.read_text())
                         print(log_path.read_text().strip())
                         print(f"Queued edit during UI Automation reads: {elapsed:.1f} ms")
                     finally:
