@@ -2,6 +2,10 @@
 
 Notable changes by release tag, newest first.
 
+## v0.4.1
+
+Maintenance release. No notable application changes.
+
 ## v0.4.0
 
 - Show surrounding text in search results and display each match in bold.
