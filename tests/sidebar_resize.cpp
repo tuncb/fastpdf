@@ -9,6 +9,14 @@ static void check(bool value, const char* message) {
         throw std::runtime_error(message);
 }
 
+static void resize_test_window(App& app, int width, int height) {
+    check(MoveWindow(app.window, 0, 0, width, height, FALSE) != FALSE, "Cannot resize the test window");
+    RECT bounds{};
+    check(GetWindowRect(app.window, &bounds) != FALSE, "Cannot measure the test window");
+    check(bounds.right - bounds.left == width && bounds.bottom - bounds.top == height,
+          "Windows constrained the test window size");
+}
+
 static bool same_paint_color(uint32_t actual, uint32_t expected) {
     // HALFTONE downsampling in ui::control can round each RGB channel by one.
     for (int shift : {0, 8, 16})
@@ -229,14 +237,14 @@ static void check_live_resize(App& app) {
     app.sidebar_width = 260;
     for (auto fit : {Fit::page, Fit::width}) {
         app.fit = fit;
-        MoveWindow(app.window, 0, 0, px(app, 1100), px(app, 700), FALSE);
+        resize_test_window(app, px(app, 1100), px(app, 700));
         request_render(app);
         const auto ticket = app.render_ticket;
         const double initial_scale = app.scale;
         SendMessageW(app.window, WM_ENTERSIZEMOVE, 0, 0);
         check(app.resizing_window, "Native resize loop did not enable the fast preview");
         for (int width : {700, 1000, 800, 1100}) {
-            MoveWindow(app.window, 0, 0, px(app, width), px(app, 700), FALSE);
+            resize_test_window(app, px(app, width), px(app, 700));
             check_fitted_page(app);
             if (width == 700)
                 check(app.scale < initial_scale, "Native resize kept the old page scale");
@@ -291,7 +299,7 @@ static void check_live_resize(App& app) {
     const auto ticket = app.render_ticket;
     const auto scale = app.scale;
     SendMessageW(app.window, WM_ENTERSIZEMOVE, 0, 0);
-    MoveWindow(app.window, 0, 0, px(app, 900), px(app, 650), FALSE);
+    resize_test_window(app, px(app, 900), px(app, 650));
     SendMessageW(app.window, WM_EXITSIZEMOVE, 0, 0);
     const auto splitter = sidebar_splitter(app);
     SendMessageW(app.window, WM_LBUTTONDOWN, MK_LBUTTON,
@@ -340,7 +348,7 @@ static void check_paint_buffer(App& app) {
     RECT smaller = bounds;
     smaller.right -= px(app, 100);
     smaller.bottom -= px(app, 100);
-    MoveWindow(app.window, 0, 0, smaller.right, smaller.bottom, FALSE);
+    resize_test_window(app, smaller.right, smaller.bottom);
     paint_window(app, surface.dc, client(app));
     check(app.frame.bitmap == buffer, "Shrinking the window allocated a new paint buffer");
     ui::close(surface);
@@ -425,6 +433,15 @@ static void check_search_updates(App& app) {
     check(!visible(app.find_bar), "A stale progress timer reopened Find");
 }
 
+static LRESULT CALLBACK test_window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    const auto result = window_proc(window, message, wp, lp);
+    // The hidden test reaches 2200 x 1400 pixels at 200% scale. Do not let the
+    // runner's desktop size cap it. Keep the application's minimum size checks.
+    if (message == WM_GETMINMAXINFO)
+        reinterpret_cast<MINMAXINFO*>(lp)->ptMaxTrackSize = {4096, 4096};
+    return result;
+}
+
 int main() {
     App app;
     app.instance = GetModuleHandleW(nullptr);
@@ -437,7 +454,7 @@ int main() {
                                                             ICC_LISTVIEW_CLASSES};
         check(InitCommonControlsEx(&controls) != FALSE, "Cannot initialize controls");
         WNDCLASSW type{};
-        type.lpfnWndProc = window_proc;
+        type.lpfnWndProc = test_window_proc;
         type.hInstance = app.instance;
         type.lpszClassName = L"FastPDF.SidebarResizeTest";
         check(RegisterClassW(&type) != 0, "Cannot register test window");
@@ -464,7 +481,7 @@ int main() {
             app.dpi = dpi;
             fonts(app);
             check_result_emphasis(app);
-            MoveWindow(window, 0, 0, px(app, 1100), px(app, 700), FALSE);
+            resize_test_window(app, px(app, 1100), px(app, 700));
             layout(app);
             check_document_fit(app);
             app.find_open = true;
@@ -489,6 +506,9 @@ int main() {
                 RECT tree{}, tabs{};
                 GetWindowRect(app.bookmark_tree, &tree);
                 GetWindowRect(app.sidebar_tabs, &tabs);
+                if (tree.right - tree.left != px(app, width) - px(app, ui::splitter_width))
+                    std::fprintf(stderr, "Sidebar size: dpi=%u requested=%d actual=%ld client=%ld\n",
+                                 dpi, px(app, width), tree.right - tree.left, client(app).right);
                 check(tree.right - tree.left == px(app, width) - px(app, ui::splitter_width),
                       "Bookmark width did not follow the splitter");
                 check(tabs.bottom == tree.top, "Tabs and bookmarks no longer align");
@@ -507,7 +527,7 @@ int main() {
             check_live_resize(app);
             check_paint_buffer(app);
             for (int width : {1100, 640}) {
-                MoveWindow(window, 0, 0, px(app, width), px(app, 700), FALSE);
+                resize_test_window(app, px(app, width), px(app, 700));
                 check_search_updates(app);
             }
         }
