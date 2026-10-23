@@ -145,17 +145,27 @@ def run(reader_exe, probe_exe, root):
         output = document.with_suffix('.txt')
         probe(probe_exe, document, image, output)
         reader(reader_exe, document, root / (label + '-reader.png'))
-        dialog_case(reader_exe, document, str(document))
-        print(label + ': PDF, PNG, text, reader, Open, and Cancel passed.', flush=True)
+        # The native Windows picker uses normal paths. The Win32 device prefix is
+        # supported by direct file I/O, but the Shell rejects it in the name field.
+        if label != 'extended':
+            dialog_case(reader_exe, document, str(document))
+            print(label + ': PDF, PNG, text, reader, Open, and Cancel passed.', flush=True)
+        else:
+            print(label + ': PDF, PNG, text, and reader passed.', flush=True)
 
-    # Quotes and spaces must not become part of an explicitly prefixed file name.
+    # Keep extended paths with spaces covered by direct file I/O.
     spaced = deep / (name + ' with spaces.pdf')
     extended(spaced).write_bytes(content)
-    dialog_case(reader_exe, extended(spaced), '"' + str(extended(spaced)) + '"')
+    reader(reader_exe, extended(spaced), root / 'extended-spaces-reader.png')
+    # The standard picker handles quotes and spaces in a normal file path.
+    if not long_paths_enabled():
+        spaced = root / (name + ' with spaces.pdf')
+        spaced.write_bytes(content)
+    dialog_case(reader_exe, spaced, '"' + str(spaced) + '"')
 
     # Relative paths must continue to resolve against the caller's working directory.
     probe(probe_exe, Path(short.name), root / 'relative.png', root / 'relative.txt', cwd=root)
-    print('Quoted extended paths and relative paths passed.', flush=True)
+    print('Extended paths with spaces, quoted picker paths, and relative paths passed.', flush=True)
 
 
 if __name__ == '__main__':

@@ -253,98 +253,6 @@ static LRESULT CALLBACK native_control_proc(HWND window, UINT message, WPARAM wp
         SetBkColor(HDC(wp), state.colors.field);
         return LRESULT(state.field);
     }
-    if (window_class(window, WC_LISTVIEWW)) {
-        if (message == LVM_SETBKCOLOR || message == LVM_SETTEXTBKCOLOR)
-            lp = LPARAM(state.colors.field);
-        if (message == LVM_SETTEXTCOLOR)
-            lp = LPARAM(state.colors.text);
-    }
-    if (message == WM_NOTIFY) {
-        const auto draw = reinterpret_cast<NMCUSTOMDRAW*>(lp);
-        if (draw->hdr.code == NM_CUSTOMDRAW && window_class(draw->hdr.hwndFrom, WC_LISTVIEWW)) {
-            const auto list = draw->hdr.hwndFrom;
-            const auto list_draw = reinterpret_cast<NMLVCUSTOMDRAW*>(lp);
-            const bool report = ListView_GetView(list) == LV_VIEW_DETAILS;
-            if (draw->dwDrawStage == CDDS_PREPAINT) {
-                FillRect(draw->hdc, &draw->rc, state.field);
-                return CDRF_NOTIFYITEMDRAW;
-            }
-            if (draw->dwDrawStage == CDDS_ITEMPREPAINT && report)
-                return CDRF_NOTIFYSUBITEMDRAW;
-            if (draw->dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM) ||
-                (draw->dwDrawStage == CDDS_ITEMPREPAINT && !report)) {
-                const int row = int(draw->dwItemSpec), column = report ? list_draw->iSubItem : 0;
-                const bool item_selected =
-                    (ListView_GetItemState(list, row, LVIS_SELECTED) & LVIS_SELECTED) != 0;
-                RECT bounds{}, label{}, icon_bounds{};
-                if (report) {
-                    ListView_GetSubItemRect(list, row, column, LVIR_BOUNDS, &bounds);
-                    RECT column_bounds{};
-                    Header_GetItemRect(ListView_GetHeader(list), column, &column_bounds);
-                    bounds.left = column_bounds.left;
-                    bounds.right = column_bounds.right;
-                    label = bounds;
-                    InflateRect(&label, -pixels(list, 6), 0);
-                } else {
-                    ListView_GetItemRect(list, row, &bounds, LVIR_BOUNDS);
-                    ListView_GetItemRect(list, row, &label, LVIR_LABEL);
-                }
-                const int saved = SaveDC(draw->hdc);
-                SetDCBrushColor(draw->hdc, item_selected ? state.colors.accent : state.colors.field);
-                FillRect(draw->hdc, &bounds, HBRUSH(GetStockObject(DC_BRUSH)));
-                if (column == 0) {
-                    LVITEMW item{};
-                    item.mask = LVIF_IMAGE;
-                    item.iItem = row;
-                    ListView_GetItem(list, &item);
-                    ListView_GetItemRect(list, row, &icon_bounds, LVIR_ICON);
-                    const auto icons = ListView_GetImageList(
-                        list, (GetWindowLongPtrW(list, GWL_STYLE) & LVS_TYPEMASK) == LVS_ICON ? LVSIL_NORMAL
-                                                                                              : LVSIL_SMALL);
-                    if (icons) {
-                        int icon_width = 0, icon_height = 0;
-                        ImageList_GetIconSize(icons, &icon_width, &icon_height);
-                        ImageList_Draw(icons, item.iImage, draw->hdc, icon_bounds.left,
-                                       (icon_bounds.top + icon_bounds.bottom - icon_height) / 2,
-                                       ILD_TRANSPARENT);
-                    }
-                    if (report)
-                        label.left = icon_bounds.right + pixels(list, 4);
-                }
-                wchar_t value[1024]{};
-                ListView_GetItemText(list, row, column, value, int(std::size(value)));
-                SelectObject(draw->hdc, HFONT(SendMessageW(list, WM_GETFONT, 0, 0)));
-                SetBkMode(draw->hdc, TRANSPARENT);
-                SetTextColor(draw->hdc, item_selected ? state.colors.on_accent : state.colors.text);
-                DrawTextW(draw->hdc, value, -1, &label,
-                          DT_NOPREFIX | DT_END_ELLIPSIS |
-                              (report ? DT_SINGLELINE | DT_VCENTER : DT_WORDBREAK | DT_CENTER));
-                RestoreDC(draw->hdc, saved);
-                return CDRF_SKIPDEFAULT;
-            }
-        }
-        if (draw->hdr.code == NM_CUSTOMDRAW && window_class(draw->hdr.hwndFrom, WC_HEADERW)) {
-            if (draw->dwDrawStage == CDDS_PREPAINT)
-                return CDRF_NOTIFYITEMDRAW;
-            if (draw->dwDrawStage == CDDS_ITEMPREPAINT) {
-                const int saved = SaveDC(draw->hdc);
-                FillRect(draw->hdc, &draw->rc, state.footer);
-                wchar_t title[256]{};
-                HDITEMW item{};
-                item.mask = HDI_TEXT;
-                item.pszText = title;
-                item.cchTextMax = int(std::size(title));
-                Header_GetItem(draw->hdr.hwndFrom, int(draw->dwItemSpec), &item);
-                RECT label = draw->rc;
-                InflateRect(&label, -pixels(window, 6), 0);
-                SetBkMode(draw->hdc, TRANSPARENT);
-                SetTextColor(draw->hdc, state.colors.text);
-                DrawTextW(draw->hdc, title, -1, &label, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-                RestoreDC(draw->hdc, saved);
-                return CDRF_SKIPDEFAULT;
-            }
-        }
-    }
     if (message == WM_PAINT && window_class(window, L"Button")) {
         PAINTSTRUCT paint{};
         const auto dc = BeginPaint(window, &paint);
@@ -383,7 +291,7 @@ static BOOL CALLBACK theme_child(HWND child, LPARAM context) {
     const bool edit = window_class(child, L"Edit");
     if (edit || window_class(child, L"ComboBox") || window_class(child, L"ScrollBar"))
         SetWindowTheme(child, state.colors.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-    if (window_class(child, L"ComboBox") || window_class(child, WC_COMBOBOXEXW)) {
+    if (window_class(child, L"ComboBox")) {
         SetWindowTheme(child, state.colors.dark ? L"DarkMode_CFD" : L"Explorer", nullptr);
         SetWindowSubclass(child, native_control_proc, 2, DWORD_PTR(&state));
     }
@@ -396,26 +304,6 @@ static BOOL CALLBACK theme_child(HWND child, LPARAM context) {
         center_edit_text(child);
         SetWindowPos(child, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    }
-    if (window_class(child, WC_LISTVIEWW)) {
-        SetWindowSubclass(child, native_control_proc, 2, DWORD_PTR(&state));
-        SetWindowTheme(child, state.colors.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-        ListView_SetBkColor(child, state.colors.field);
-        ListView_SetTextBkColor(child, state.colors.field);
-        ListView_SetTextColor(child, state.colors.text);
-        if (const auto tips = ListView_GetToolTips(child)) {
-            SetWindowTheme(tips, L"", L"");
-            SendMessageW(tips, TTM_SETTIPBKCOLOR, state.colors.body, 0);
-            SendMessageW(tips, TTM_SETTIPTEXTCOLOR, state.colors.text, 0);
-        }
-    }
-    if (window_class(child, TOOLBARCLASSNAMEW))
-        SetWindowTheme(child, L"", L"");
-    if (window_class(child, L"SHELLDLL_DefView"))
-        SetWindowSubclass(child, native_control_proc, 2, DWORD_PTR(&state));
-    if (window_class(child, WC_TREEVIEWW)) {
-        TreeView_SetBkColor(child, state.colors.field);
-        TreeView_SetTextColor(child, state.colors.text);
     }
     return TRUE;
 }
@@ -619,22 +507,6 @@ static LRESULT CALLBACK dialog_proc(HWND window, UINT message, WPARAM wp, LPARAM
             tip->lpszText = tip->szText;
             return 0;
         }
-        if (draw->hdr.code == NM_CUSTOMDRAW && window_class(draw->hdr.hwndFrom, TOOLBARCLASSNAMEW)) {
-            if (draw->dwDrawStage == CDDS_PREPAINT) {
-                FillRect(draw->hdc, &draw->rc, state.body);
-                return CDRF_NOTIFYITEMDRAW;
-            }
-            if (draw->dwDrawStage == CDDS_ITEMPREPAINT) {
-                const auto toolbar = reinterpret_cast<NMTBCUSTOMDRAW*>(lp);
-                toolbar->clrText = state.colors.text;
-                toolbar->clrBtnFace = state.colors.body;
-                toolbar->clrBtnHighlight = state.colors.hover;
-                toolbar->clrHighlightHotTrack = state.colors.hover;
-                toolbar->nStringBkMode = TRANSPARENT;
-                toolbar->nHLStringBkMode = TRANSPARENT;
-                return TBCDRF_USECDCOLORS | TBCDRF_HILITEHOTTRACK;
-            }
-        }
         if (draw->hdr.code == NM_CUSTOMDRAW && draw->dwDrawStage == CDDS_PREPAINT &&
             window_class(draw->hdr.hwndFrom, L"Button") &&
             (GetWindowLongPtrW(draw->hdr.hwndFrom, GWL_STYLE) & BS_TYPEMASK) != BS_GROUPBOX) {
@@ -697,7 +569,7 @@ void style_dialog(HWND window, int footer_top, int primary, bool center) {
         return;
     }
     refresh_style(window, *state.release());
-    // Common dialogs can create their shell controls after the initialization hook.
+    // Apply the final font after the caller finishes initializing the dialog.
     PostMessageW(window, refresh_message, 0, 0);
     if (center && !(GetWindowLongPtrW(window, GWL_STYLE) & WS_CHILD)) {
         RECT bounds{}, parent{};

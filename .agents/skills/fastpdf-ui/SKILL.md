@@ -16,7 +16,8 @@ Paths below are relative to the repository root.
 - Call `ui::style_dialog` during dialog initialization. Keep its footer position in sync with the resource layout.
 - Use `ui::position_dialog_control` for runtime positions in dialog units. Update the footer with `ui::dialog_footer` when the layout changes.
 - Use `ui::show_prompt` or `ui::message_box` for application messages and confirmations. These functions measure text and use the shared style.
-- Use `ui::style_common_dialog` for native Open and Print dialogs. Preserve their native behavior. Use `ui::refresh_dialog_style` when the shell creates new controls during navigation.
+- Use the standard Windows `IFileOpenDialog` for Open. Keep its native font, layout, controls, and drawing. Call `ui::enable_system_dialog_theme` to follow the Windows app theme. Open is an exception to the shared dialog style.
+- Use `ui::style_common_dialog` for Print. Preserve its native behavior. Use `ui::refresh_dialog_style` when a styled dialog needs a theme refresh.
 - Improve the shared functions when a change applies to several dialogs. Avoid a separate palette or button painter for each dialog.
 
 ## Font And Text

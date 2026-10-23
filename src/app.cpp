@@ -9,6 +9,7 @@
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -958,74 +959,35 @@ static void load_file(App& a, const std::wstring& path, const std::wstring& pass
     enqueue(a, std::move(request));
     InvalidateRect(a.window, nullptr, FALSE);
 }
-struct FileSelection {
-    std::wstring extended_path;
-    std::exception_ptr error;
+struct FileDialog {
+    IFileOpenDialog* dialog = nullptr;
+    IShellItem* item = nullptr;
+    PWSTR path = nullptr;
+    ~FileDialog() {
+        CoTaskMemFree(path);
+        release(item);
+        release(dialog);
+    }
 };
-static LRESULT CALLBACK file_dialog_proc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR subclass,
-                                         DWORD_PTR data) {
-    if (message == WM_NCDESTROY)
-        RemoveWindowSubclass(window, file_dialog_proc, subclass);
-    if (message == WM_COMMAND && LOWORD(wp) == IDOK) {
-        auto& selection = *reinterpret_cast<FileSelection*>(data);
-        try {
-            const LRESULT size = SendMessageW(window, CDM_GETSPEC, 0, 0);
-            if (size > 0 && size <= 32768) {
-                std::wstring path(size_t(size), L'\0');
-                const LRESULT copied =
-                    SendMessageW(window, CDM_GETSPEC, WPARAM(path.size()), LPARAM(path.data()));
-                if (copied > 0 && copied <= size) {
-                    path.resize(wcslen(path.c_str()));
-                    if (path.size() >= 2 && path.front() == L'"' && path.back() == L'"')
-                        path = path.substr(1, path.size() - 2);
-                    if (path.starts_with(L"\\\\?\\")) {
-                        // The shell treats '?' as a wildcard. Preserve the exact path for file I/O.
-                        selection.extended_path = std::move(path);
-                        SendMessageW(window, WM_COMMAND, IDCANCEL, 0);
-                        return 0;
-                    }
-                }
-            }
-        } catch (...) {
-            selection.error = std::current_exception();
-            SendMessageW(window, WM_COMMAND, IDCANCEL, 0);
-            return 0;
-        }
-    }
-    return DefSubclassProc(window, message, wp, lp);
-}
-static UINT_PTR CALLBACK file_dialog_hook(HWND window, UINT message, WPARAM, LPARAM lp) {
-    if (message == WM_INITDIALOG) {
-        const auto& dialog = *reinterpret_cast<OPENFILENAMEW*>(lp);
-        SetWindowSubclass(GetParent(window), file_dialog_proc, 1, DWORD_PTR(dialog.lCustData));
-    }
-    if (message == WM_NOTIFY && reinterpret_cast<NMHDR*>(lp)->code == CDN_INITDONE)
-        ui::style_common_dialog(GetParent(window));
-    if (message == WM_NOTIFY && (reinterpret_cast<NMHDR*>(lp)->code == CDN_FOLDERCHANGE ||
-                                 reinterpret_cast<NMHDR*>(lp)->code == CDN_TYPECHANGE))
-        ui::refresh_dialog_style(GetParent(window));
-    return 0;
-}
 static void choose_file(App& a) {
     ui::enable_system_dialog_theme();
-    wchar_t path[32768]{};
-    FileSelection selection;
-    OPENFILENAMEW dialog{sizeof(dialog)};
-    dialog.hwndOwner = a.window;
-    dialog.lpstrFilter = L"PDF documents (*.pdf)\0*.pdf\0All files\0*.*\0";
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = 32768;
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_ENABLEHOOK |
-                   OFN_HIDEREADONLY;
-    dialog.lpfnHook = file_dialog_hook;
-    dialog.lCustData = LPARAM(&selection);
-    const bool accepted = GetOpenFileNameW(&dialog) != FALSE;
-    if (selection.error)
-        std::rethrow_exception(selection.error);
-    if (!selection.extended_path.empty())
-        load_file(a, selection.extended_path);
-    else if (accepted)
-        load_file(a, path);
+    FileDialog file;
+    hr(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&file.dialog)),
+       "Create Open dialog");
+    DWORD options = 0;
+    hr(file.dialog->GetOptions(&options), "Get Open dialog options");
+    hr(file.dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST |
+                               FOS_NOCHANGEDIR),
+       "Set Open dialog options");
+    const COMDLG_FILTERSPEC filters[] = {{L"PDF documents (*.pdf)", L"*.pdf"}, {L"All files", L"*.*"}};
+    hr(file.dialog->SetFileTypes(UINT(std::size(filters)), filters), "Set Open dialog file types");
+    const auto result = file.dialog->Show(a.window);
+    if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED))
+        return;
+    hr(result, "Show Open dialog");
+    hr(file.dialog->GetResult(&file.item), "Get selected file");
+    hr(file.item->GetDisplayName(SIGDN_FILESYSPATH, &file.path), "Get selected file path");
+    load_file(a, file.path);
 }
 static void goto_page(App& a, int page) {
     if (a.pages.empty())
